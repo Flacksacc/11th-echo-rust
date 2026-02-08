@@ -82,11 +82,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 tokio::select! {
                     Some(level) = level_rx.recv() => {
-                        if let Some(ui) = ui_handle_for_tokio.upgrade() {
-                            let _ = ui.upgrade_in_event_loop(move |ui| {
-                                ui.set_audio_level(level);
-                            });
-                        }
+                        let _ = ui_handle_for_tokio.upgrade_in_event_loop(move |ui| {
+                            ui.set_audio_level(level);
+                        });
                     }
                     Some(cmd) = cmd_rx.recv() => {
                         match cmd {
@@ -136,11 +134,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             AppCommand::StopRecording => {
                                 println!("⚡ Stopping Recording Session...");
                                 active_session = None;
-                                if let Some(ui) = ui_handle_for_tokio.upgrade() {
-                                    let _ = ui.upgrade_in_event_loop(|ui| {
-                                        ui.set_audio_level(0.0);
-                                    });
-                                }
+                                let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
+                                    ui.set_audio_level(0.0);
+                                });
                             }
                         }
                     }
