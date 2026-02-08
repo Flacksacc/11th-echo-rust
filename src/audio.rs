@@ -10,7 +10,10 @@ const CHUNK_SIZE: usize = 1024; // Process in chunks
 
 /// Starts the audio recording stream.
 /// Audio chunks (raw i16 PCM @ 16kHz) are sent to the provided `sender`.
-pub fn start_audio_capture(sender: Sender<Vec<i16>>) -> Result<cpal::Stream, Box<dyn Error + Send + Sync>> {
+pub fn start_audio_capture(
+    sender: Sender<Vec<i16>>,
+    level_sender: Sender<f32>,
+) -> Result<cpal::Stream, Box<dyn Error + Send + Sync>> {
     let host = cpal::default_host();
     let device = host.default_input_device().ok_or("No input device available")?;
     let config = device.default_input_config()?;
@@ -49,11 +52,12 @@ pub fn start_audio_capture(sender: Sender<Vec<i16>>) -> Result<cpal::Stream, Box
     
     let err_fn = move |err| eprintln!("❌ Audio stream error: {}", err);
 
+    let sender_level = level_sender.clone();
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
             &config.into(),
             move |data: &[f32], _: &_| {
-                process_audio_f32(data, &sender, &resampler_state, &buffer_state, input_sample_rate);
+                process_audio_f32(data, &sender, &sender_level, &resampler_state, &buffer_state, input_sample_rate);
             },
             err_fn,
             None 
@@ -63,7 +67,7 @@ pub fn start_audio_capture(sender: Sender<Vec<i16>>) -> Result<cpal::Stream, Box
             move |data: &[i16], _: &_| {
                 // Convert i16 -> f32 for resampling
                 let samples_f32: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                process_audio_f32(&samples_f32, &sender, &resampler_state, &buffer_state, input_sample_rate);
+                process_audio_f32(&samples_f32, &sender, &sender_level, &resampler_state, &buffer_state, input_sample_rate);
             },
             err_fn,
             None
@@ -78,10 +82,21 @@ pub fn start_audio_capture(sender: Sender<Vec<i16>>) -> Result<cpal::Stream, Box
 fn process_audio_f32(
     input: &[f32], 
     sender: &Sender<Vec<i16>>, 
+    level_sender: &Sender<f32>,
     resampler_state: &Arc<Mutex<Option<SincFixedIn<f32>>>>,
     buffer_state: &Arc<Mutex<Vec<f32>>>,
     _input_rate: u32
 ) {
+    // Calculate peak level for feedback
+    let mut peak = 0.0f32;
+    for &sample in input {
+        let abs = sample.abs();
+        if abs > peak {
+            peak = abs;
+        }
+    }
+    let _ = level_sender.try_send(peak);
+
     let mut buffer = buffer_state.lock().unwrap();
     buffer.extend_from_slice(input);
 

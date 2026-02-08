@@ -2,13 +2,17 @@ import { Button, VerticalBox, LineEdit, ComboBox } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
     title: "11th Echo Settings";
+    icon: @image-url("../eleventhecho.ico");
     min-width: 400px;
     min-height: 300px;
     background: #1e1e2e; // Catppuccin Mocha base (Dark Theme)
 
+    out property <string> api-key-text: api-key-input.text;
+
     callback start-recording(string);
     callback stop-recording();
     in property <bool> is-recording: false;
+    in property <float> audio-level: 0.0;
 
     VerticalBox {
         padding: 20px;
@@ -20,6 +24,20 @@ export component AppWindow inherits Window {
             font-weight: 700;
             color: #cdd6f4;
             horizontal-alignment: center;
+        }
+
+        // Audio Level Indicator
+        Rectangle {
+            height: 4px;
+            background: #313244;
+            border-radius: 2px;
+            Rectangle {
+                x: 0;
+                width: parent.width * root.audio-level;
+                background: root.is-recording ? #a6e3a1 : #6c7086;
+                border-radius: 2px;
+                animate width { duration: 50ms; }
+            }
         }
 
         Text {
