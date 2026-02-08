@@ -104,12 +104,9 @@ fn main() -> Result<(), slint::PlatformError> {
     let ui_handle = ui.as_weak();
     let start_tx = cmd_tx.clone();
     
-    ui.on_start_recording(move || {
+    ui.on_start_recording(move |api_key_slint| {
         let ui = ui_handle.unwrap();
-        // Mock API Key fetch - in real app, bind to UI property
-        // For now, hardcode or grab from env if we could, but UI has LineEdit
-        // We'll just send placeholder
-        let api_key = "sk_mock_key".to_string(); 
+        let api_key = api_key_slint.to_string();
         
         let _ = start_tx.send(AppCommand::StartRecording { 
             api_key, 

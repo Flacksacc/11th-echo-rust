@@ -6,7 +6,7 @@ export component AppWindow inherits Window {
     min-height: 300px;
     background: #1e1e2e; // Catppuccin Mocha base (Dark Theme)
 
-    callback start-recording();
+    callback start-recording(string);
     callback stop-recording();
     in property <bool> is-recording: false;
 
@@ -31,7 +31,7 @@ export component AppWindow inherits Window {
         VerticalBox {
             spacing: 5px;
             Text { text: "ElevenLabs API Key:"; color: #bac2de; }
-            LineEdit {
+            api-key-input := LineEdit {
                 placeholder-text: "sk_...";
                 input-type: password;
             }
@@ -54,7 +54,7 @@ export component AppWindow inherits Window {
                 if (root.is-recording) {
                     root.stop-recording();
                 } else {
-                    root.start-recording();
+                    root.start-recording(api-key-input.text);
                 }
             }
         }
