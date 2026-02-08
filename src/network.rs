@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::error::Error;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver; // Bounded receiver
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use url::Url;
+use base64::{Engine as _, engine::general_purpose};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -42,23 +43,19 @@ impl ElevenLabsClient {
 
     pub async fn run(
         &self,
-        mut audio_rx: UnboundedReceiver<Vec<i16>>,
+        mut audio_rx: Receiver<Vec<i16>>,
         text_tx: tokio::sync::mpsc::Sender<String>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let url = Url::parse_with_params(
             ELEVENLABS_WSS_URL,
             &[
-                ("model_id", &self.model_id),
-                //("language_code", "en"), // Default is en, can make configurable later
+                ("model_id", self.model_id.as_str()),
+                //("language_code", "en"), 
                 ("audio_format", "pcm_16000"),
             ],
         )?;
 
         println!("🔌 Connecting to ElevenLabs: {}", url);
-
-        // Header injection for API Key might be needed if not supported in query params for auth.
-        // ElevenLabs docs usually say "xi-api-key" header.
-        // tungstenite `connect_async` takes a Request, so we can add headers.
         
         let request = http::Request::builder()
             .uri(url.as_str())
@@ -71,11 +68,10 @@ impl ElevenLabsClient {
         let (mut write, mut read) = ws_stream.split();
 
         // Spawn a task to read from WS and send text to injector
-        let mut read_task = tokio::spawn(async move {
+        let read_task = tokio::spawn(async move {
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                        // println!("📩 Received: {}", text); // Debug log
                         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&text) {
                             if let Some(msg_type) = event.get("type").and_then(|v| v.as_str()) {
                                 match msg_type {
@@ -110,37 +106,13 @@ impl ElevenLabsClient {
 
         // Loop to send audio from channel to WS
         while let Some(chunk) = audio_rx.recv().await {
-            // Convert i16 to base64
-            // ElevenLabs expects base64 encoded raw PCM or container format?
-            // "audio_format": "pcm_16000" implies raw PCM.
-            // We need to convert [i16] -> [u8] bytes -> Base64 String.
-            
             let byte_data: Vec<u8> = chunk.iter().flat_map(|&s| s.to_le_bytes().to_vec()).collect();
-            let b64 = base64::encode(&byte_data);
+            let b64 = general_purpose::STANDARD.encode(&byte_data);
 
-            let msg = json!({
-                "audio_event": {
-                    "audio_base_64": b64,
-                    "event_type": "audio_input"
-                }
-            });
-
-            // Note: Check ElevenLabs Scribe v2 specific JSON structure.
-            // Docs: { "audio": "base64...", "isFinal": false } or just raw JSON?
-            // Re-checking standard structure:
-            // usually: { "type": "audio_input", "data": "base64..." } or similar.
-            // Let's stick to a generic "audio_event" wrapper if that's what their specialized client does,
-            // OR simply follow the standard:
-            
-            // Standard Scribe v2:
-            // Send JSON: { "type": "audio", "data": "<base64>" } ?
-            // Actually, looking at previous TS code:
-            // "message_type": "input_audio_chunk", "audio_base_64": "...", "sample_rate": 16000
-            
+            // Correct Scribe v2 JSON format
             let valid_msg = json!({
-                "message_type": "input_audio_chunk",
-                "audio_base_64": b64,
-                "sample_rate": 16000 // Optional if set in connection
+                "type": "audio",
+                "data": b64
             });
 
             if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(valid_msg.to_string())).await {

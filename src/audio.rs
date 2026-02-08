@@ -1,42 +1,59 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender; // Use bounded sender for backpressure
 use std::error::Error;
+use rubato::{Resampler, SincFixedIn, SincInterpolationType, SincInterpolationParameters, WindowFunction};
+use std::sync::{Arc, Mutex};
 
 /// Audio configuration constants
 const TARGET_SAMPLE_RATE: u32 = 16000;
-const TARGET_CHANNELS: u16 = 1;
+const CHUNK_SIZE: usize = 1024; // Process in chunks
 
 /// Starts the audio recording stream.
-/// Audio chunks (raw i16 PCM) are sent to the provided `sender`.
-pub fn start_audio_capture(sender: UnboundedSender<Vec<i16>>) -> Result<cpal::Stream, Box<dyn Error + Send + Sync>> {
+/// Audio chunks (raw i16 PCM @ 16kHz) are sent to the provided `sender`.
+pub fn start_audio_capture(sender: Sender<Vec<i16>>) -> Result<cpal::Stream, Box<dyn Error + Send + Sync>> {
     let host = cpal::default_host();
-    
-    // Get the default input device
-    let device = host.default_input_device()
-        .ok_or("No input device available")?;
-        
-    println!("🎤 Input device: {}", device.name().unwrap_or_else(|_| "Unknown".to_string()));
-
-    // Try to find a config supported by the device
+    let device = host.default_input_device().ok_or("No input device available")?;
     let config = device.default_input_config()?;
+    let input_sample_rate = config.sample_rate().0;
     
-    println!("🎧 Default config: {:?} channels, {} Hz", config.channels(), config.sample_rate().0);
+    println!("🎤 Input device: {} @ {}Hz", device.name().unwrap_or_default(), input_sample_rate);
 
-    let err_fn = move |err| {
-        eprintln!("❌ an error occurred on stream: {}", err);
+    // Setup Resampler if needed
+    let resampler = if input_sample_rate != TARGET_SAMPLE_RATE {
+        println!("🔄 Resampling from {}Hz to {}Hz", input_sample_rate, TARGET_SAMPLE_RATE);
+        
+        let params = SincInterpolationParameters {
+            sinc_len: 256,
+            f_cutoff: 0.95,
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: 256,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        
+        SincFixedIn::<f32>::new(
+            TARGET_SAMPLE_RATE as f64 / input_sample_rate as f64,
+            2.0, // Max ratio
+            params,
+            CHUNK_SIZE, 
+            1 // channels
+        ).ok()
+    } else {
+        None
     };
+
+    // Shared state for the callback (Resampler needs to be mutable)
+    // In a real app, use a ring buffer. Here we keep it simple but thread-safe.
+    let resampler_state = Arc::new(Mutex::new(resampler));
+    // Buffer to hold incoming samples until we have enough for a resampler chunk
+    let buffer_state = Arc::new(Mutex::new(Vec::<f32>::with_capacity(CHUNK_SIZE * 2)));
+    
+    let err_fn = move |err| eprintln!("❌ Audio stream error: {}", err);
 
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
             &config.into(),
             move |data: &[f32], _: &_| {
-                // Convert f32 to i16 for ElevenLabs
-                let samples: Vec<i16> = data.iter()
-                    .map(|&s| (s * i16::MAX as f32) as i16)
-                    .collect();
-                if let Err(_) = sender.send(samples) {
-                    // Channel closed
-                }
+                process_audio_f32(data, &sender, &resampler_state, &buffer_state, input_sample_rate);
             },
             err_fn,
             None 
@@ -44,23 +61,9 @@ pub fn start_audio_capture(sender: UnboundedSender<Vec<i16>>) -> Result<cpal::St
         cpal::SampleFormat::I16 => device.build_input_stream(
             &config.into(),
             move |data: &[i16], _: &_| {
-                if let Err(_) = sender.send(data.to_vec()) {
-                    // Channel closed
-                }
-            },
-            err_fn,
-            None
-        )?,
-        cpal::SampleFormat::U16 => device.build_input_stream(
-            &config.into(),
-            move |data: &[u16], _: &_| {
-                // Convert u16 to i16
-                let samples: Vec<i16> = data.iter()
-                    .map(|&s| (s as i32 - 32768) as i16)
-                    .collect();
-                if let Err(_) = sender.send(samples) {
-                    // Channel closed
-                }
+                // Convert i16 -> f32 for resampling
+                let samples_f32: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+                process_audio_f32(&samples_f32, &sender, &resampler_state, &buffer_state, input_sample_rate);
             },
             err_fn,
             None
@@ -70,4 +73,42 @@ pub fn start_audio_capture(sender: UnboundedSender<Vec<i16>>) -> Result<cpal::St
 
     stream.play()?;
     Ok(stream)
+}
+
+fn process_audio_f32(
+    input: &[f32], 
+    sender: &Sender<Vec<i16>>, 
+    resampler_state: &Arc<Mutex<Option<SincFixedIn<f32>>>>,
+    buffer_state: &Arc<Mutex<Vec<f32>>>,
+    _input_rate: u32
+) {
+    let mut buffer = buffer_state.lock().unwrap();
+    buffer.extend_from_slice(input);
+
+    let mut resampler_guard = resampler_state.lock().unwrap();
+    
+    if let Some(resampler) = resampler_guard.as_mut() {
+        // If we have enough data for the resampler
+        let chunks_needed = buffer.len() / CHUNK_SIZE;
+        if chunks_needed > 0 {
+             // Basic implementation: take slices.
+             // Rubato requires strict chunk sizes for SincFixedIn
+             let input_frames = vec![buffer.drain(0..CHUNK_SIZE).collect::<Vec<f32>>()];
+             
+             if let Ok(output_frames) = resampler.process(&input_frames, None) {
+                 if let Some(channel_data) = output_frames.first() {
+                     let output_i16: Vec<i16> = channel_data.iter()
+                        .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                        .collect();
+                     let _ = sender.blocking_send(output_i16);
+                 }
+             }
+        }
+    } else {
+        // No resampling needed
+        let output_i16: Vec<i16> = buffer.drain(..)
+            .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+            .collect();
+        let _ = sender.blocking_send(output_i16);
+    }
 }

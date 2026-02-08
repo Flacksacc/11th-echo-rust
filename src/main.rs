@@ -43,9 +43,10 @@ fn main() -> Result<(), slint::PlatformError> {
                         println!("⚡ Starting Recording Session...");
                         
                         // 1. Create channels
-                        let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<i16>>();
+                        // Use a bounded channel for audio to prevent memory explosion if net lags
+                        let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>(50); 
                         let (text_tx, mut text_rx) = mpsc::channel::<String>(100);
-                        let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+                        let (stop_tx, stop_rx) = oneshot::channel::<()>();
 
                         // 2. Start Audio Capture (Sync)
                         let stream_result = audio::start_audio_capture(audio_tx);
@@ -62,6 +63,9 @@ fn main() -> Result<(), slint::PlatformError> {
                                             println!("⚡ Stop signal received");
                                         }
                                     }
+                                    // When this block exits, text_tx is dropped.
+                                    // This causes the Injector loop below (text_rx) to return None and exit.
+                                    println!("⚡ Session Tear-down");
                                 });
 
                                 // 4. Spawn Text Injector (Async listener)
