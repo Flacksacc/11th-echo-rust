@@ -1,5 +1,6 @@
 mod injector;
 mod audio;
+mod network;
 
 use slint::ComponentHandle;
 use std::thread;
