@@ -7,10 +7,13 @@ use std::thread;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+
+#[cfg(target_os = "windows")]
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
     TrayIconBuilder, TrayIconEvent,
 };
+#[cfg(target_os = "windows")]
 use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager,
@@ -29,24 +32,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🦋 11th Echo Rust (Iron Butterfly) Starting...");
 
     // 1. Setup Global Hotkeys
-    let manager = GlobalHotKeyManager::new().unwrap();
-    let hotkey = HotKey::new(Some(Modifiers::CONTROL), Code::Space);
-    manager.register(hotkey).unwrap();
+    #[cfg(target_os = "windows")]
+    let (manager, hotkey) = {
+        let manager = GlobalHotKeyManager::new().unwrap();
+        let hotkey = HotKey::new(Some(Modifiers::CONTROL), Code::Space);
+        manager.register(hotkey).unwrap();
+        (manager, hotkey)
+    };
 
     // 2. Setup Tray Icon
-    let tray_menu = Menu::new();
-    let show_item = MenuItem::new("Show Settings", true, None);
-    let quit_item = MenuItem::new("Quit", true, None);
-    tray_menu.append_items(&[&show_item, &quit_item])?;
+    #[cfg(target_os = "windows")]
+    let (quit_item_id, show_item_id, _tray_icon) = {
+        let tray_menu = Menu::new();
+        let show_item = MenuItem::new("Show Settings", true, None);
+        let quit_item = MenuItem::new("Quit", true, None);
+        tray_menu.append_items(&[&show_item, &quit_item])?;
 
-    let icon = tray_icon::Icon::from_path("eleventhecho.ico", None)?;
-    let mut _tray_icon = Some(
-        TrayIconBuilder::new()
-            .with_menu(Box::new(tray_menu))
-            .with_tooltip("11th Echo")
-            .with_icon(icon)
-            .build()?,
-    );
+        let icon = tray_icon::Icon::from_path("eleventhecho.ico", None)?;
+        let tray = TrayIconBuilder::new()
+                .with_menu(Box::new(tray_menu))
+                .with_tooltip("11th Echo")
+                .with_icon(icon)
+                .build()?;
+        (quit_item.id(), show_item.id(), Some(tray))
+    };
 
     // Channel to send commands from UI to Tokio
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AppCommand>();
@@ -170,36 +179,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(50), move || {
         if let Some(ui) = ui_handle_for_timer.upgrade() {
-            // Global Hotkeys
-            while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-                if event.id == hotkey.id() {
-                    println!("🔥 Hotkey Pressed!");
-                    if ui.get_is_recording() {
-                        let _ = cmd_tx_for_timer.send(AppCommand::StopRecording);
-                        ui.set_is_recording(false);
-                    } else {
-                        let api_key = ui.get_api_key_text().to_string();
-                        let _ = cmd_tx_for_timer.send(AppCommand::StartRecording {
-                            api_key,
-                            model: "scribe_v2".to_string()
-                        });
-                        ui.set_is_recording(true);
+            #[cfg(target_os = "windows")]
+            {
+                // Global Hotkeys
+                while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+                    if event.id == hotkey.id() {
+                        println!("🔥 Hotkey Pressed!");
+                        if ui.get_is_recording() {
+                            let _ = cmd_tx_for_timer.send(AppCommand::StopRecording);
+                            ui.set_is_recording(false);
+                        } else {
+                            let api_key = ui.get_api_key_text().to_string();
+                            let _ = cmd_tx_for_timer.send(AppCommand::StartRecording {
+                                api_key,
+                                model: "scribe_v2".to_string()
+                            });
+                            ui.set_is_recording(true);
+                        }
+                        ui.show().unwrap();
                     }
-                    ui.show().unwrap();
                 }
-            }
 
-            // Tray Events
-            while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                println!("tray event: {event:?}");
-            }
+                // Tray Events
+                while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                    println!("tray event: {event:?}");
+                }
 
-            // Menu Events
-            while let Ok(event) = MenuEvent::receiver().try_recv() {
-                if event.id == quit_item.id() {
-                    slint::quit_event_loop().unwrap();
-                } else if event.id == show_item.id() {
-                    ui.show().unwrap();
+                // Menu Events
+                while let Ok(event) = MenuEvent::receiver().try_recv() {
+                    if event.id == quit_item_id {
+                        slint::quit_event_loop().unwrap();
+                    } else if event.id == show_item_id {
+                        ui.show().unwrap();
+                    }
                 }
             }
         }

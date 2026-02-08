@@ -71,6 +71,7 @@ pub fn inject_text(text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
 }
 
 #[cfg(not(windows))]
-pub fn inject_text(_text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    Err("Input injection is only supported on Windows".into())
+pub fn inject_text(text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    println!("INJECT (No-op on Linux): {}", text);
+    Ok(())
 }
