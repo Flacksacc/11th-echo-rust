@@ -1,4 +1,5 @@
 mod injector;
+mod audio;
 
 #[tokio::main]
 async fn main() {
