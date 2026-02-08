@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::error::Error;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use url::Url;
 
@@ -42,7 +42,7 @@ impl ElevenLabsClient {
 
     pub async fn run(
         &self,
-        mut audio_rx: Receiver<Vec<i16>>,
+        mut audio_rx: UnboundedReceiver<Vec<i16>>,
         text_tx: tokio::sync::mpsc::Sender<String>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let url = Url::parse_with_params(

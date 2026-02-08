@@ -1,5 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::mpsc::Sender;
+use tokio::sync::mpsc::UnboundedSender;
 use std::error::Error;
 
 /// Audio configuration constants
@@ -8,7 +8,7 @@ const TARGET_CHANNELS: u16 = 1;
 
 /// Starts the audio recording stream.
 /// Audio chunks (raw i16 PCM) are sent to the provided `sender`.
-pub fn start_audio_capture(sender: Sender<Vec<i16>>) -> Result<cpal::Stream, Box<dyn Error + Send + Sync>> {
+pub fn start_audio_capture(sender: UnboundedSender<Vec<i16>>) -> Result<cpal::Stream, Box<dyn Error + Send + Sync>> {
     let host = cpal::default_host();
     
     // Get the default input device
@@ -21,11 +21,6 @@ pub fn start_audio_capture(sender: Sender<Vec<i16>>) -> Result<cpal::Stream, Box
     let config = device.default_input_config()?;
     
     println!("🎧 Default config: {:?} channels, {} Hz", config.channels(), config.sample_rate().0);
-
-    // For this MVP, we are somewhat relying on the device supporting standard formats.
-    // In a production app, we would add a proper Resampler here to ensure 16kHz output.
-    // For now, we just pass the raw samples and let the consumer handle (or fail) if mismatched.
-    // TODO: Implement `samplerate` crate for high-quality resampling to 16000Hz.
 
     let err_fn = move |err| {
         eprintln!("❌ an error occurred on stream: {}", err);
@@ -40,7 +35,7 @@ pub fn start_audio_capture(sender: Sender<Vec<i16>>) -> Result<cpal::Stream, Box
                     .map(|&s| (s * i16::MAX as f32) as i16)
                     .collect();
                 if let Err(_) = sender.send(samples) {
-                    // Channel closed, stop streaming?
+                    // Channel closed
                 }
             },
             err_fn,
