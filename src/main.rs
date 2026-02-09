@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Setup Global Hotkeys
     #[cfg(target_os = "windows")]
-    let (manager, hotkey) = {
+    let (_manager, hotkey) = {
         let manager = GlobalHotKeyManager::new().unwrap();
         let hotkey = HotKey::new(Some(Modifiers::CONTROL), Code::Space);
         manager.register(hotkey).unwrap();
@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_tooltip("11th Echo")
                 .with_icon(icon)
                 .build()?;
-        (quit_item.id(), show_item.id(), Some(tray))
+        (quit_item.id().clone(), show_item.id().clone(), Some(tray))
     };
 
     // Channel to send commands from UI to Tokio
