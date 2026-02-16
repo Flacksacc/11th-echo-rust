@@ -1,4 +1,4 @@
-import { Button, VerticalBox, LineEdit, ComboBox } from "std-widgets.slint";
+import { Button, VerticalBox, LineEdit, ComboBox, ScrollView } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
     title: "11th Echo Settings";
@@ -13,6 +13,7 @@ export component AppWindow inherits Window {
     callback stop-recording();
     in property <bool> is-recording: false;
     in property <float> audio-level: 0.0;
+    in-out property <string> transcript;
 
     VerticalBox {
         padding: 20px;
@@ -61,6 +62,36 @@ export component AppWindow inherits Window {
             ComboBox {
                 model: ["Default Device", "Microphone 2"];
                 current-value: "Default Device";
+            }
+        }
+
+        VerticalBox {
+            spacing: 5px;
+            vertical-stretch: 1;
+            Text { text: "Transcription:"; color: #bac2de; }
+            Rectangle {
+                min-height: 120px;
+                vertical-stretch: 1;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #45475a;
+                background: #11111b;
+                clip: true;
+
+                ScrollView {
+                    x: 8px;
+                    y: 8px;
+                    width: parent.width - 16px;
+                    height: parent.height - 16px;
+
+                    Text {
+                        width: parent.visible-width;
+                        text: root.transcript;
+                        wrap: word-wrap;
+                        color: #cdd6f4;
+                        vertical-alignment: top;
+                    }
+                }
             }
         }
 
