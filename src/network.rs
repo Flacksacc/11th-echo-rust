@@ -232,6 +232,7 @@ impl ElevenLabsClient {
                             println!("➡️ [API OUT] WS silence chunk 1/2 (pre-commit)");
                             if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(pre_commit_1)).await {
                                 eprintln!("❌ Failed to send pre-commit silence chunk 1: {}", e);
+                                break;
                             }
 
                             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -240,6 +241,7 @@ impl ElevenLabsClient {
                             println!("➡️ [API OUT] WS silence chunk 2/2 (pre-commit)");
                             if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(pre_commit_2)).await {
                                 eprintln!("❌ Failed to send pre-commit silence chunk 2: {}", e);
+                                break;
                             }
 
                             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -248,6 +250,7 @@ impl ElevenLabsClient {
                             println!("➡️ [API OUT] WS commit chunk");
                             if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(commit_payload)).await {
                                 eprintln!("❌ Failed to send commit chunk: {}", e);
+                                break;
                             }
 
                             tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -281,6 +284,7 @@ impl ElevenLabsClient {
                             println!("➡️ [API OUT] WS silence chunk 1/2 (pre-commit)");
                             if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(pre_commit_1)).await {
                                 eprintln!("❌ Failed to send pre-commit silence chunk 1 after audio close: {}", e);
+                                break;
                             }
 
                             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -289,6 +293,7 @@ impl ElevenLabsClient {
                             println!("➡️ [API OUT] WS silence chunk 2/2 (pre-commit)");
                             if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(pre_commit_2)).await {
                                 eprintln!("❌ Failed to send pre-commit silence chunk 2 after audio close: {}", e);
+                                break;
                             }
 
                             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -297,6 +302,7 @@ impl ElevenLabsClient {
                             println!("➡️ [API OUT] WS commit chunk");
                             if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(commit_payload)).await {
                                 eprintln!("❌ Failed to send commit chunk after audio close: {}", e);
+                                break;
                             }
 
                             tokio::time::sleep(Duration::from_millis(1000)).await;

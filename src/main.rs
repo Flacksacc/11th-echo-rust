@@ -6,7 +6,7 @@ mod pipeline;
 mod settings;
 mod state;
 
-use slint::{Color, ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{CloseRequestResponse, Color, ComponentHandle, ModelRc, SharedString, VecModel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use pipeline::TranscriptPipeline;
@@ -32,7 +32,7 @@ use std::{cell::RefCell, rc::Rc};
 #[cfg(target_os = "windows")]
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
-    TrayIconBuilder, TrayIconEvent,
+    MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
 };
 
 slint::include_modules!();
@@ -361,6 +361,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Color::from_rgb_u8(204, 239, 214),
     ));
 
+    // When the user closes the main window, hide it but keep the Slint
+    // event loop alive so the app can continue running from the tray.
+    let ui_weak_for_close = ui.as_weak();
+    ui.window().on_close_requested(move || {
+        if let Some(ui) = ui_weak_for_close.upgrade() {
+            let _ = ui.window().hide();
+        }
+        CloseRequestResponse::KeepWindowShown
+    });
+
     #[cfg(target_os = "windows")]
     let hotkey_capture_window = HotkeyCaptureWindow::new()?;
     #[cfg(target_os = "windows")]
@@ -675,6 +685,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     ui.set_is_recording(false);
                                 });
 
+                                // Immediately hide and reset the overlay, even if no
+                                // transcript text was ever produced for this session.
+                                let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
+                                    overlay.set_sentence_text("".into());
+                                    overlay.set_window_width(520);
+                                    overlay.set_window_height(120);
+                                    let _ = overlay.hide();
+                                });
+
                                 if let Some(session) = active_session.as_mut() {
                                     {
                                         let mut s = session.state.lock().unwrap();
@@ -891,7 +910,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                        println!("tray event: {event:?}");
+                        if let TrayIconEvent::Click { button, button_state, .. } = event {
+                            if button == MouseButton::Left && button_state == MouseButtonState::Up {
+                                ui.set_active_tab(0);
+                                let _ = ui.show();
+                            }
+                        }
                     }
 
                     while let Ok(event) = MenuEvent::receiver().try_recv() {
@@ -907,7 +931,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    ui.run()?;
+    ui.show()?;
+    slint::run_event_loop_until_quit()?;
     Ok(())
 }
 
