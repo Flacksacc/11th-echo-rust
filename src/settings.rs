@@ -18,6 +18,11 @@ pub struct AppSettings {
     pub theme_text_color: String,
     pub overlay_background_color: String,
     pub overlay_text_color: String,
+    pub gemini_api_key: String,
+    pub gemini_enabled: bool,
+    pub gemini_model: String,
+    pub gemini_prompt_preset: String,
+    pub gemini_custom_prompt: String,
 }
 
 impl Default for AppSettings {
@@ -36,6 +41,11 @@ impl Default for AppSettings {
             theme_text_color: "#ccefd6".to_string(),             // muted light green
             overlay_background_color: "#03150c".to_string(),     // darker overlay panel
             overlay_text_color: "#e6fff0".to_string(),           // overlay text
+            gemini_api_key: String::new(),
+            gemini_enabled: false,
+            gemini_model: "gemini-3.1-flash-lite-preview".to_string(),
+            gemini_prompt_preset: "Minimal corrections".to_string(),
+            gemini_custom_prompt: String::new(),
         }
     }
 }
@@ -117,6 +127,11 @@ mod tests {
             theme_text_color: "#0000ff".to_string(),
             overlay_background_color: "#123456".to_string(),
             overlay_text_color: "#654321".to_string(),
+            gemini_api_key: "gm_test".to_string(),
+            gemini_enabled: true,
+            gemini_model: "gemini-3.1-flash-lite-preview".to_string(),
+            gemini_prompt_preset: "Minimal corrections".to_string(),
+            gemini_custom_prompt: "Custom instructions".to_string(),
         };
         save_settings_to_path(&path, &expected);
         let loaded = load_settings_from_path(&path);

@@ -5,6 +5,7 @@ mod network;
 mod pipeline;
 mod settings;
 mod state;
+mod gemini;
 
 use slint::{CloseRequestResponse, Color, ComponentHandle, ModelRc, SharedString, VecModel};
 use std::sync::{Arc, Mutex};
@@ -324,6 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "windows"))]
     ui.set_hotkey_text("Unavailable".into());
     ui.set_api_key_text(initial_settings.api_key.clone().into());
+    ui.set_gemini_api_key_text(initial_settings.gemini_api_key.clone().into());
     ui.set_selected_microphone(selected_microphone.clone().into());
     ui.set_use_default_microphone(initial_settings.use_default_microphone);
     ui.set_default_microphone_text(default_microphone.clone().into());
@@ -334,6 +336,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(SharedString::from)
             .collect::<Vec<SharedString>>(),
     )));
+
+    let gemini_preset_options: Vec<SharedString> = vec![
+        "Minimal corrections".into(),
+        "Sound like a pirate".into(),
+        "Sound like a medieval knight".into(),
+        "Custom".into(),
+    ];
+    ui.set_gemini_preset_options(ModelRc::new(VecModel::from(gemini_preset_options)));
+    ui.set_selected_gemini_preset(initial_settings.gemini_prompt_preset.clone().into());
+    ui.set_gemini_custom_prompt(initial_settings.gemini_custom_prompt.clone().into());
+    ui.set_gemini_model_text(initial_settings.gemini_model.clone().into());
+    ui.set_use_gemini_modifier(initial_settings.gemini_enabled);
 
     ui.set_overlay_opacity(initial_settings.overlay_opacity);
     ui.set_theme_background_top_color(parse_theme_color(
@@ -538,6 +552,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let client_state = state.clone();
                                         let injection_state = state.clone();
                                         let transcript_pipeline_for_text = transcript_pipeline.clone();
+                                        let settings_for_text = settings_for_runtime.clone();
                                         let finalize_tx_for_network = finalize_tx.clone();
                                         let finalize_tx_for_injection = finalize_tx.clone();
                                         let ui_handle_for_network = ui_handle_for_tokio.clone();
@@ -592,30 +607,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 }
 
                                                 let mut was_committed = false;
-                                                let display_text = {
-                                                    let mut pipeline = transcript_pipeline_for_text.lock().unwrap();
-                                                    match msg {
-                                                        network::TranscriptMessage::Partial(text) => {
-                                                            latest_partial = text;
-                                                            let committed =
-                                                                pipeline.committed_text().trim().to_string();
-                                                            if committed.is_empty() {
-                                                                latest_partial.clone()
-                                                            } else if latest_partial.trim().is_empty() {
-                                                                committed
-                                                            } else {
-                                                                format!("{} {}", committed, latest_partial.trim())
-                                                            }
+                                                let display_text = match msg {
+                                                    network::TranscriptMessage::Partial(text) => {
+                                                        latest_partial = text;
+                                                        let committed = {
+                                                            let pipeline = transcript_pipeline_for_text.lock().unwrap();
+                                                            pipeline.committed_text().trim().to_string()
+                                                        };
+                                                        if committed.is_empty() {
+                                                            latest_partial.clone()
+                                                        } else if latest_partial.trim().is_empty() {
+                                                            committed
+                                                        } else {
+                                                            format!("{} {}", committed, latest_partial.trim())
                                                         }
-                                                        network::TranscriptMessage::Committed(text) => {
-                                                            latest_partial.clear();
-                                                            let aggregated = pipeline.push_fragment(&text);
-                                                            if let Err(e) = injector::inject_text(&text) {
-                                                                eprintln!("❌ Injection Error: {}", e);
-                                                            }
-                                                            was_committed = true;
-                                                            aggregated
+                                                    }
+                                                    network::TranscriptMessage::Committed(text) => {
+                                                        latest_partial.clear();
+
+                                                        // Snapshot Gemini settings while holding the lock briefly.
+                                                        let (gemini_on, gkey, gmodel, gpreset, gcustom) = {
+                                                            let s = settings_for_text.lock().unwrap();
+                                                            (
+                                                                s.gemini_enabled,
+                                                                s.gemini_api_key.clone(),
+                                                                s.gemini_model.clone(),
+                                                                s.gemini_prompt_preset.clone(),
+                                                                s.gemini_custom_prompt.clone(),
+                                                            )
+                                                        };
+                                                        // Lock is dropped here before any await.
+
+                                                        let final_text = if gemini_on {
+                                                            println!("🤖 [Gemini] Rewriting committed text...");
+                                                            gemini::rewrite_text(&gkey, &gmodel, &gpreset, &gcustom, &text).await
+                                                        } else {
+                                                            text
+                                                        };
+
+                                                        let aggregated = {
+                                                            let mut pipeline = transcript_pipeline_for_text.lock().unwrap();
+                                                            pipeline.push_fragment(&final_text)
+                                                        };
+                                                        if let Err(e) = injector::inject_text(&final_text) {
+                                                            eprintln!("❌ Injection Error: {}", e);
                                                         }
+                                                        was_committed = true;
+                                                        aggregated
                                                     }
                                                 };
 
@@ -734,25 +772,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings_for_save = settings.clone();
     let ui_weak_for_apply = ui.as_weak();
     ui.on_apply_settings(move || {
-        let api_key = if let Some(ui) = ui_weak_for_apply.upgrade() {
-            ui.get_api_key_text().to_string()
-        } else {
-            String::new()
-        };
-        let selected_mic = if let Some(ui) = ui_weak_for_apply.upgrade() {
-            ui.get_selected_microphone().to_string()
-        } else {
-            String::new()
-        };
-        let use_default_mic = if let Some(ui) = ui_weak_for_apply.upgrade() {
-            ui.get_use_default_microphone()
-        } else {
-            true
-        };
+        let (api_key, gemini_api_key, gemini_enabled, gemini_model, gemini_preset, gemini_custom, selected_mic, use_default_mic) =
+            if let Some(ui) = ui_weak_for_apply.upgrade() {
+                (
+                    ui.get_api_key_text().to_string(),
+                    ui.get_gemini_api_key_text().to_string(),
+                    ui.get_use_gemini_modifier(),
+                    ui.get_gemini_model_text().to_string(),
+                    ui.get_selected_gemini_preset().to_string(),
+                    ui.get_gemini_custom_prompt().to_string(),
+                    ui.get_selected_microphone().to_string(),
+                    ui.get_use_default_microphone(),
+                )
+            } else {
+                (String::new(), String::new(), false, "gemini-3.1-flash-lite-preview".to_string(), "Minimal corrections".to_string(), String::new(), String::new(), true)
+            };
 
         let snapshot = {
             let mut current = settings_for_ui.lock().unwrap();
             current.api_key = api_key;
+            current.gemini_api_key = gemini_api_key;
+            current.gemini_enabled = gemini_enabled;
+            current.gemini_model = gemini_model;
+            current.gemini_prompt_preset = gemini_preset;
+            current.gemini_custom_prompt = gemini_custom;
             current.selected_microphone = selected_mic;
             current.use_default_microphone = use_default_mic;
             current.clone()
@@ -826,6 +869,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let mut s = settings_for_timer.lock().unwrap();
                     s.api_key = ui.get_api_key_text().to_string();
+                    s.gemini_api_key = ui.get_gemini_api_key_text().to_string();
+                    s.gemini_enabled = ui.get_use_gemini_modifier();
+                    s.gemini_model = ui.get_gemini_model_text().to_string();
+                    s.gemini_prompt_preset = ui.get_selected_gemini_preset().to_string();
+                    s.gemini_custom_prompt = ui.get_gemini_custom_prompt().to_string();
                     s.selected_microphone = ui.get_selected_microphone().to_string();
                     s.use_default_microphone = ui.get_use_default_microphone();
                     s.overlay_opacity = ui.get_overlay_opacity();

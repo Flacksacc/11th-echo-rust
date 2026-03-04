@@ -26,6 +26,9 @@ futures-util = "0.3"
 base64 = "0.22"
 http = "1.1"
 
+# HTTP client for Gemini API
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+
 # Logging & Error Handling
 anyhow = "1.0"
 log = "0.4"

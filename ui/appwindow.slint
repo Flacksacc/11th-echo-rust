@@ -17,6 +17,7 @@ export component AppWindow inherits Window {
     in-out property <string> transcript;
 
     in-out property <string> api-key-text;
+    in-out property <string> gemini-api-key-text;
     in property <[string]> microphone-options;
     in-out property <string> selected-microphone;
     in-out property <bool> use-default-microphone: true;
@@ -31,6 +32,11 @@ export component AppWindow inherits Window {
     in-out property <color> theme-text-color: #ccefd6;
     in-out property <color> overlay-background-color: #03150c;
     in-out property <color> overlay-text-color: #e6fff0;
+    in-out property <bool> use-gemini-modifier: false;
+    in-out property <string> gemini-model-text;
+    in-out property <[string]> gemini-preset-options;
+    in-out property <string> selected-gemini-preset;
+    in-out property <string> gemini-custom-prompt;
 
     callback start-recording();
     callback stop-recording();
@@ -248,6 +254,85 @@ export component AppWindow inherits Window {
                                         clicked => {
                                             root.start-hotkey-capture();
                                         }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                height: 1px;
+                                horizontal-stretch: 1;
+                                background: #313244;
+                            }
+
+                            VerticalBox {
+                                spacing: 8px;
+
+                                Text {
+                                    text: "Gemini Text Rewriter";
+                                    font-size: 18px;
+                                    font-weight: 600;
+                                    color: root.theme-title-color;
+                                }
+
+                                use-gemini := CheckBox {
+                                    text: "Enable Gemini text modification before injection";
+                                    checked <=> root.use-gemini-modifier;
+                                }
+
+                                VerticalBox {
+                                    spacing: 5px;
+                                    Text {
+                                        text: "Gemini API Key";
+                                        color: #bac2de;
+                                        wrap: word-wrap;
+                                    }
+                                    LineEdit {
+                                        text <=> root.gemini-api-key-text;
+                                        placeholder-text: "AIza...";
+                                        input-type: password;
+                                        enabled: use-gemini.checked;
+                                    }
+                                }
+
+                                VerticalBox {
+                                    spacing: 5px;
+                                    Text {
+                                        text: "Gemini Model";
+                                        color: #bac2de;
+                                        wrap: word-wrap;
+                                    }
+                                    LineEdit {
+                                        text <=> root.gemini-model-text;
+                                        placeholder-text: "gemini-3.1-flash-lite-preview";
+                                        enabled: use-gemini.checked;
+                                    }
+                                }
+
+                                VerticalBox {
+                                    spacing: 5px;
+                                    Text {
+                                        text: "Rewrite style";
+                                        color: #bac2de;
+                                        wrap: word-wrap;
+                                    }
+                                    ComboBox {
+                                        model: root.gemini-preset-options;
+                                        current-value <=> root.selected-gemini-preset;
+                                        enabled: use-gemini.checked;
+                                    }
+                                }
+
+                                VerticalBox {
+                                    spacing: 5px;
+                                    Text {
+                                        text: "Custom prompt (used when preset is \"Custom\")";
+                                        color: #bac2de;
+                                        wrap: word-wrap;
+                                    }
+                                    LineEdit {
+                                        text <=> root.gemini-custom-prompt;
+                                        placeholder-text: "Describe how Gemini should rewrite your text";
+                                        enabled: use-gemini.checked && root.selected-gemini-preset == "Custom";
                                     }
                                 }
                             }
