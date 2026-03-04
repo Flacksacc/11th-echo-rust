@@ -642,6 +642,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                             );
                                                             overlay.set_window_width(w);
                                                             overlay.set_window_height(h);
+                                                            let _ = overlay.show();
                                                         }
                                                     });
                                             }
