@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use dirs_next::config_dir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -40,7 +41,10 @@ impl Default for AppSettings {
 }
 
 pub fn settings_path() -> PathBuf {
-    PathBuf::from("settings.json")
+    // Prefer a per-user configuration directory; fall back to the current
+    // directory if the OS-specific config dir is unavailable.
+    let base = config_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join("11th_echo").join("settings.json")
 }
 
 pub fn load_settings() -> AppSettings {
@@ -61,6 +65,14 @@ pub fn save_settings(settings: &AppSettings) {
 }
 
 pub fn save_settings_to_path(path: &PathBuf, settings: &AppSettings) {
+    // Ensure the target directory exists (create the per-user folder if needed)
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            eprintln!("❌ Failed to create settings directory {:?}: {}", parent, err);
+            return;
+        }
+    }
+
     match serde_json::to_string_pretty(settings) {
         Ok(json) => {
             if let Err(err) = fs::write(path, json) {
