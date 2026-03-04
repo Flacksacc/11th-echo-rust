@@ -75,3 +75,18 @@ pub fn inject_text(text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("INJECT (No-op on Linux): {}", text);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::inject_text;
+
+    #[test]
+    fn inject_empty_text_is_ok() {
+        assert!(inject_text("").is_ok());
+    }
+
+    #[test]
+    fn inject_null_only_text_is_ok() {
+        assert!(inject_text("\0").is_ok());
+    }
+}

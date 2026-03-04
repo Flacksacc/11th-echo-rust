@@ -8,8 +8,30 @@ use std::collections::VecDeque;
 
 /// Audio configuration constants
 const TARGET_SAMPLE_RATE: u32 = 16000;
-const CHUNK_SIZE: usize = 1024; // Process in chunks
+const CHUNK_SIZE: usize = TARGET_SAMPLE_RATE as usize; // Send 1 second chunks at 16kHz mono
 const PRECONNECT_BUFFER_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 5; // Keep last 5s before consumer catches up
+
+pub fn list_input_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    let mut names = Vec::new();
+
+    if let Ok(devices) = host.input_devices() {
+        for device in devices {
+            if let Ok(name) = device.name() {
+                names.push(name);
+            }
+        }
+    }
+
+    names.sort();
+    names.dedup();
+    names
+}
+
+pub fn default_input_device_name() -> Option<String> {
+    let host = cpal::default_host();
+    host.default_input_device().and_then(|d| d.name().ok())
+}
 
 struct CircularSampleBuffer {
     samples: VecDeque<i16>,
@@ -74,9 +96,23 @@ impl CircularSampleBuffer {
 pub fn start_audio_capture(
     sender: Sender<Vec<i16>>,
     level_sender: Sender<f32>,
+    preferred_device_name: Option<String>,
 ) -> Result<cpal::Stream, Box<dyn Error + Send + Sync>> {
     let host = cpal::default_host();
-    let device = host.default_input_device().ok_or("No input device available")?;
+    let device = if let Some(name) = preferred_device_name {
+        if name.trim().is_empty() {
+            host.default_input_device().ok_or("No input device available")?
+        } else if let Ok(mut devices) = host.input_devices() {
+            devices
+                .find(|d| d.name().map(|n| n == name).unwrap_or(false))
+                .or_else(|| host.default_input_device())
+                .ok_or("No input device available")?
+        } else {
+            host.default_input_device().ok_or("No input device available")?
+        }
+    } else {
+        host.default_input_device().ok_or("No input device available")?
+    };
     let config = device.default_input_config()?;
     let input_sample_rate = config.sample_rate().0;
     
@@ -225,5 +261,76 @@ fn enqueue_and_flush(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CircularSampleBuffer, CHUNK_SIZE, enqueue_and_flush};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn circular_buffer_trims_to_capacity() {
+        let mut b = CircularSampleBuffer::new(4);
+        b.push_samples(&[1, 2, 3, 4, 5, 6]);
+        let out = b.pop_chunk(10).unwrap();
+        assert_eq!(out, vec![3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn circular_buffer_push_front_restores_order() {
+        let mut b = CircularSampleBuffer::new(10);
+        b.push_samples(&[1, 2, 3]);
+        let chunk = b.pop_chunk(2).unwrap();
+        assert_eq!(chunk, vec![1, 2]);
+        b.push_front_samples(&chunk);
+        let out = b.pop_chunk(10).unwrap();
+        assert_eq!(out, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn circular_buffer_clear_empties_storage() {
+        let mut b = CircularSampleBuffer::new(10);
+        b.push_samples(&[1, 2, 3]);
+        b.clear();
+        assert!(b.pop_chunk(10).is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_and_flush_sends_when_channel_has_space() {
+        let (tx, mut rx) = mpsc::channel::<Vec<i16>>(4);
+        let ring = Arc::new(Mutex::new(CircularSampleBuffer::new(CHUNK_SIZE * 2)));
+        enqueue_and_flush(&tx, &ring, vec![1; CHUNK_SIZE]);
+        let got = rx.recv().await.unwrap();
+        assert_eq!(got.len(), CHUNK_SIZE);
+    }
+
+    #[tokio::test]
+    async fn enqueue_and_flush_handles_full_channel() {
+        let (tx, mut rx) = mpsc::channel::<Vec<i16>>(1);
+        let ring = Arc::new(Mutex::new(CircularSampleBuffer::new(CHUNK_SIZE * 3)));
+
+        // Fill channel so next send hits TrySendError::Full.
+        tx.try_send(vec![9; CHUNK_SIZE]).unwrap();
+        enqueue_and_flush(&tx, &ring, vec![1; CHUNK_SIZE]);
+
+        // First message is the pre-filled one.
+        let _ = rx.recv().await.unwrap();
+
+        // The chunk should have been preserved in ring buffer.
+        let mut rb = ring.lock().unwrap();
+        let preserved = rb.pop_chunk(CHUNK_SIZE).unwrap();
+        assert_eq!(preserved.len(), CHUNK_SIZE);
+    }
+
+    #[tokio::test]
+    async fn enqueue_and_flush_handles_closed_channel() {
+        let (tx, rx) = mpsc::channel::<Vec<i16>>(1);
+        drop(rx); // force TrySendError::Closed
+        let ring = Arc::new(Mutex::new(CircularSampleBuffer::new(CHUNK_SIZE * 2)));
+        enqueue_and_flush(&tx, &ring, vec![1; CHUNK_SIZE]);
+        let mut rb = ring.lock().unwrap();
+        assert!(rb.pop_chunk(CHUNK_SIZE).is_none());
     }
 }

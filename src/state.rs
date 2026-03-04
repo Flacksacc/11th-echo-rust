@@ -4,23 +4,13 @@ pub enum RecordingState {
     BufferingPreConnect,
     Connecting,
     Recording,
-    Finalizing { pending_injections: usize },
-    Error(String),
+    Finalizing,
+    Error,
 }
 
 impl RecordingState {
-    pub fn is_active(&self) -> bool {
-        matches!(
-            self,
-            RecordingState::BufferingPreConnect
-                | RecordingState::Connecting
-                | RecordingState::Recording
-                | RecordingState::Finalizing { .. }
-        )
-    }
-
     pub fn can_start(&self) -> bool {
-        matches!(self, RecordingState::Idle | RecordingState::Error(_))
+        matches!(self, RecordingState::Idle | RecordingState::Error)
     }
 
     pub fn can_stop(&self) -> bool {
@@ -30,10 +20,6 @@ impl RecordingState {
                 | RecordingState::Connecting
                 | RecordingState::Recording
         )
-    }
-
-    pub fn is_finalizing(&self) -> bool {
-        matches!(self, RecordingState::Finalizing { .. })
     }
 
     pub fn transition_to_connecting(&mut self) {
@@ -52,22 +38,8 @@ impl RecordingState {
     }
 
     pub fn transition_to_finalizing(&mut self) {
-        if !matches!(self, RecordingState::Finalizing { .. }) {
-            *self = RecordingState::Finalizing {
-                pending_injections: 0,
-            };
-        }
-    }
-
-    pub fn begin_injection(&mut self) {
-        if let RecordingState::Finalizing { pending_injections } = self {
-            *pending_injections += 1;
-        }
-    }
-
-    pub fn finish_injection(&mut self) {
-        if let RecordingState::Finalizing { pending_injections } = self {
-            *pending_injections = pending_injections.saturating_sub(1);
+        if !matches!(self, RecordingState::Finalizing) {
+            *self = RecordingState::Finalizing;
         }
     }
 
@@ -79,5 +51,48 @@ impl RecordingState {
 impl Default for RecordingState {
     fn default() -> Self {
         RecordingState::Idle
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RecordingState;
+
+    #[test]
+    fn start_stop_guards_work() {
+        let mut state = RecordingState::Idle;
+        assert!(state.can_start());
+        assert!(!state.can_stop());
+
+        state = RecordingState::BufferingPreConnect;
+        assert!(!state.can_start());
+        assert!(state.can_stop());
+    }
+
+    #[test]
+    fn transitions_follow_expected_path() {
+        let mut state = RecordingState::BufferingPreConnect;
+        state.transition_to_connecting();
+        assert!(matches!(state, RecordingState::Connecting));
+        state.transition_to_recording();
+        assert!(matches!(state, RecordingState::Recording));
+        state.transition_to_finalizing();
+        assert!(matches!(state, RecordingState::Finalizing));
+        state.transition_to_idle();
+        assert!(matches!(state, RecordingState::Idle));
+    }
+
+    #[test]
+    fn connecting_transition_is_noop_from_idle() {
+        let mut state = RecordingState::Idle;
+        state.transition_to_connecting();
+        assert!(matches!(state, RecordingState::Idle));
+    }
+
+    #[test]
+    fn recording_transition_allows_from_connecting() {
+        let mut state = RecordingState::Connecting;
+        state.transition_to_recording();
+        assert!(matches!(state, RecordingState::Recording));
     }
 }

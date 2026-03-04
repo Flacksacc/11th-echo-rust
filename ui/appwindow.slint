@@ -1,110 +1,664 @@
-import { Button, VerticalBox, LineEdit, ComboBox, ScrollView } from "std-widgets.slint";
+import { Button, VerticalBox, HorizontalBox, LineEdit, ComboBox, CheckBox, ScrollView, Slider } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
-    title: "11th Echo Settings";
-    icon: @image-url("../eleventhecho.ico");
-    min-width: 400px;
-    min-height: 300px;
-    background: #1e1e2e; // Catppuccin Mocha base (Dark Theme)
+    title: "11th Echo";
+    icon: @image-url("../eleventhecho.png");
+    min-width: 520px;
+    min-height: 360px;
+    background: @linear-gradient(0deg, root.theme-background-top-color, root.theme-background-bottom-color);
 
-    out property <string> api-key-text: api-key-input.text;
+    in-out property <int> active-tab: 0;
 
-    callback start-recording(string);
-    callback stop-recording();
     in property <bool> is-recording: false;
     in property <float> audio-level: 0.0;
+    in property <string> status-text: "Idle";
+    in property <string> hotkey-text: "Ctrl+Space";
+
     in-out property <string> transcript;
 
+    in-out property <string> api-key-text;
+    in property <[string]> microphone-options;
+    in-out property <string> selected-microphone;
+    in-out property <bool> use-default-microphone: true;
+    in property <string> default-microphone-text: "Unknown";
+
+    in-out property <float> overlay-opacity: 0.85;
+    in-out property <color> theme-background-top-color: #02140b;
+    in-out property <color> theme-background-bottom-color: #000806;
+    in-out property <color> theme-window-color: #041b11;
+    in-out property <color> theme-button-accent-color: #4ade80;
+    in-out property <color> theme-title-color: #e4ffe9;
+    in-out property <color> theme-text-color: #ccefd6;
+    in-out property <color> overlay-background-color: #03150c;
+    in-out property <color> overlay-text-color: #e6fff0;
+
+    callback start-recording();
+    callback stop-recording();
+    callback apply-settings();
+    callback start-hotkey-capture();
+    callback clear-transcript();
+
     VerticalBox {
-        padding: 20px;
-        spacing: 15px;
+        padding: 16px;
+        spacing: 12px;
 
-        Text {
-            text: "11th Echo";
-            font-size: 24px;
-            font-weight: 700;
-            color: #cdd6f4;
-            horizontal-alignment: center;
-        }
-
-        // Audio Level Indicator
-        Rectangle {
-            height: 4px;
-            background: #313244;
-            border-radius: 2px;
-            Rectangle {
-                x: 0;
-                width: parent.width * root.audio-level;
-                background: root.is-recording ? #a6e3a1 : #6c7086;
-                border-radius: 2px;
-                animate width { duration: 50ms; }
+        HorizontalBox {
+            spacing: 8px;
+            Button {
+                text: "Main";
+                primary: root.active-tab == 0;
+                clicked => { root.active-tab = 0; }
+            }
+            Button {
+                text: "Transcription";
+                primary: root.active-tab == 1;
+                clicked => { root.active-tab = 1; }
+            }
+            Button {
+                text: "Settings";
+                primary: root.active-tab == 2;
+                clicked => { root.active-tab = 2; }
             }
         }
 
-        Text {
-            text: "Status: " + (root.is-recording ? "Listening..." : "Idle");
-            color: root.is-recording ? #a6e3a1 : #6c7086; // Green or Overlay2
-            horizontal-alignment: center;
-        }
-
-        VerticalBox {
-            spacing: 5px;
-            Text { text: "ElevenLabs API Key:"; color: #bac2de; }
-            api-key-input := LineEdit {
-                placeholder-text: "sk_...";
-                input-type: password;
-            }
-        }
-
-        VerticalBox {
-            spacing: 5px;
-            Text { text: "Microphone:"; color: #bac2de; }
-            ComboBox {
-                model: ["Default Device", "Microphone 2"];
-                current-value: "Default Device";
-            }
-        }
-
-        VerticalBox {
-            spacing: 5px;
+        if (root.active-tab == 0) : Rectangle {
+            background: root.theme-window-color;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #313244;
             vertical-stretch: 1;
-            Text { text: "Transcription:"; color: #bac2de; }
-            Rectangle {
-                min-height: 120px;
-                vertical-stretch: 1;
-                border-radius: 8px;
-                border-width: 1px;
-                border-color: #45475a;
-                background: #11111b;
-                clip: true;
 
-                ScrollView {
-                    x: 8px;
-                    y: 8px;
-                    width: parent.width - 16px;
-                    height: parent.height - 16px;
+            VerticalBox {
+                padding: 20px;
+                spacing: 14px;
 
+                Rectangle {
+                    width: 18px;
+                    height: 18px;
+                    border-radius: 9px;
+                    background: root.is-recording ? root.theme-button-accent-color : #f38ba8;
+                }
+
+                Text {
+                    text: "Status: " + root.status-text;
+                    color: root.is-recording ? root.theme-button-accent-color : #bac2de;
+                    horizontal-alignment: center;
+                }
+
+                Rectangle {
+                    height: 6px;
+                    background: #313244;
+                    border-radius: 3px;
+                    Rectangle {
+                        x: 0;
+                        width: parent.width * root.audio-level;
+                        background: root.is-recording ? root.theme-button-accent-color : #6c7086;
+                        border-radius: 3px;
+                        animate width { duration: 50ms; }
+                    }
+                }
+
+                Text {
+                    text: "Hotkey: " + root.hotkey-text;
+                    color: #9399b2;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        if (root.active-tab == 1) : Rectangle {
+            background: root.theme-window-color;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #313244;
+            vertical-stretch: 1;
+
+            VerticalBox {
+                padding: 16px;
+                spacing: 10px;
+
+                HorizontalBox {
+                    spacing: 10px;
                     Text {
-                        width: parent.visible-width;
-                        text: root.transcript;
-                        wrap: word-wrap;
-                        color: #cdd6f4;
-                        vertical-alignment: top;
+                        text: "Live Transcription";
+                        font-size: 22px;
+                        font-weight: 700;
+                        color: root.theme-title-color;
+                    }
+                    Button {
+                        text: "Clear";
+                        clicked => { root.clear-transcript(); }
+                    }
+                }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: #45475a;
+                        background: #11111b;
+                        clip: true;
+
+                        ScrollView {
+                            x: 10px;
+                            y: 10px;
+                            width: parent.width - 20px;
+                            height: parent.height - 20px;
+
+                            Text {
+                                width: parent.visible-width;
+                                text: root.transcript;
+                                wrap: word-wrap;
+                                color: root.theme-text-color;
+                                vertical-alignment: top;
+                            }
+                        }
+                    }
+            }
+        }
+
+        if (root.active-tab == 2) : Rectangle {
+            background: root.theme-window-color;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #313244;
+            vertical-stretch: 1;
+
+            VerticalBox {
+                padding: 20px;
+                spacing: 12px;
+
+                Text {
+                    text: "Settings";
+                    font-size: 24px;
+                    font-weight: 700;
+                    color: root.theme-title-color;
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-width: 0px;
+
+                    ScrollView {
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        height: parent.height;
+
+                        VerticalBox {
+                            spacing: 12px;
+
+                            VerticalBox {
+                                spacing: 5px;
+                                Text {
+                                    text: "ElevenLabs API Key";
+                                    color: #bac2de;
+                                    wrap: word-wrap;
+                                }
+                                api-key-input := LineEdit {
+                                    text <=> root.api-key-text;
+                                    placeholder-text: "sk_...";
+                                    input-type: password;
+                                }
+                            }
+
+                            VerticalBox {
+                                spacing: 5px;
+                                Text {
+                                    text: "Default Microphone: " + root.default-microphone-text;
+                                    color: #9399b2;
+                                    wrap: word-wrap;
+                                }
+                                use-default := CheckBox {
+                                    text: "Use default microphone";
+                                    checked <=> root.use-default-microphone;
+                                }
+                            }
+
+                            VerticalBox {
+                                spacing: 5px;
+                                Text {
+                                    text: "Microphone";
+                                    color: #bac2de;
+                                }
+                                mic-combo := ComboBox {
+                                    model: root.microphone-options;
+                                    current-value <=> root.selected-microphone;
+                                    enabled: !use-default.checked;
+                                }
+                            }
+
+                            VerticalBox {
+                                spacing: 5px;
+                                Text {
+                                    text: "Hotkey (example: Ctrl+Space, Ctrl+Shift+F8)";
+                                    color: #bac2de;
+                                    wrap: word-wrap;
+                                }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.hotkey-text;
+                                        color: root.theme-text-color;
+                                        vertical-alignment: center;
+                                        wrap: word-wrap;
+                                    }
+                                    Button {
+                                        text: "Set Hotkey";
+                                        clicked => {
+                                            root.start-hotkey-capture();
+                                        }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                height: 1px;
+                                horizontal-stretch: 1;
+                                background: #313244;
+                            }
+
+                            VerticalBox {
+                                spacing: 8px;
+
+                                Text {
+                                    text: "Overlay & Theme";
+                                    font-size: 18px;
+                                    font-weight: 600;
+                                    color: root.theme-title-color;
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Overlay transparency";
+                                        color: #bac2de;
+                                        vertical-alignment: center;
+                                        wrap: word-wrap;
+                                    }
+                                    Slider {
+                                        minimum: 0.3;
+                                        maximum: 1.0;
+                                        value <=> root.overlay-opacity;
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Background gradient (top)";
+                                        color: #bac2de;
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalBox {
+                                        spacing: 4px;
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #02140b;
+                                            TouchArea { clicked => { root.theme-background-top-color = #02140b; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #042418;
+                                            TouchArea { clicked => { root.theme-background-top-color = #042418; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #064e2a;
+                                            TouchArea { clicked => { root.theme-background-top-color = #064e2a; } }
+                                        }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Background gradient (bottom)";
+                                        color: #bac2de;
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalBox {
+                                        spacing: 4px;
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #000806;
+                                            TouchArea { clicked => { root.theme-background-bottom-color = #000806; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #02140b;
+                                            TouchArea { clicked => { root.theme-background-bottom-color = #02140b; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #042418;
+                                            TouchArea { clicked => { root.theme-background-bottom-color = #042418; } }
+                                        }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Window color";
+                                        color: #bac2de;
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalBox {
+                                        spacing: 4px;
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #041b11;
+                                            TouchArea { clicked => { root.theme-window-color = #041b11; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #02140b;
+                                            TouchArea { clicked => { root.theme-window-color = #02140b; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #06351f;
+                                            TouchArea { clicked => { root.theme-window-color = #06351f; } }
+                                        }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Accent / button color";
+                                        color: #bac2de;
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalBox {
+                                        spacing: 4px;
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #4ade80;
+                                            TouchArea { clicked => { root.theme-button-accent-color = #4ade80; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #22c55e;
+                                            TouchArea { clicked => { root.theme-button-accent-color = #22c55e; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #16a34a;
+                                            TouchArea { clicked => { root.theme-button-accent-color = #16a34a; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #15803d;
+                                            TouchArea { clicked => { root.theme-button-accent-color = #15803d; } }
+                                        }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Title bar color";
+                                        color: #bac2de;
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalBox {
+                                        spacing: 4px;
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #e4ffe9;
+                                            TouchArea { clicked => { root.theme-title-color = #e4ffe9; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #ccefd6;
+                                            TouchArea { clicked => { root.theme-title-color = #ccefd6; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #bbdec6;
+                                            TouchArea { clicked => { root.theme-title-color = #bbdec6; } }
+                                        }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Text color";
+                                        color: #bac2de;
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalBox {
+                                        spacing: 4px;
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #ccefd6;
+                                            TouchArea { clicked => { root.theme-text-color = #ccefd6; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #b7e2c5;
+                                            TouchArea { clicked => { root.theme-text-color = #b7e2c5; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #e6fff0;
+                                            TouchArea { clicked => { root.theme-text-color = #e6fff0; } }
+                                        }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Overlay background";
+                                        color: #bac2de;
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalBox {
+                                        spacing: 4px;
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #03150c;
+                                            TouchArea { clicked => { root.overlay-background-color = #03150c; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #02140b;
+                                            TouchArea { clicked => { root.overlay-background-color = #02140b; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #042418;
+                                            TouchArea { clicked => { root.overlay-background-color = #042418; } }
+                                        }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Overlay text color";
+                                        color: #bac2de;
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalBox {
+                                        spacing: 4px;
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #e6fff0;
+                                            TouchArea { clicked => { root.overlay-text-color = #e6fff0; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #ccefd6;
+                                            TouchArea { clicked => { root.overlay-text-color = #ccefd6; } }
+                                        }
+                                        Rectangle {
+                                            width: 18px;
+                                            height: 18px;
+                                            border-radius: 4px;
+                                            background: #ffffff;
+                                            TouchArea { clicked => { root.overlay-text-color = #ffffff; } }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                HorizontalBox {
+                    spacing: 10px;
+                    Button {
+                        text: "Apply";
+                        primary: true;
+                        clicked => {
+                            root.apply-settings();
+                        }
                     }
                 }
             }
         }
+    }
+}
 
-        Button {
-            text: root.is-recording ? "Stop Recording (Ctrl+Space)" : "Start Recording (Ctrl+Space)";
-            primary: true;
-            height: 40px;
-            clicked => {
-                if (root.is-recording) {
-                    root.stop-recording();
-                } else {
-                    root.start-recording(api-key-input.text);
-                }
+export component HotkeyCaptureWindow inherits Window {
+    title: "Capture Hotkey";
+    icon: @image-url("../eleventhecho.png");
+    width: 360px;
+    height: 180px;
+    background: #1e1e2e;
+
+    in property <string> state-text: "Waiting for key combo...";
+    in property <string> combo-text: "";
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 10px;
+
+        Text {
+            text: root.state-text;
+            color: #cdd6f4;
+            wrap: word-wrap;
+        }
+
+        Text {
+            text: root.combo-text;
+            color: #a6e3a1;
+            font-size: 18px;
+            font-weight: 700;
+        }
+    }
+}
+
+export component TranscriptOverlayWindow inherits Window {
+    title: "11th Echo Live";
+    icon: @image-url("../eleventhecho.png");
+    no-frame: true;
+    always-on-top: true;
+    width: root.window-width * 1px;
+    height: root.window-height * 1px;
+    background: transparent;
+
+    in property <int> window-width: 520;
+    in property <int> window-height: 120;
+    in property <string> sentence-text: "";
+    in property <float> overlay-opacity: 0.85;
+    in property <color> overlay-background-color: #0d1017;
+    in property <color> overlay-text-color: #ffffff;
+
+    callback move-window(int, int);
+
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+        moved => {
+            if (self.pressed) {
+                root.move-window(
+                    (self.mouse-x - self.pressed-x) / 1px,
+                    (self.mouse-y - self.pressed-y) / 1px
+                );
+            }
+        }
+
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #45475a;
+            background: root.overlay-background-color;
+            opacity: root.overlay-opacity;
+
+            Text {
+                x: 10px;
+                y: 8px;
+                text: "Live";
+                color: root.overlay-text-color;
+                font-size: 12px;
+            }
+
+            Text {
+                x: 10px;
+                y: 28px;
+                width: parent.width - 20px;
+                height: parent.height - 36px;
+                text: root.sentence-text;
+                color: root.overlay-text-color;
+                wrap: word-wrap;
+                overflow: elide;
+                vertical-alignment: top;
             }
         }
     }
