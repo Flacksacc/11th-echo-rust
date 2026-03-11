@@ -409,6 +409,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &initial_settings.overlay_text_color,
         Color::from_rgb_u8(230, 255, 240),
     ));
+    transcript_overlay.set_is_error(false);
     #[cfg(target_os = "windows")]
     {
         let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
@@ -462,12 +463,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
                             ui.set_audio_level(0.0);
                             ui.set_is_recording(false);
+                            ui.set_has_error(false);
                             ui.set_status_text("Idle".into());
                         });
                         let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
                             overlay.set_sentence_text("".into());
                             overlay.set_window_width(520);
                             overlay.set_window_height(120);
+                            overlay.set_is_error(false);
                             let _ = overlay.hide();
                         });
                     }
@@ -485,6 +488,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
                                             ui.set_status_text("Listening...".into());
                                             ui.set_is_recording(true);
+                                            ui.set_has_error(false);
                                             ui.set_transcript("".into());
                                         });
                                         let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
@@ -522,6 +526,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("⚡ Starting Recording Session...");
                                 let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
                                     ui.set_status_text("Connecting...".into());
+                                    ui.set_has_error(false);
                                     ui.set_transcript("".into());
                                 });
                                 let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
@@ -579,6 +584,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 let _ = ui_handle_for_network.upgrade_in_event_loop(|ui| {
                                                     ui.set_status_text("Network error".into());
                                                     ui.set_is_recording(false);
+                                                    ui.set_has_error(true);
                                                 });
                                                 let _ = finalize_tx_for_network.send(());
                                                 return;
@@ -607,6 +613,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 }
 
                                                 let mut was_committed = false;
+                                                let mut is_error = false;
                                                 let display_text = match msg {
                                                     network::TranscriptMessage::Partial(text) => {
                                                         latest_partial = text;
@@ -623,7 +630,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                         }
                                                     }
                                                     network::TranscriptMessage::Committed(text) => {
+                                                        // Clear any partial; this is end-of-utterance.
                                                         latest_partial.clear();
+
+                                                        // Decide what text to actually commit:
+                                                        // - If ElevenLabs sends an empty committed transcript (which happens),
+                                                        //   fall back to the current committed text in the pipeline so we
+                                                        //   still inject something useful.
+                                                        let empty_commit = text.trim().is_empty();
+                                                        let base_text = if empty_commit {
+                                                            let pipeline = transcript_pipeline_for_text.lock().unwrap();
+                                                            pipeline.committed_text().trim().to_string()
+                                                        } else {
+                                                            text.clone()
+                                                        };
 
                                                         // Snapshot Gemini settings while holding the lock briefly.
                                                         let (gemini_on, gkey, gmodel, gpreset, gcustom) = {
@@ -640,35 +660,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                                         let final_text = if gemini_on {
                                                             println!("🤖 [Gemini] Rewriting committed text...");
-                                                            gemini::rewrite_text(&gkey, &gmodel, &gpreset, &gcustom, &text).await
+                                                            gemini::rewrite_text(&gkey, &gmodel, &gpreset, &gcustom, &base_text).await
                                                         } else {
-                                                            text
+                                                            base_text
                                                         };
 
                                                         let aggregated = {
                                                             let mut pipeline = transcript_pipeline_for_text.lock().unwrap();
-                                                            pipeline.push_fragment(&final_text)
+                                                            if empty_commit {
+                                                                // Empty commit: treat as "finalize" without appending.
+                                                                pipeline.committed_text().to_string()
+                                                            } else {
+                                                                pipeline.push_fragment(&final_text)
+                                                            }
                                                         };
+                                                        println!("⌨ Injecting committed transcript into active window");
                                                         if let Err(e) = injector::inject_text(&final_text) {
                                                             eprintln!("❌ Injection Error: {}", e);
+                                                            let _ = ui_handle_for_transcript.upgrade_in_event_loop(|ui| {
+                                                                ui.set_status_text("Injection error - check focused window and permissions".into());
+                                                                ui.set_has_error(true);
+                                                                ui.set_is_recording(false);
+                                                            });
                                                         }
                                                         was_committed = true;
                                                         aggregated
+                                                    }
+                                                    network::TranscriptMessage::Error(err_json) => {
+                                                        latest_partial.clear();
+                                                        is_error = true;
+                                                        let friendly = format!("Error from speech service:\n{}", err_json);
+                                                        let _ = ui_handle_for_transcript.upgrade_in_event_loop(|ui| {
+                                                            ui.set_status_text("Speech service error".into());
+                                                            ui.set_is_recording(false);
+                                                            ui.set_has_error(true);
+                                                        });
+                                                        friendly
                                                     }
                                                 };
 
                                                 let aggregated_for_ui = display_text.clone();
                                                 let aggregated_for_overlay = display_text.clone();
-                                                let hide_overlay = was_committed;
+                                                let hide_overlay = was_committed && !is_error;
                                                 let _ = ui_handle_for_transcript.upgrade_in_event_loop(move |ui| {
                                                     ui.set_transcript(aggregated_for_ui.into());
                                                 });
                                                 let _ = overlay_handle_for_transcript
                                                     .upgrade_in_event_loop(move |overlay| {
+                                                        overlay.set_is_error(is_error);
                                                         if hide_overlay {
                                                             overlay.set_sentence_text("".into());
                                                             overlay.set_window_width(520);
                                                             overlay.set_window_height(120);
+                                                            overlay.set_is_error(false);
                                                             let _ = overlay.hide();
                                                         } else {
                                                             let (w, h) =
@@ -722,15 +766,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
                                     ui.set_status_text("Finalizing...".into());
                                     ui.set_is_recording(false);
-                                });
-
-                                // Immediately hide and reset the overlay, even if no
-                                // transcript text was ever produced for this session.
-                                let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
-                                    overlay.set_sentence_text("".into());
-                                    overlay.set_window_width(520);
-                                    overlay.set_window_height(120);
-                                    let _ = overlay.hide();
                                 });
 
                                 if let Some(session) = active_session.as_mut() {

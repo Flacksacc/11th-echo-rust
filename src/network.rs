@@ -27,6 +27,7 @@ pub enum ControlMessage {
 pub enum TranscriptMessage {
     Partial(String),
     Committed(String),
+    Error(String),
 }
 
 #[derive(Debug)]
@@ -161,13 +162,12 @@ impl ElevenLabsClient {
                                 }
                             }
                             ParsedIncoming::CommittedTranscript(content) => {
-                                if !content.is_empty() {
-                                    println!("📝 [COMMITTED] {}", content);
-                                    let _ = text_tx.send(TranscriptMessage::Committed(content)).await;
-                                }
+                                println!("📝 [COMMITTED] {}", content);
+                                let _ = text_tx.send(TranscriptMessage::Committed(content)).await;
                             }
                             ParsedIncoming::Error(err_json) => {
                                 eprintln!("❌ [API ERROR] {}", err_json);
+                                let _ = text_tx.send(TranscriptMessage::Error(err_json)).await;
                             }
                             ParsedIncoming::Other => {}
                         }
