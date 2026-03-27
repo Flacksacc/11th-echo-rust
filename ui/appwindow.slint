@@ -5,6 +5,8 @@ export component AppWindow inherits Window {
     icon: @image-url("../eleventhecho.png");
     min-width: 520px;
     min-height: 360px;
+    max-width: 1920px;
+    max-height: 1080px;
     background: @linear-gradient(0deg, root.theme-background-top-color, root.theme-background-bottom-color);
 
     in-out property <int> active-tab: 0;
@@ -16,6 +18,13 @@ export component AppWindow inherits Window {
     in-out property <bool> has-error: false;
 
     in-out property <string> transcript;
+    in-out property <[string]> transcript-history;
+    in-out property <[string]> log-items;
+    in-out property <int> context-menu-index: -1;
+    in-out property <bool> context-menu-visible: false;
+    in-out property <length> context-menu-x: 0;
+    in-out property <length> context-menu-y: 0;
+    in-out property <bool> context-menu-is-log: false;
 
     in-out property <string> api-key-text;
     in-out property <string> gemini-api-key-text;
@@ -44,6 +53,8 @@ export component AppWindow inherits Window {
     callback apply-settings();
     callback start-hotkey-capture();
     callback clear-transcript();
+    callback copy-transcript(int);
+    callback copy-log-item(int);
 
     VerticalBox {
         padding: 16px;
@@ -62,9 +73,14 @@ export component AppWindow inherits Window {
                 clicked => { root.active-tab = 1; }
             }
             Button {
-                text: "Settings";
+                text: "Log";
                 primary: root.active-tab == 2;
                 clicked => { root.active-tab = 2; }
+            }
+            Button {
+                text: "Settings";
+                primary: root.active-tab == 3;
+                clicked => { root.active-tab = 3; }
             }
         }
 
@@ -127,7 +143,7 @@ export component AppWindow inherits Window {
                 HorizontalBox {
                     spacing: 10px;
                     Text {
-                        text: "Live Transcription";
+                        text: "Transcripts";
                         font-size: 22px;
                         font-weight: 700;
                         color: root.theme-title-color;
@@ -138,33 +154,133 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                    Rectangle {
-                        vertical-stretch: 1;
-                        border-radius: 8px;
-                        border-width: 1px;
-                        border-color: #45475a;
-                        background: #11111b;
-                        clip: true;
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: #45475a;
+                    background: #11111b;
+                    clip: true;
 
-                        ScrollView {
-                            x: 10px;
-                            y: 10px;
-                            width: parent.width - 20px;
-                            height: parent.height - 20px;
+                    ScrollView {
+                        x: 6px;
+                        y: 6px;
+                        width: parent.width - 12px;
+                        height: parent.height - 12px;
 
-                            Text {
-                                width: parent.visible-width;
-                                text: root.transcript;
-                                wrap: word-wrap;
-                                color: root.theme-text-color;
-                                vertical-alignment: top;
+                        VerticalBox {
+                            spacing: 2px;
+                            padding: 0;
+
+                            for line[i] in root.transcript-history : Rectangle {
+                                height: transcript-line.preferred-height + 6px;
+                                vertical-stretch: 0;
+                                background: Math.mod(i, 2) == 0 ? #11111b : #0e0e18;
+                                border-radius: 2px;
+
+                                TouchArea {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    pointer-event(event) => {
+                                        if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                                            root.context-menu-index = i;
+                                            root.context-menu-is-log = false;
+                                            root.context-menu-x = self.mouse-x + self.absolute-position.x;
+                                            root.context-menu-y = self.mouse-y + self.absolute-position.y;
+                                            root.context-menu-visible = true;
+                                        }
+                                    }
+
+                                    transcript-line := Text {
+                                        x: 6px;
+                                        y: 3px;
+                                        width: parent.width - 12px;
+                                        text: line;
+                                        wrap: word-wrap;
+                                        color: root.theme-text-color;
+                                        font-size: 12px;
+                                    }
+                                }
                             }
                         }
                     }
+                }
             }
         }
 
         if (root.active-tab == 2) : Rectangle {
+            background: root.theme-window-color;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #313244;
+            vertical-stretch: 1;
+
+            VerticalBox {
+                padding: 16px;
+                spacing: 10px;
+
+                Text {
+                    text: "Log";
+                    font-size: 22px;
+                    font-weight: 700;
+                    color: root.theme-title-color;
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: #45475a;
+                    background: #11111b;
+                    clip: true;
+
+                    ScrollView {
+                        x: 6px;
+                        y: 6px;
+                        width: parent.width - 12px;
+                        height: parent.height - 12px;
+
+                        VerticalBox {
+                            spacing: 2px;
+                            padding: 0;
+
+                            for line[i] in root.log-items : Rectangle {
+                                height: log-line.preferred-height + 4px;
+                                vertical-stretch: 0;
+                                background: Math.mod(i, 2) == 0 ? #11111b : #0e0e18;
+                                border-radius: 2px;
+
+                                TouchArea {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    pointer-event(event) => {
+                                        if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                                            root.context-menu-index = i;
+                                            root.context-menu-is-log = true;
+                                            root.context-menu-x = self.mouse-x + self.absolute-position.x;
+                                            root.context-menu-y = self.mouse-y + self.absolute-position.y;
+                                            root.context-menu-visible = true;
+                                        }
+                                    }
+
+                                    log-line := Text {
+                                        x: 6px;
+                                        y: 2px;
+                                        width: parent.width - 12px;
+                                        text: line;
+                                        wrap: word-wrap;
+                                        color: #94a3b8;
+                                        font-size: 11px;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (root.active-tab == 3) : Rectangle {
             background: root.theme-window-color;
             border-radius: 8px;
             border-width: 1px;
@@ -657,6 +773,49 @@ export component AppWindow inherits Window {
             }
         }
     }
+
+    if root.context-menu-visible : Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+
+        TouchArea {
+            clicked => { root.context-menu-visible = false; }
+        }
+
+        Rectangle {
+            x: root.context-menu-x;
+            y: root.context-menu-y;
+            width: 160px;
+            height: 32px;
+            background: #1e293b;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: #334155;
+            drop-shadow-blur: 8px;
+            drop-shadow-color: #00000080;
+
+            TouchArea {
+                clicked => {
+                    if root.context-menu-is-log {
+                        root.copy-log-item(root.context-menu-index);
+                    } else {
+                        root.copy-transcript(root.context-menu-index);
+                    }
+                    root.context-menu-visible = false;
+                }
+
+                Text {
+                    x: 12px;
+                    y: 6px;
+                    text: "Copy to clipboard";
+                    color: #e2e8f0;
+                    font-size: 13px;
+                }
+            }
+        }
+    }
 }
 
 export component HotkeyCaptureWindow inherits Window {
@@ -704,6 +863,7 @@ export component TranscriptOverlayWindow inherits Window {
     in property <color> overlay-background-color: #0d1017;
     in property <color> overlay-text-color: #ffffff;
     in property <bool> is-error: false;
+    in property <bool> is-visible: false;
 
     callback move-window(int, int);
 

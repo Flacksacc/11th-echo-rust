@@ -18,29 +18,36 @@ impl TranscriptPipeline {
         self.stop_requested = true;
     }
 
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requested
+    }
+
     pub fn committed_text(&self) -> &str {
         &self.transcript
     }
 }
 
 pub fn append_fragment(existing: &str, incoming: &str) -> String {
-    let incoming = incoming.trim();
+    let incoming = incoming.trim().trim_start_matches('-').trim();
     if incoming.is_empty() {
         return existing.to_string();
     }
 
     let mut output = existing.trim().to_string();
     if output.is_empty() {
-        return incoming.to_string();
+        return format!("{} ", incoming);
     }
 
     let no_leading_space = [".", ",", "!", "?", ";", ":"];
     if no_leading_space.iter().any(|p| incoming.starts_with(p)) {
+        // If it starts with punctuation, we might have added a space at the end of the previous fragment
+        // so we just push it. But wait, existing.trim() already removed the trailing space.
         output.push_str(incoming);
     } else {
         output.push(' ');
         output.push_str(incoming);
     }
+    output.push(' ');
     output
 }
 
@@ -51,13 +58,19 @@ mod tests {
     #[test]
     fn append_fragment_adds_spaces_between_words() {
         let a = append_fragment("hello", "world");
-        assert_eq!(a, "hello world");
+        assert_eq!(a, "hello world ");
     }
 
     #[test]
     fn append_fragment_avoids_space_before_punctuation() {
-        let a = append_fragment("hello world", "!");
-        assert_eq!(a, "hello world!");
+        let a = append_fragment("hello world ", "!");
+        assert_eq!(a, "hello world! ");
+    }
+
+    #[test]
+    fn append_fragment_removes_leading_dash() {
+        let a = append_fragment("hello", "-world");
+        assert_eq!(a, "hello world ");
     }
 
     #[test]
@@ -65,7 +78,7 @@ mod tests {
         let mut p = TranscriptPipeline::new();
         p.push_fragment("hello");
         p.push_fragment("world");
-        assert_eq!(p.committed_text(), "hello world");
+        assert_eq!(p.committed_text(), "hello world ");
     }
 
     #[test]
@@ -74,7 +87,7 @@ mod tests {
         p.push_fragment("hello");
         p.push_fragment("world");
         p.request_stop();
-        assert_eq!(p.committed_text(), "hello world");
+        assert_eq!(p.committed_text(), "hello world ");
     }
 
     #[test]
@@ -88,12 +101,12 @@ mod tests {
         let mut p = TranscriptPipeline::new();
         p.push_fragment("alpha");
         p.push_fragment("beta");
-        assert_eq!(p.committed_text(), "alpha beta");
+        assert_eq!(p.committed_text(), "alpha beta ");
     }
 
     #[test]
     fn append_ignores_empty_fragment() {
-        let a = append_fragment("hello", "   ");
-        assert_eq!(a, "hello");
+        let a = append_fragment("hello ", "   ");
+        assert_eq!(a, "hello ");
     }
 }

@@ -15,6 +15,8 @@ use settings::{load_settings, save_settings};
 use state::RecordingState;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
+use arboard::Clipboard;
+use chrono::Local;
 
 #[cfg(target_os = "windows")]
 use global_hotkey::{
@@ -374,6 +376,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &initial_settings.theme_text_color,
         Color::from_rgb_u8(204, 239, 214),
     ));
+    ui.set_transcript_history(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+    ui.set_log_items(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
 
     // When the user closes the main window, hide it but keep the Slint
     // event loop alive so the app can continue running from the tray.
@@ -438,6 +442,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let overlay_handle_for_tokio = transcript_overlay.as_weak();
     let settings_for_runtime = settings.clone();
 
+    let transcript_raw_for_clipboard: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_raw_for_clipboard: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    ui.on_copy_transcript({
+        let raw = transcript_raw_for_clipboard.clone();
+        move |index| {
+            if let Ok(hist) = raw.lock() {
+                if let Some(text) = hist.get(index as usize) {
+                    if let Ok(mut cb) = Clipboard::new() {
+                        let _ = cb.set_text(text.clone());
+                    }
+                }
+            }
+        }
+    });
+
+    ui.on_copy_log_item({
+        let raw = log_raw_for_clipboard.clone();
+        move |index| {
+            if let Ok(hist) = raw.lock() {
+                if let Some(text) = hist.get(index as usize) {
+                    if let Ok(mut cb) = Clipboard::new() {
+                        let _ = cb.set_text(text.clone());
+                    }
+                }
+            }
+        }
+    });
+
     thread::spawn(move || {
         let rt = Runtime::new().unwrap();
         rt.block_on(async move {
@@ -445,6 +478,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut active_session: Option<Session> = None;
             let (finalize_tx, mut finalize_rx) = mpsc::unbounded_channel::<()>();
+            let overlay_visible = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             loop {
                 tokio::select! {
@@ -460,6 +494,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             println!("✅ Finalization complete, session closed");
                         }
+                        overlay_visible.store(false, std::sync::atomic::Ordering::SeqCst);
                         let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
                             ui.set_audio_level(0.0);
                             ui.set_is_recording(false);
@@ -471,327 +506,416 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             overlay.set_window_width(520);
                             overlay.set_window_height(120);
                             overlay.set_is_error(false);
+                            overlay.set_is_visible(false);
                             let _ = overlay.hide();
                         });
                     }
                     Some(cmd) = cmd_rx.recv() => {
-                        match cmd {
-                            AppCommand::StartRecording => {
-                                if let Some(session) = active_session.as_mut() {
-                                    if session.state.lock().unwrap().can_start() {
-                                        if let Ok(mut pipeline) = session.transcript_pipeline.lock() {
-                                            *pipeline = TranscriptPipeline::new();
+                    match cmd {
+                        AppCommand::StartRecording => {
+                            if let Some(session) = active_session.as_mut() {
+                                if session.state.lock().unwrap().can_start() {
+                                    if let Ok(mut pipeline) = session.transcript_pipeline.lock() {
+                                        *pipeline = TranscriptPipeline::new();
+                                    }
+                                    if let Ok(mut s) = session.state.lock() {
+                                        s.transition_to_recording();
+                                    }
+                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
+                                        ui.set_status_text("Listening...".into());
+                                        ui.set_is_recording(true);
+                                        ui.set_has_error(false);
+                                        ui.set_transcript("".into());
+                                    });
+                                    overlay_visible.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
+                                        overlay.set_sentence_text("".into());
+                                        overlay.set_window_width(520);
+                                        overlay.set_window_height(120);
+                                        overlay.set_is_visible(true);
+                                        let _ = overlay.show();
+                                    });
+                                    if let Some(tx) = session.network_stop_tx.as_ref() {
+                                        let _ = tx.send(network::ControlMessage::Start);
+                                    }
+                                    println!("⚡ Resumed existing transcription session");
+                                    continue;
+                                } else {
+                                    println!("❌ Cannot start recording: session already active");
+                                    continue;
+                                }
+                            }
+
+                            let current_settings = settings_for_runtime.lock().unwrap().clone();
+                            if current_settings.api_key.trim().is_empty() {
+                                let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
+                                    ui.set_status_text("Missing API key".into());
+                                    ui.set_is_recording(false);
+                                });
+                                continue;
+                            }
+
+                            let preferred_device = if current_settings.use_default_microphone {
+                                None
+                            } else {
+                                Some(current_settings.selected_microphone.clone())
+                            };
+
+                            println!("⚡ Starting Recording Session...");
+                            let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
+                                ui.set_status_text("Connecting...".into());
+                                ui.set_has_error(false);
+                                ui.set_transcript("".into());
+                            });
+                            overlay_visible.store(true, std::sync::atomic::Ordering::SeqCst);
+                            let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
+                                overlay.set_sentence_text("Listening...".into());
+                                overlay.set_window_width(520);
+                                overlay.set_window_height(120);
+                                overlay.set_is_visible(true);
+                                let _ = overlay.show();
+                            });
+
+                            let state = Arc::new(Mutex::new(RecordingState::BufferingPreConnect));
+                            let transcript_pipeline = Arc::new(Mutex::new(TranscriptPipeline::new()));
+                            let transcript_history: Arc<Mutex<Vec<SharedString>>> = Arc::new(Mutex::new(Vec::new()));
+                            let transcript_raw: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+                            let log_display: Arc<Mutex<Vec<SharedString>>> = Arc::new(Mutex::new(Vec::new()));
+                            let log_raw: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+                            let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<i16>>(50);
+                            let (network_stop_tx, network_stop_rx) =
+                                mpsc::unbounded_channel::<network::ControlMessage>();
+                            let (text_tx, mut text_rx) =
+                                mpsc::channel::<network::TranscriptMessage>(100);
+                            let (log_line_tx, mut log_line_rx) =
+                                mpsc::unbounded_channel::<String>();
+                            let audio_level_tx = level_tx.clone();
+
+                            let stream_result =
+                                audio::start_audio_capture(audio_tx, audio_level_tx, preferred_device);
+
+                            match stream_result {
+                                Ok(stream) => {
+                                    let client = network::ElevenLabsClient::new(
+                                        current_settings.api_key,
+                                        ELEVEN_MODEL_ID.to_string(),
+                                    );
+                                    let client_state = state.clone();
+                                    let injection_state = state.clone();
+                                    let transcript_pipeline_for_network = transcript_pipeline.clone();
+                                    let transcript_pipeline_for_text = transcript_pipeline.clone();
+                                    let transcript_history_for_text = transcript_history.clone();
+                                    let transcript_raw_for_text = transcript_raw.clone();
+                                    let transcript_raw_for_cb = transcript_raw_for_clipboard.clone();
+                                    let log_display_for_text = log_display.clone();
+                                    let log_raw_for_text = log_raw.clone();
+                                    let log_raw_for_cb = log_raw_for_clipboard.clone();
+                                    let log_line_tx_for_text = log_line_tx.clone();
+                                    let settings_for_text = settings_for_runtime.clone();
+                                    let finalize_tx_for_network = finalize_tx.clone();
+                                    let finalize_tx_for_transcript = finalize_tx.clone();
+                                    let ui_handle_for_network = ui_handle_for_tokio.clone();
+                                    let ui_handle_for_transcript = ui_handle_for_tokio.clone();
+                                    let ui_handle_for_log = ui_handle_for_tokio.clone();
+                                    let overlay_handle_for_transcript = overlay_handle_for_tokio.clone();
+                                    let _overlay_handle_for_audio = overlay_handle_for_tokio.clone();
+                                    let overlay_visible_for_audio = overlay_visible.clone();
+                                    let overlay_visible_for_transcript = overlay_visible.clone();
+
+                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
+                                        ui.set_is_recording(true);
+                                        ui.set_status_text("Listening...".into());
+                                    });
+
+                                    let (audio_to_net_tx, audio_to_net_rx) = mpsc::channel::<Vec<i16>>(50);
+                                    tokio::spawn(async move {
+                                        while let Some(chunk) = audio_rx.recv().await {
+                                            if overlay_visible_for_audio.load(std::sync::atomic::Ordering::SeqCst) {
+                                                let _ = audio_to_net_tx.send(chunk).await;
+                                            }
                                         }
-                                        if let Ok(mut s) = session.state.lock() {
-                                            s.transition_to_recording();
+                                    });
+
+                                    tokio::spawn(async move {
+                                        {
+                                            let mut s = client_state.lock().unwrap();
+                                            s.transition_to_connecting();
                                         }
-                                        let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
-                                            ui.set_status_text("Listening...".into());
-                                            ui.set_is_recording(true);
-                                            ui.set_has_error(false);
-                                            ui.set_transcript("".into());
-                                        });
-                                        let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
-                                            overlay.set_sentence_text("".into());
-                                            overlay.set_window_width(520);
-                                            overlay.set_window_height(120);
-                                            let _ = overlay.show();
-                                        });
+
+                                        let result = client.run(audio_to_net_rx, network_stop_rx, text_tx, log_line_tx).await;
+                                        if let Err(err) = result {
+                                            eprintln!("❌ Network client failed: {}", err);
+                                            if let Ok(mut s) = client_state.lock() {
+                                                *s = RecordingState::Error;
+                                            }
+                                            let _ = ui_handle_for_network.upgrade_in_event_loop(|ui| {
+                                                ui.set_status_text("Network error".into());
+                                                ui.set_is_recording(false);
+                                                ui.set_has_error(true);
+                                            });
+                                            let _ = finalize_tx_for_network.send(());
+                                            return;
+                                        }
+
+                                        let should_finalize = {
+                                            let pipeline = transcript_pipeline_for_network.lock().unwrap();
+                                            !pipeline.stop_requested()
+                                        };
+                                        if should_finalize {
+                                            let _ = finalize_tx_for_network.send(());
+                                        }
+                                        println!("⚡ Network client task ended");
+                                    });
+
+                                    tokio::spawn(async move {
+                                        while let Some(line) = log_line_rx.recv().await {
+                                            let ts = Local::now().format("%H:%M:%S");
+                                            let display_line: SharedString = format!("[{}] {}", ts, line).into();
+                                            let raw_line = line;
+                                            {
+                                                let mut disp = log_display_for_text.lock().unwrap();
+                                                let mut raw = log_raw_for_text.lock().unwrap();
+                                                disp.push(display_line);
+                                                raw.push(raw_line);
+                                                if disp.len() > 300 {
+                                                    let excess = disp.len() - 300;
+                                                    disp.drain(0..excess);
+                                                    raw.drain(0..excess);
+                                                }
+                                                let items = disp.clone();
+                                                let _ = ui_handle_for_log.upgrade_in_event_loop(move |ui| {
+                                                    ui.set_log_items(ModelRc::new(VecModel::from(items)));
+                                                });
+                                                *log_raw_for_cb.lock().unwrap() = raw.clone();
+                                            }
+                                        }
+                                    });
+
+                                    tokio::spawn(async move {
+                                        let mut latest_partial = String::new();
+                                        while let Some(msg) = text_rx.recv().await {
+                                            {
+                                                let mut s = injection_state.lock().unwrap();
+                                                s.transition_to_recording();
+                                            }
+
+                                            let mut was_committed = false;
+                                            let mut is_error = false;
+                                            let mut stop_requested_for_msg = false;
+                                            let display_text = match msg {
+                                                network::TranscriptMessage::Partial(text) => {
+                                                    latest_partial = text;
+                                                    let committed = {
+                                                        let pipeline = transcript_pipeline_for_text.lock().unwrap();
+                                                        pipeline.committed_text().trim().to_string()
+                                                    };
+                                                    if committed.is_empty() {
+                                                        latest_partial.clone()
+                                                    } else if latest_partial.trim().is_empty() {
+                                                        committed
+                                                    } else {
+                                                        format!("{} {}", committed, latest_partial.trim())
+                                                    }
+                                                }
+                                                network::TranscriptMessage::Committed(text) => {
+                                                    // Decide what text to actually commit:
+                                                    // - If ElevenLabs sends an empty committed transcript, only
+                                                    //   commit the current partial if we have one. Falling back to
+                                                    //   the existing committed transcript would duplicate content.
+                                                    let empty_commit = text.trim().is_empty();
+                                                    let base_text = if empty_commit {
+                                                        if !latest_partial.trim().is_empty() {
+                                                            latest_partial.trim().to_string()
+                                                        } else {
+                                                            String::new()
+                                                        }
+                                                    } else {
+                                                        text.clone()
+                                                    };
+                                                    // Clear partial now that we've used it for empty-commit fallback.
+                                                    latest_partial.clear();
+
+                                                    // Snapshot Gemini settings while holding the lock briefly.
+                                                    let (gemini_on, gkey, gmodel, gpreset, gcustom) = {
+                                                        let s = settings_for_text.lock().unwrap();
+                                                        (
+                                                            s.gemini_enabled,
+                                                            s.gemini_api_key.clone(),
+                                                            s.gemini_model.clone(),
+                                                            s.gemini_prompt_preset.clone(),
+                                                            s.gemini_custom_prompt.clone(),
+                                                        )
+                                                    };
+                                                    // Lock is dropped here before any await.
+
+                                                    let final_text = if gemini_on {
+                                                        println!("🤖 [Gemini] Rewriting committed text...");
+                                                        gemini::rewrite_text(&gkey, &gmodel, &gpreset, &gcustom, &base_text).await
+                                                    } else {
+                                                        base_text
+                                                    };
+
+                                                    let final_text = final_text.trim().trim_start_matches('-').trim().to_string();
+                                                    stop_requested_for_msg = {
+                                                        let pipeline = transcript_pipeline_for_text.lock().unwrap();
+                                                        pipeline.stop_requested()
+                                                    };
+
+                                                    let aggregated = {
+                                                        let mut pipeline = transcript_pipeline_for_text.lock().unwrap();
+                                                        if final_text.is_empty() {
+                                                            pipeline.committed_text().to_string()
+                                                        } else {
+                                                            pipeline.push_fragment(&final_text)
+                                                        }
+                                                    };
+                                                    if !final_text.is_empty() {
+                                                        let ts = Local::now().format("%H:%M:%S");
+                                                        let display: SharedString = format!("[{}] {}", ts, final_text).into();
+                                                        {
+                                                            let mut history = transcript_history_for_text.lock().unwrap();
+                                                            let mut raw = transcript_raw_for_text.lock().unwrap();
+                                                            history.push(display);
+                                                            raw.push(final_text.clone());
+                                                            let items = history.clone();
+                                                            let _ = ui_handle_for_transcript.upgrade_in_event_loop(move |ui| {
+                                                                ui.set_transcript_history(ModelRc::new(VecModel::from(items)));
+                                                            });
+                                                            *transcript_raw_for_cb.lock().unwrap() = raw.clone();
+                                                        }
+                                                        let _ = log_line_tx_for_text.send(format!("⌨ [TRANSCRIPT] {}", final_text));
+                                                    }
+                                                    if stop_requested_for_msg {
+                                                        let final_payload = aggregated.trim().to_string();
+                                                        if !final_payload.is_empty() {
+                                                            println!("⌨ Injecting full transcript into active window");
+                                                            let to_inject = format!("{} ", final_payload);
+                                                            if let Err(e) = injector::inject_text(&to_inject) {
+                                                                eprintln!("❌ Injection Error: {}", e);
+                                                                let _ = ui_handle_for_transcript.upgrade_in_event_loop(|ui| {
+                                                                    ui.set_status_text("Injection error - check focused window and permissions".into());
+                                                                    ui.set_has_error(true);
+                                                                    ui.set_is_recording(false);
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                    was_committed = true;
+                                                    aggregated
+                                                }
+                                                network::TranscriptMessage::Error(err_json) => {
+                                                    latest_partial.clear();
+                                                    is_error = true;
+                                                    let friendly = format!("Error from speech service:\n{}", err_json);
+                                                    let _ = ui_handle_for_transcript.upgrade_in_event_loop(|ui| {
+                                                        ui.set_status_text("Speech service error".into());
+                                                        ui.set_is_recording(false);
+                                                        ui.set_has_error(true);
+                                                    });
+                                                    friendly
+                                                }
+                                            };
+
+                                            let aggregated_for_overlay = display_text.clone();
+                                            let hide_overlay = (was_committed && stop_requested_for_msg) || is_error;
+                                            let text_for_ui = if was_committed || is_error {
+                                                display_text.clone()
+                                            } else {
+                                                let pipeline = transcript_pipeline_for_text.lock().unwrap();
+                                                pipeline.committed_text().to_string()
+                                            };
+                                            let _ = ui_handle_for_transcript.upgrade_in_event_loop(move |ui| {
+                                                ui.set_transcript(text_for_ui.into());
+                                            });
+                                            let overlay_visible_setter = overlay_visible_for_transcript.clone();
+                                            let _ = overlay_handle_for_transcript
+                                                .upgrade_in_event_loop(move |overlay| {
+                                                    overlay.set_is_error(is_error);
+                                                    if hide_overlay {
+                                                        overlay.set_sentence_text("".into());
+                                                        overlay.set_window_width(520);
+                                                        overlay.set_window_height(120);
+                                                        overlay.set_is_error(false);
+                                                        overlay.set_is_visible(false);
+                                                        overlay_visible_setter.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                        let _ = overlay.hide();
+                                                    } else {
+                                                        let (w, h) =
+                                                            overlay_size_for_text(
+                                                                &aggregated_for_overlay,
+                                                            );
+                                                        overlay.set_sentence_text(
+                                                            aggregated_for_overlay.into(),
+                                                        );
+                                                        overlay.set_window_width(w);
+                                                        overlay.set_window_height(h);
+                                                        overlay.set_is_visible(true);
+                                                        overlay_visible_setter.store(true, std::sync::atomic::Ordering::SeqCst);
+                                                        let _ = overlay.show();
+                                                    }
+                                                });
+
+                                            if was_committed && stop_requested_for_msg {
+                                                let _ = finalize_tx_for_transcript.send(());
+                                            }
+                                        }
+                                    });
+
+                                    active_session = Some(Session {
+                                        state,
+                                        _audio_stream: Some(stream),
+                                        network_stop_tx: Some(network_stop_tx),
+                                        transcript_pipeline,
+                                    });
+                                    if let Some(session) = active_session.as_ref() {
                                         if let Some(tx) = session.network_stop_tx.as_ref() {
                                             let _ = tx.send(network::ControlMessage::Start);
                                         }
-                                        println!("⚡ Resumed existing transcription session");
-                                        continue;
-                                    } else {
-                                        println!("❌ Cannot start recording: session already active");
-                                        continue;
                                     }
-                                }
-
-                                let current_settings = settings_for_runtime.lock().unwrap().clone();
-                                if current_settings.api_key.trim().is_empty() {
-                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
-                                        ui.set_status_text("Missing API key".into());
-                                        ui.set_is_recording(false);
-                                    });
-                                    continue;
-                                }
-
-                                let preferred_device = if current_settings.use_default_microphone {
-                                    None
-                                } else {
-                                    Some(current_settings.selected_microphone.clone())
-                                };
-
-                                println!("⚡ Starting Recording Session...");
-                                let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
-                                    ui.set_status_text("Connecting...".into());
-                                    ui.set_has_error(false);
-                                    ui.set_transcript("".into());
-                                });
-                                let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
-                                    overlay.set_sentence_text("Listening...".into());
-                                    overlay.set_window_width(520);
-                                    overlay.set_window_height(120);
-                                    let _ = overlay.show();
-                                });
-
-                                let state = Arc::new(Mutex::new(RecordingState::BufferingPreConnect));
-                                let transcript_pipeline = Arc::new(Mutex::new(TranscriptPipeline::new()));
-                                let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>(50);
-                                let (network_stop_tx, network_stop_rx) =
-                                    mpsc::unbounded_channel::<network::ControlMessage>();
-                                let (text_tx, mut text_rx) =
-                                    mpsc::channel::<network::TranscriptMessage>(100);
-                                let audio_level_tx = level_tx.clone();
-
-                                let stream_result =
-                                    audio::start_audio_capture(audio_tx, audio_level_tx, preferred_device);
-
-                                match stream_result {
-                                    Ok(stream) => {
-                                        let client = network::ElevenLabsClient::new(
-                                            current_settings.api_key,
-                                            ELEVEN_MODEL_ID.to_string(),
-                                        );
-                                        let client_state = state.clone();
-                                        let injection_state = state.clone();
-                                        let transcript_pipeline_for_text = transcript_pipeline.clone();
-                                        let settings_for_text = settings_for_runtime.clone();
-                                        let finalize_tx_for_network = finalize_tx.clone();
-                                        let finalize_tx_for_injection = finalize_tx.clone();
-                                        let ui_handle_for_network = ui_handle_for_tokio.clone();
-                                        let ui_handle_for_transcript = ui_handle_for_tokio.clone();
-                                        let overlay_handle_for_transcript = overlay_handle_for_tokio.clone();
-
-                                        let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
-                                            ui.set_is_recording(true);
-                                            ui.set_status_text("Listening...".into());
-                                        });
-
-                                        tokio::spawn(async move {
-                                            {
-                                                let mut s = client_state.lock().unwrap();
-                                                s.transition_to_connecting();
-                                            }
-
-                                            let result = client.run(audio_rx, network_stop_rx, text_tx).await;
-                                            if let Err(err) = result {
-                                                eprintln!("❌ Network client failed: {}", err);
-                                                if let Ok(mut s) = client_state.lock() {
-                                                    *s = RecordingState::Error;
-                                                }
-                                                let _ = ui_handle_for_network.upgrade_in_event_loop(|ui| {
-                                                    ui.set_status_text("Network error".into());
-                                                    ui.set_is_recording(false);
-                                                    ui.set_has_error(true);
-                                                });
-                                                let _ = finalize_tx_for_network.send(());
-                                                return;
-                                            }
-
-                                            if let Ok(mut s) = client_state.lock() {
-                                                if matches!(
-                                                    *s,
-                                                    RecordingState::BufferingPreConnect
-                                                        | RecordingState::Connecting
-                                                        | RecordingState::Recording
-                                                ) {
-                                                    s.transition_to_finalizing();
-                                                }
-                                            }
-
-                                            println!("⚡ Network client task ended");
-                                        });
-
-                                        tokio::spawn(async move {
-                                            let mut latest_partial = String::new();
-                                            while let Some(msg) = text_rx.recv().await {
-                                                {
-                                                    let mut s = injection_state.lock().unwrap();
-                                                    s.transition_to_recording();
-                                                }
-
-                                                let mut was_committed = false;
-                                                let mut is_error = false;
-                                                let display_text = match msg {
-                                                    network::TranscriptMessage::Partial(text) => {
-                                                        latest_partial = text;
-                                                        let committed = {
-                                                            let pipeline = transcript_pipeline_for_text.lock().unwrap();
-                                                            pipeline.committed_text().trim().to_string()
-                                                        };
-                                                        if committed.is_empty() {
-                                                            latest_partial.clone()
-                                                        } else if latest_partial.trim().is_empty() {
-                                                            committed
-                                                        } else {
-                                                            format!("{} {}", committed, latest_partial.trim())
-                                                        }
-                                                    }
-                                                    network::TranscriptMessage::Committed(text) => {
-                                                        // Clear any partial; this is end-of-utterance.
-                                                        latest_partial.clear();
-
-                                                        // Decide what text to actually commit:
-                                                        // - If ElevenLabs sends an empty committed transcript (which happens),
-                                                        //   fall back to the current committed text in the pipeline so we
-                                                        //   still inject something useful.
-                                                        let empty_commit = text.trim().is_empty();
-                                                        let base_text = if empty_commit {
-                                                            let pipeline = transcript_pipeline_for_text.lock().unwrap();
-                                                            pipeline.committed_text().trim().to_string()
-                                                        } else {
-                                                            text.clone()
-                                                        };
-
-                                                        // Snapshot Gemini settings while holding the lock briefly.
-                                                        let (gemini_on, gkey, gmodel, gpreset, gcustom) = {
-                                                            let s = settings_for_text.lock().unwrap();
-                                                            (
-                                                                s.gemini_enabled,
-                                                                s.gemini_api_key.clone(),
-                                                                s.gemini_model.clone(),
-                                                                s.gemini_prompt_preset.clone(),
-                                                                s.gemini_custom_prompt.clone(),
-                                                            )
-                                                        };
-                                                        // Lock is dropped here before any await.
-
-                                                        let final_text = if gemini_on {
-                                                            println!("🤖 [Gemini] Rewriting committed text...");
-                                                            gemini::rewrite_text(&gkey, &gmodel, &gpreset, &gcustom, &base_text).await
-                                                        } else {
-                                                            base_text
-                                                        };
-
-                                                        let aggregated = {
-                                                            let mut pipeline = transcript_pipeline_for_text.lock().unwrap();
-                                                            if empty_commit {
-                                                                // Empty commit: treat as "finalize" without appending.
-                                                                pipeline.committed_text().to_string()
-                                                            } else {
-                                                                pipeline.push_fragment(&final_text)
-                                                            }
-                                                        };
-                                                        println!("⌨ Injecting committed transcript into active window");
-                                                        if let Err(e) = injector::inject_text(&final_text) {
-                                                            eprintln!("❌ Injection Error: {}", e);
-                                                            let _ = ui_handle_for_transcript.upgrade_in_event_loop(|ui| {
-                                                                ui.set_status_text("Injection error - check focused window and permissions".into());
-                                                                ui.set_has_error(true);
-                                                                ui.set_is_recording(false);
-                                                            });
-                                                        }
-                                                        was_committed = true;
-                                                        aggregated
-                                                    }
-                                                    network::TranscriptMessage::Error(err_json) => {
-                                                        latest_partial.clear();
-                                                        is_error = true;
-                                                        let friendly = format!("Error from speech service:\n{}", err_json);
-                                                        let _ = ui_handle_for_transcript.upgrade_in_event_loop(|ui| {
-                                                            ui.set_status_text("Speech service error".into());
-                                                            ui.set_is_recording(false);
-                                                            ui.set_has_error(true);
-                                                        });
-                                                        friendly
-                                                    }
-                                                };
-
-                                                let aggregated_for_ui = display_text.clone();
-                                                let aggregated_for_overlay = display_text.clone();
-                                                let hide_overlay = was_committed && !is_error;
-                                                let _ = ui_handle_for_transcript.upgrade_in_event_loop(move |ui| {
-                                                    ui.set_transcript(aggregated_for_ui.into());
-                                                });
-                                                let _ = overlay_handle_for_transcript
-                                                    .upgrade_in_event_loop(move |overlay| {
-                                                        overlay.set_is_error(is_error);
-                                                        if hide_overlay {
-                                                            overlay.set_sentence_text("".into());
-                                                            overlay.set_window_width(520);
-                                                            overlay.set_window_height(120);
-                                                            overlay.set_is_error(false);
-                                                            let _ = overlay.hide();
-                                                        } else {
-                                                            let (w, h) =
-                                                                overlay_size_for_text(
-                                                                    &aggregated_for_overlay,
-                                                                );
-                                                            overlay.set_sentence_text(
-                                                                aggregated_for_overlay.into(),
-                                                            );
-                                                            overlay.set_window_width(w);
-                                                            overlay.set_window_height(h);
-                                                            let _ = overlay.show();
-                                                        }
-                                                    });
-                                            }
-
-                                            // Committed transcripts are injected immediately as they arrive.
-                                            let _ = finalize_tx_for_injection.send(());
-                                        });
-
-                                        active_session = Some(Session {
-                                            state,
-                                            _audio_stream: Some(stream),
-                                            network_stop_tx: Some(network_stop_tx),
-                                            transcript_pipeline,
-                                        });
-                                        if let Some(session) = active_session.as_ref() {
-                                            if let Some(tx) = session.network_stop_tx.as_ref() {
-                                                let _ = tx.send(network::ControlMessage::Start);
-                                            }
-                                        }
                                     }
                                     Err(e) => {
-                                        eprintln!("❌ Failed to start audio: {}", e);
-                                        let _ = ui_handle_for_tokio.upgrade_in_event_loop(move |ui| {
-                                            ui.set_is_recording(false);
-                                            ui.set_status_text(format!("Audio error: {}", e).into());
-                                            ui.set_active_tab(2);
-                                        });
-                                        let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
-                                            overlay.set_sentence_text("".into());
-                                            overlay.set_window_width(520);
-                                            overlay.set_window_height(120);
-                                            let _ = overlay.hide();
-                                        });
+                                    eprintln!("❌ Failed to start audio: {}", e);
+                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(move |ui| {
+                                        ui.set_is_recording(false);
+                                        ui.set_status_text(format!("Audio error: {}", e).into());
+                                        ui.set_active_tab(2);
+                                    });
+                                    let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
+                                        overlay.set_sentence_text("".into());
+                                        overlay.set_window_width(520);
+                                        overlay.set_window_height(120);
+                                        overlay.set_is_visible(false);
+                                        let _ = overlay.hide();
+                                    });
                                     }
-                                }
-                            }
-                            AppCommand::StopRecording => {
-                                println!("⚡ Stop requested");
-                                let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
+                                    }
+                                    }
+                                    AppCommand::StopRecording => {
+                                    println!("⚡ Stop requested");
+                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
                                     ui.set_status_text("Finalizing...".into());
                                     ui.set_is_recording(false);
-                                });
+                                    });
 
-                                if let Some(session) = active_session.as_mut() {
+                                    if let Some(session) = active_session.as_mut() {
                                     {
-                                        let mut s = session.state.lock().unwrap();
-                                        if s.can_stop() {
-                                            s.transition_to_finalizing();
-                                        }
+                                    let mut s = session.state.lock().unwrap();
+                                    if s.can_stop() {
+                                        s.transition_to_finalizing();
+                                    }
                                     }
                                     if let Ok(mut pipeline) = session.transcript_pipeline.lock() {
-                                        pipeline.request_stop();
+                                    pipeline.request_stop();
                                     }
                                     session.stop_network();
-                                    if let Ok(mut s) = session.state.lock() {
-                                        s.transition_to_idle();
                                     }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    });
-
-    let start_tx = cmd_tx.clone();
+                                    }
+                                    }
+                                    }
+                                    }
+                                    }
+                                    });
+                                    });    let start_tx = cmd_tx.clone();
     ui.on_start_recording(move || {
         let _ = start_tx.send(AppCommand::StartRecording);
     });

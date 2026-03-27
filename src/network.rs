@@ -2,7 +2,6 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::error::Error;
 use std::collections::VecDeque;
-use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver}; // Bounded receiver
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -33,6 +32,7 @@ pub enum TranscriptMessage {
 #[derive(Debug)]
 enum WsEvent {
     SessionStarted,
+    CommittedTranscriptReceived,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -114,6 +114,7 @@ impl ElevenLabsClient {
         mut audio_rx: Receiver<Vec<i16>>,
         mut control_rx: UnboundedReceiver<ControlMessage>,
         text_tx: tokio::sync::mpsc::Sender<TranscriptMessage>,
+        log_tx: mpsc::UnboundedSender<String>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let url = Url::parse_with_params(
             ELEVENLABS_WSS_URL,
@@ -125,68 +126,84 @@ impl ElevenLabsClient {
             ],
         )?;
 
-        println!("🔌 Connecting to ElevenLabs: {}", url);
-        
+        macro_rules! emit {
+            ($($arg:tt)*) => {{
+                let msg = format!($($arg)*);
+                println!("{}", msg);
+                let _ = log_tx.send(msg);
+            }};
+        }
+
+        emit!("🔌 Connecting to ElevenLabs: {}", url);
+
         let mut request = url.as_str().into_client_request()?;
         request
             .headers_mut()
             .insert("xi-api-key", self.api_key.parse()?);
 
-        println!("➡️ [API OUT] WebSocket CONNECT {}", url);
+        emit!("➡️ [API OUT] WebSocket CONNECT {}", url);
         let (ws_stream, response) = connect_async(request).await?;
-        println!(
+        emit!(
             "⬅️ [API IN] WebSocket CONNECT status={} headers={:?}",
             response.status(),
             response.headers()
         );
-        println!("✅ Connected to ElevenLabs WebSocket");
+        emit!("✅ Connected to ElevenLabs WebSocket");
 
         let (mut write, mut read) = ws_stream.split();
         let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<WsEvent>();
 
-        // Spawn a task to read from WS and send text to injector
+        let log_tx_read = log_tx.clone();
         let read_task = tokio::spawn(async move {
+            macro_rules! emit_read {
+                ($($arg:tt)*) => {{
+                    let msg = format!($($arg)*);
+                    println!("{}", msg);
+                    let _ = log_tx_read.send(msg);
+                }};
+            }
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                        println!("⬅️ [API IN] WS text: {}", text);
+                        emit_read!("⬅️ [API IN] WS text: {}", text);
                         match parse_incoming_message(&text) {
                             ParsedIncoming::SessionStarted => {
-                                println!("✅ [API IN] session_started");
+                                emit_read!("✅ [API IN] session_started");
                                 let _ = evt_tx.send(WsEvent::SessionStarted);
                             }
                             ParsedIncoming::PartialTranscript(content) => {
                                 if !content.is_empty() {
-                                    println!("📝 [PARTIAL] {}", content);
+                                    emit_read!("📝 [PARTIAL] {}", content);
                                     let _ = text_tx.send(TranscriptMessage::Partial(content)).await;
                                 }
                             }
                             ParsedIncoming::CommittedTranscript(content) => {
-                                println!("📝 [COMMITTED] {}", content);
+                                emit_read!("📝 [COMMITTED] {}", content);
                                 let _ = text_tx.send(TranscriptMessage::Committed(content)).await;
+                                let _ = evt_tx.send(WsEvent::CommittedTranscriptReceived);
                             }
                             ParsedIncoming::Error(err_json) => {
-                                eprintln!("❌ [API ERROR] {}", err_json);
+                                emit_read!("❌ [API ERROR] {}", err_json);
                                 let _ = text_tx.send(TranscriptMessage::Error(err_json)).await;
                             }
                             ParsedIncoming::Other => {}
                         }
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
-                        println!("🔌 WebSocket Closed");
+                        emit_read!("🔌 WebSocket Closed");
                         break;
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Ping(payload)) => {
-                        println!("⬅️ [API IN] WS ping {} bytes", payload.len());
+                        emit_read!("⬅️ [API IN] WS ping {} bytes", payload.len());
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Pong(payload)) => {
-                        println!("⬅️ [API IN] WS pong {} bytes", payload.len());
+                        emit_read!("⬅️ [API IN] WS pong {} bytes", payload.len());
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Binary(payload)) => {
-                        println!("⬅️ [API IN] WS binary {} bytes", payload.len());
+                        emit_read!("⬅️ [API IN] WS binary {} bytes", payload.len());
                     }
                     Err(e) => {
-                        eprintln!("❌ WebSocket Error: {}", e);
+                        emit_read!("❌ WebSocket Error: {}", e);
                         break;
                     }
                     _ => {}
@@ -194,25 +211,34 @@ impl ElevenLabsClient {
             }
         });
 
-        // Loop to send audio from channel to WS and handle stop/finalize signals.
         let mut session_ready = false;
         let mut accepting_audio = false;
+        let mut awaiting_final_commit = false;
         let mut queued_audio: VecDeque<Vec<i16>> = VecDeque::new();
         loop {
             tokio::select! {
                 Some(evt) = evt_rx.recv() => {
-                    if matches!(evt, WsEvent::SessionStarted) {
-                        session_ready = true;
-                        println!("➡️ Session ready, flushing {} queued chunks", queued_audio.len());
-                        while let Some(chunk) = queued_audio.pop_front() {
-                            let payload = audio_chunk_payload(&chunk, false);
-                            println!(
-                                "➡️ [API OUT] WS audio chunk: samples={} payload_bytes={}",
-                                chunk.len(),
-                                payload.len()
-                            );
-                            if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(payload)).await {
-                                eprintln!("❌ Failed to flush queued audio: {}", e);
+                    match evt {
+                        WsEvent::SessionStarted => {
+                            session_ready = true;
+                            emit!("➡️ Session ready, flushing {} queued chunks", queued_audio.len());
+                            while let Some(chunk) = queued_audio.pop_front() {
+                                let payload = audio_chunk_payload(&chunk, false);
+                                emit!(
+                                    "➡️ [API OUT] WS audio chunk: samples={} payload_bytes={}",
+                                    chunk.len(),
+                                    payload.len()
+                                );
+                                if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(payload)).await {
+                                    emit!("❌ Failed to flush queued audio: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        WsEvent::CommittedTranscriptReceived => {
+                            if awaiting_final_commit {
+                                emit!("➡️ Final committed transcript received, closing WebSocket");
+                                let _ = write.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
                                 break;
                             }
                         }
@@ -222,38 +248,33 @@ impl ElevenLabsClient {
                     match cmd {
                         ControlMessage::Start => {
                             accepting_audio = true;
-                            println!("➡️ [API OUT] Segment start requested");
+                            emit!("➡️ [API OUT] Segment start requested");
                         }
                         ControlMessage::Stop => {
                             accepting_audio = false;
-                            println!("➡️ [API OUT] Manual commit requested");
+                            awaiting_final_commit = true;
+                            emit!("➡️ [API OUT] Manual commit requested");
 
                             let pre_commit_1 = silence_chunk_payload(false);
-                            println!("➡️ [API OUT] WS silence chunk 1/2 (pre-commit)");
+                            emit!("➡️ [API OUT] WS silence chunk 1/2 (pre-commit)");
                             if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(pre_commit_1)).await {
-                                eprintln!("❌ Failed to send pre-commit silence chunk 1: {}", e);
+                                emit!("❌ Failed to send pre-commit silence chunk 1: {}", e);
                                 break;
                             }
-
-                            tokio::time::sleep(Duration::from_millis(200)).await;
 
                             let pre_commit_2 = silence_chunk_payload(false);
-                            println!("➡️ [API OUT] WS silence chunk 2/2 (pre-commit)");
+                            emit!("➡️ [API OUT] WS silence chunk 2/2 (pre-commit)");
                             if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(pre_commit_2)).await {
-                                eprintln!("❌ Failed to send pre-commit silence chunk 2: {}", e);
+                                emit!("❌ Failed to send pre-commit silence chunk 2: {}", e);
                                 break;
                             }
-
-                            tokio::time::sleep(Duration::from_millis(200)).await;
 
                             let commit_payload = silence_chunk_payload(true);
-                            println!("➡️ [API OUT] WS commit chunk");
+                            emit!("➡️ [API OUT] WS commit chunk");
                             if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(commit_payload)).await {
-                                eprintln!("❌ Failed to send commit chunk: {}", e);
+                                emit!("❌ Failed to send commit chunk: {}", e);
                                 break;
                             }
-
-                            tokio::time::sleep(Duration::from_millis(1000)).await;
                         }
                     }
                 }
@@ -267,52 +288,46 @@ impl ElevenLabsClient {
                                 queued_audio.push_back(chunk);
                             } else {
                                 let payload = audio_chunk_payload(&chunk, false);
-                                println!(
+                                emit!(
                                     "➡️ [API OUT] WS audio chunk: samples={} payload_bytes={}",
                                     chunk.len(),
                                     payload.len()
                                 );
                                 if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(payload)).await {
-                                    eprintln!("❌ Failed to send audio: {}", e);
+                                    emit!("❌ Failed to send audio: {}", e);
                                     break;
                                 }
                             }
                         }
                         None => {
-                            println!("➡️ [API OUT] Audio stream ended, forcing manual commit");
+                            emit!("➡️ [API OUT] Audio stream ended, forcing manual commit");
                             let pre_commit_1 = silence_chunk_payload(false);
-                            println!("➡️ [API OUT] WS silence chunk 1/2 (pre-commit)");
+                            emit!("➡️ [API OUT] WS silence chunk 1/2 (pre-commit)");
                             if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(pre_commit_1)).await {
-                                eprintln!("❌ Failed to send pre-commit silence chunk 1 after audio close: {}", e);
+                                emit!("❌ Failed to send pre-commit silence chunk 1 after audio close: {}", e);
                                 break;
                             }
-
-                            tokio::time::sleep(Duration::from_millis(200)).await;
 
                             let pre_commit_2 = silence_chunk_payload(false);
-                            println!("➡️ [API OUT] WS silence chunk 2/2 (pre-commit)");
+                            emit!("➡️ [API OUT] WS silence chunk 2/2 (pre-commit)");
                             if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(pre_commit_2)).await {
-                                eprintln!("❌ Failed to send pre-commit silence chunk 2 after audio close: {}", e);
+                                emit!("❌ Failed to send pre-commit silence chunk 2 after audio close: {}", e);
                                 break;
                             }
-
-                            tokio::time::sleep(Duration::from_millis(200)).await;
 
                             let commit_payload = silence_chunk_payload(true);
-                            println!("➡️ [API OUT] WS commit chunk");
+                            emit!("➡️ [API OUT] WS commit chunk");
                             if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(commit_payload)).await {
-                                eprintln!("❌ Failed to send commit chunk after audio close: {}", e);
+                                emit!("❌ Failed to send commit chunk after audio close: {}", e);
                                 break;
                             }
-
-                            tokio::time::sleep(Duration::from_millis(1000)).await;
                             break;
                         }
                     }
                 }
             }
         }
-        
+
         // Cleanup
         let _ = read_task.await;
         Ok(())
