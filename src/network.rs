@@ -1,13 +1,13 @@
+use base64::{engine::general_purpose, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use std::error::Error;
 use std::collections::VecDeque;
-use tokio::sync::mpsc::{Receiver, UnboundedReceiver}; // Bounded receiver
+use std::error::Error;
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver}; // Bounded receiver
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use url::Url;
-use base64::{Engine as _, engine::general_purpose};
 
 const ELEVENLABS_WSS_URL: &str = "wss://api.elevenlabs.io/v1/speech-to-text/realtime";
 
@@ -33,6 +33,8 @@ pub enum TranscriptMessage {
 enum WsEvent {
     SessionStarted,
     CommittedTranscriptReceived,
+    TerminalError,
+    ConnectionClosed,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -71,15 +73,17 @@ fn parse_incoming_message(text: &str) -> ParsedIncoming {
                 .unwrap_or_default()
                 .to_string(),
         ),
-        "auth_error" | "quota_exceeded" | "transcriber_error" | "input_error" | "error" | "invalid_request" => {
-            ParsedIncoming::Error(parsed.to_string())
-        }
+        "auth_error" | "quota_exceeded" | "resource_exhausted" | "transcriber_error"
+        | "input_error" | "error" | "invalid_request" => ParsedIncoming::Error(parsed.to_string()),
         _ => ParsedIncoming::Other,
     }
 }
 
 fn audio_chunk_payload(chunk: &[i16], commit: bool) -> String {
-    let byte_data: Vec<u8> = chunk.iter().flat_map(|&s| s.to_le_bytes().to_vec()).collect();
+    let byte_data: Vec<u8> = chunk
+        .iter()
+        .flat_map(|&s| s.to_le_bytes().to_vec())
+        .collect();
     let b64 = general_purpose::STANDARD.encode(&byte_data);
     if commit {
         json!({
@@ -99,6 +103,19 @@ fn audio_chunk_payload(chunk: &[i16], commit: bool) -> String {
     }
 }
 
+fn realtime_url(model_id: &str) -> Result<Url, url::ParseError> {
+    Url::parse_with_params(
+        ELEVENLABS_WSS_URL,
+        &[
+            ("model_id", model_id),
+            ("language_code", "en"),
+            ("audio_format", "pcm_16000"),
+            ("commit_strategy", "manual"),
+            ("no_verbatim", "true"),
+        ],
+    )
+}
+
 fn silence_chunk_payload(commit: bool) -> String {
     let silence = vec![0i16; 3200];
     audio_chunk_payload(&silence, commit)
@@ -116,15 +133,7 @@ impl ElevenLabsClient {
         text_tx: tokio::sync::mpsc::Sender<TranscriptMessage>,
         log_tx: mpsc::UnboundedSender<String>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let url = Url::parse_with_params(
-            ELEVENLABS_WSS_URL,
-            &[
-                ("model_id", self.model_id.as_str()),
-                ("language_code", "en"),
-                ("audio_format", "pcm_16000"),
-                ("commit_strategy", "manual"),
-            ],
-        )?;
+        let url = realtime_url(&self.model_id)?;
 
         macro_rules! emit {
             ($($arg:tt)*) => {{
@@ -185,12 +194,14 @@ impl ElevenLabsClient {
                             ParsedIncoming::Error(err_json) => {
                                 emit_read!("❌ [API ERROR] {}", err_json);
                                 let _ = text_tx.send(TranscriptMessage::Error(err_json)).await;
+                                let _ = evt_tx.send(WsEvent::TerminalError);
                             }
                             ParsedIncoming::Other => {}
                         }
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
                         emit_read!("🔌 WebSocket Closed");
+                        let _ = evt_tx.send(WsEvent::ConnectionClosed);
                         break;
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Ping(payload)) => {
@@ -204,11 +215,13 @@ impl ElevenLabsClient {
                     }
                     Err(e) => {
                         emit_read!("❌ WebSocket Error: {}", e);
+                        let _ = evt_tx.send(WsEvent::ConnectionClosed);
                         break;
                     }
                     _ => {}
                 }
             }
+            let _ = evt_tx.send(WsEvent::ConnectionClosed);
         });
 
         let mut session_ready = false;
@@ -241,6 +254,15 @@ impl ElevenLabsClient {
                                 let _ = write.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
                                 break;
                             }
+                        }
+                        WsEvent::TerminalError => {
+                            emit!("➡️ API reported terminal error, closing WebSocket");
+                            let _ = write.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
+                            break;
+                        }
+                        WsEvent::ConnectionClosed => {
+                            emit!("➡️ WebSocket connection closed, ending session");
+                            break;
                         }
                     }
                 }
@@ -336,7 +358,10 @@ impl ElevenLabsClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{audio_chunk_payload, parse_incoming_message, silence_chunk_payload, ParsedIncoming};
+    use super::{
+        audio_chunk_payload, parse_incoming_message, realtime_url, silence_chunk_payload,
+        ParsedIncoming,
+    };
 
     #[test]
     fn parse_session_started_event() {
@@ -410,5 +435,16 @@ mod tests {
         assert_eq!(v["message_type"], "input_audio_chunk");
         assert_eq!(v["sample_rate"], 16000);
         assert_eq!(v["commit"], true);
+    }
+
+    #[test]
+    fn realtime_url_requests_non_verbatim_transcripts() {
+        let url = realtime_url("scribe_v2_realtime").unwrap();
+        let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(query.get("model_id").map(String::as_str), Some("scribe_v2_realtime"));
+        assert_eq!(query.get("language_code").map(String::as_str), Some("en"));
+        assert_eq!(query.get("audio_format").map(String::as_str), Some("pcm_16000"));
+        assert_eq!(query.get("commit_strategy").map(String::as_str), Some("manual"));
+        assert_eq!(query.get("no_verbatim").map(String::as_str), Some("true"));
     }
 }

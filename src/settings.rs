@@ -1,7 +1,7 @@
+use dirs_next::config_dir;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use dirs_next::config_dir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -18,6 +18,10 @@ pub struct AppSettings {
     pub theme_text_color: String,
     pub overlay_background_color: String,
     pub overlay_text_color: String,
+    #[serde(default)]
+    pub overlay_position_x: Option<i32>,
+    #[serde(default)]
+    pub overlay_position_y: Option<i32>,
     pub gemini_api_key: String,
     pub gemini_enabled: bool,
     pub gemini_model: String,
@@ -33,14 +37,16 @@ impl Default for AppSettings {
             use_default_microphone: true,
             hotkey_text: "Ctrl+Space".to_string(),
             overlay_opacity: 0.85,
-            theme_background_top_color: "#02140b".to_string(),   // deep forest green
+            theme_background_top_color: "#02140b".to_string(), // deep forest green
             theme_background_bottom_color: "#000806".to_string(), // near-black green
-            theme_window_color: "#041b11".to_string(),           // card/window green
-            theme_button_accent_color: "#4ade80".to_string(),    // bright leaf green
-            theme_title_color: "#e4ffe9".to_string(),            // soft light green
-            theme_text_color: "#ccefd6".to_string(),             // muted light green
-            overlay_background_color: "#03150c".to_string(),     // darker overlay panel
-            overlay_text_color: "#e6fff0".to_string(),           // overlay text
+            theme_window_color: "#041b11".to_string(),         // card/window green
+            theme_button_accent_color: "#4ade80".to_string(),  // bright leaf green
+            theme_title_color: "#e4ffe9".to_string(),          // soft light green
+            theme_text_color: "#ccefd6".to_string(),           // muted light green
+            overlay_background_color: "#03150c".to_string(),   // darker overlay panel
+            overlay_text_color: "#e6fff0".to_string(),         // overlay text
+            overlay_position_x: None,
+            overlay_position_y: None,
             gemini_api_key: String::new(),
             gemini_enabled: false,
             gemini_model: "gemini-3.1-flash-lite-preview".to_string(),
@@ -78,7 +84,10 @@ pub fn save_settings_to_path(path: &PathBuf, settings: &AppSettings) {
     // Ensure the target directory exists (create the per-user folder if needed)
     if let Some(parent) = path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
-            eprintln!("❌ Failed to create settings directory {:?}: {}", parent, err);
+            eprintln!(
+                "❌ Failed to create settings directory {:?}: {}",
+                parent, err
+            );
             return;
         }
     }
@@ -127,6 +136,8 @@ mod tests {
             theme_text_color: "#0000ff".to_string(),
             overlay_background_color: "#123456".to_string(),
             overlay_text_color: "#654321".to_string(),
+            overlay_position_x: Some(128),
+            overlay_position_y: Some(256),
             gemini_api_key: "gm_test".to_string(),
             gemini_enabled: true,
             gemini_model: "gemini-3.1-flash-lite-preview".to_string(),
@@ -138,7 +149,10 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert_eq!(loaded.api_key, expected.api_key);
         assert_eq!(loaded.selected_microphone, expected.selected_microphone);
-        assert_eq!(loaded.use_default_microphone, expected.use_default_microphone);
+        assert_eq!(
+            loaded.use_default_microphone,
+            expected.use_default_microphone
+        );
         assert_eq!(loaded.hotkey_text, expected.hotkey_text);
     }
 
@@ -161,5 +175,7 @@ mod tests {
         assert_eq!(loaded.theme_text_color, "#ccefd6");
         assert_eq!(loaded.overlay_background_color, "#03150c");
         assert_eq!(loaded.overlay_text_color, "#e6fff0");
+        assert_eq!(loaded.overlay_position_x, None);
+        assert_eq!(loaded.overlay_position_y, None);
     }
 }

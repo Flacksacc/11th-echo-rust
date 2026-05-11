@@ -863,6 +863,7 @@ export component TranscriptOverlayWindow inherits Window {
     in property <color> overlay-background-color: #0d1017;
     in property <color> overlay-text-color: #ffffff;
     in property <bool> is-error: false;
+    in property <bool> is-system-message: false;
     in property <bool> is-visible: false;
 
     callback move-window(int, int);
@@ -891,8 +892,8 @@ export component TranscriptOverlayWindow inherits Window {
             Text {
                 x: 10px;
                 y: 8px;
-                text: "Live";
-                color: root.is-error ? #f38ba8 : root.overlay-text-color;
+                text: root.is-system-message ? "Gemini" : "Live";
+                color: root.is-error ? #f38ba8 : root.is-system-message ? #4ade80 : root.overlay-text-color;
                 font-size: 12px;
             }
 
@@ -902,7 +903,7 @@ export component TranscriptOverlayWindow inherits Window {
                 width: parent.width - 20px;
                 height: parent.height - 36px;
                 text: root.sentence-text;
-                color: root.is-error ? #ffe5e5 : root.overlay-text-color;
+                color: root.is-error ? #ffe5e5 : root.is-system-message ? #4ade80 : root.overlay-text-color;
                 wrap: word-wrap;
                 overflow: elide;
                 vertical-alignment: top;

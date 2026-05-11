@@ -1,22 +1,25 @@
-mod injector;
 mod audio;
+mod gemini;
 mod hotkey;
+mod injector;
 mod network;
 mod pipeline;
 mod settings;
 mod state;
-mod gemini;
 
-use slint::{CloseRequestResponse, Color, ComponentHandle, ModelRc, SharedString, VecModel};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use pipeline::TranscriptPipeline;
-use settings::{load_settings, save_settings};
-use state::RecordingState;
-use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
 use arboard::Clipboard;
 use chrono::Local;
+use pipeline::TranscriptPipeline;
+use settings::{load_settings, save_settings};
+use slint::{CloseRequestResponse, Color, ComponentHandle, ModelRc, SharedString, VecModel};
+use state::RecordingState;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
+use std::thread;
+use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
 
 #[cfg(target_os = "windows")]
 use global_hotkey::{
@@ -24,19 +27,19 @@ use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
 };
 #[cfg(target_os = "windows")]
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_RWIN, VK_LWIN, VK_SHIFT,
-    VK_SPACE, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
-};
-#[cfg(target_os = "windows")]
-use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CYSCREEN};
-#[cfg(target_os = "windows")]
 use std::{cell::RefCell, rc::Rc};
 #[cfg(target_os = "windows")]
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
     MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
 };
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_F1, VK_F10, VK_F11, VK_F12, VK_F2, VK_F3, VK_F4,
+    VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_SPACE,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CYSCREEN};
 
 slint::include_modules!();
 
@@ -200,16 +203,54 @@ fn detect_hotkey_combo() -> Option<String> {
 
     let keys: [(&str, i32); 49] = [
         ("Space", VK_SPACE.0 as i32),
-        ("A", 0x41), ("B", 0x42), ("C", 0x43), ("D", 0x44), ("E", 0x45), ("F", 0x46),
-        ("G", 0x47), ("H", 0x48), ("I", 0x49), ("J", 0x4A), ("K", 0x4B), ("L", 0x4C),
-        ("M", 0x4D), ("N", 0x4E), ("O", 0x4F), ("P", 0x50), ("Q", 0x51), ("R", 0x52),
-        ("S", 0x53), ("T", 0x54), ("U", 0x55), ("V", 0x56), ("W", 0x57), ("X", 0x58),
-        ("Y", 0x59), ("Z", 0x5A),
-        ("0", 0x30), ("1", 0x31), ("2", 0x32), ("3", 0x33), ("4", 0x34),
-        ("5", 0x35), ("6", 0x36), ("7", 0x37), ("8", 0x38), ("9", 0x39),
-        ("F1", VK_F1.0 as i32), ("F2", VK_F2.0 as i32), ("F3", VK_F3.0 as i32), ("F4", VK_F4.0 as i32),
-        ("F5", VK_F5.0 as i32), ("F6", VK_F6.0 as i32), ("F7", VK_F7.0 as i32), ("F8", VK_F8.0 as i32),
-        ("F9", VK_F9.0 as i32), ("F10", VK_F10.0 as i32), ("F11", VK_F11.0 as i32), ("F12", VK_F12.0 as i32),
+        ("A", 0x41),
+        ("B", 0x42),
+        ("C", 0x43),
+        ("D", 0x44),
+        ("E", 0x45),
+        ("F", 0x46),
+        ("G", 0x47),
+        ("H", 0x48),
+        ("I", 0x49),
+        ("J", 0x4A),
+        ("K", 0x4B),
+        ("L", 0x4C),
+        ("M", 0x4D),
+        ("N", 0x4E),
+        ("O", 0x4F),
+        ("P", 0x50),
+        ("Q", 0x51),
+        ("R", 0x52),
+        ("S", 0x53),
+        ("T", 0x54),
+        ("U", 0x55),
+        ("V", 0x56),
+        ("W", 0x57),
+        ("X", 0x58),
+        ("Y", 0x59),
+        ("Z", 0x5A),
+        ("0", 0x30),
+        ("1", 0x31),
+        ("2", 0x32),
+        ("3", 0x33),
+        ("4", 0x34),
+        ("5", 0x35),
+        ("6", 0x36),
+        ("7", 0x37),
+        ("8", 0x38),
+        ("9", 0x39),
+        ("F1", VK_F1.0 as i32),
+        ("F2", VK_F2.0 as i32),
+        ("F3", VK_F3.0 as i32),
+        ("F4", VK_F4.0 as i32),
+        ("F5", VK_F5.0 as i32),
+        ("F6", VK_F6.0 as i32),
+        ("F7", VK_F7.0 as i32),
+        ("F8", VK_F8.0 as i32),
+        ("F9", VK_F9.0 as i32),
+        ("F10", VK_F10.0 as i32),
+        ("F11", VK_F11.0 as i32),
+        ("F12", VK_F12.0 as i32),
     ];
 
     for (label, vk) in keys {
@@ -244,6 +285,44 @@ fn overlay_size_for_text(text: &str) -> (i32, i32) {
     (width, height)
 }
 
+fn live_transcript_text(committed: &str, partial: &str) -> String {
+    let committed = committed.trim();
+    let partial = partial.trim();
+
+    if partial.is_empty() {
+        return committed.to_string();
+    }
+
+    if committed.is_empty() || partial.starts_with(committed) {
+        return partial.to_string();
+    }
+
+    format!("{} {}", committed, partial)
+}
+
+fn reset_overlay_to_listening(overlay: &TranscriptOverlayWindow) {
+    overlay.set_sentence_text("Listening...".into());
+    overlay.set_window_width(520);
+    overlay.set_window_height(120);
+    overlay.set_is_error(false);
+    overlay.set_is_system_message(false);
+    overlay.set_is_visible(true);
+    let _ = overlay.show();
+}
+
+#[cfg(target_os = "windows")]
+fn default_overlay_position() -> slint::PhysicalPosition {
+    let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    let overlay_h = 120;
+    let margin = 24;
+    slint::PhysicalPosition::new(margin, (screen_h - overlay_h - margin).max(0))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn default_overlay_position() -> slint::LogicalPosition {
+    slint::LogicalPosition::new(24.0, 820.0)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     println!("🦋 11th Echo Rust (Iron Butterfly) Starting...");
@@ -268,6 +347,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "windows")]
     let hotkey_text = Arc::new(Mutex::new(initial_settings.hotkey_text.clone()));
+    #[cfg(target_os = "windows")]
+    let intended_target = Arc::new(Mutex::new(None::<injector::ForegroundTarget>));
 
     #[cfg(target_os = "windows")]
     let hotkey_manager = GlobalHotKeyManager::new().unwrap();
@@ -279,7 +360,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     {
         let startup_hotkey = hotkey_text.lock().unwrap().clone();
-        match apply_hotkey(&hotkey_manager, &mut hotkey_state.borrow_mut(), &startup_hotkey) {
+        match apply_hotkey(
+            &hotkey_manager,
+            &mut hotkey_state.borrow_mut(),
+            &startup_hotkey,
+        ) {
             Ok(id) => {
                 *hotkey_id_state.borrow_mut() = Some(id);
             }
@@ -312,7 +397,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_tooltip("11th Echo")
             .with_icon(icon)
             .build()?;
-        (quit_item.id().clone(), settings_item.id().clone(), Some(tray))
+        (
+            quit_item.id().clone(),
+            settings_item.id().clone(),
+            Some(tray),
+        )
     };
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AppCommand>();
@@ -414,33 +503,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Color::from_rgb_u8(230, 255, 240),
     ));
     transcript_overlay.set_is_error(false);
+    transcript_overlay.set_is_system_message(false);
     #[cfg(target_os = "windows")]
     {
-        let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-        let overlay_h = 120;
-        let margin = 24;
-        transcript_overlay.window().set_position(slint::PhysicalPosition::new(margin, (screen_h - overlay_h - margin).max(0)));
+        let position = match (
+            initial_settings.overlay_position_x,
+            initial_settings.overlay_position_y,
+        ) {
+            (Some(x), Some(y)) => slint::PhysicalPosition::new(x, y),
+            _ => default_overlay_position(),
+        };
+        transcript_overlay.window().set_position(position);
     }
     #[cfg(not(target_os = "windows"))]
     {
-        transcript_overlay.window().set_position(slint::LogicalPosition::new(24.0, 820.0));
+        let position = match (
+            initial_settings.overlay_position_x,
+            initial_settings.overlay_position_y,
+        ) {
+            (Some(x), Some(y)) => slint::LogicalPosition::new(x as f32, y as f32),
+            _ => default_overlay_position(),
+        };
+        transcript_overlay.window().set_position(position);
     }
 
     let overlay_weak_for_drag = transcript_overlay.as_weak();
+    let settings_for_overlay_drag = settings.clone();
     transcript_overlay.on_move_window(move |dx, dy| {
         if let Some(overlay) = overlay_weak_for_drag.upgrade() {
             let current = overlay.window().position();
             let scale = overlay.window().scale_factor();
-            overlay.window().set_position(slint::PhysicalPosition::new(
+            let new_position = slint::PhysicalPosition::new(
                 current.x + (dx as f32 * scale) as i32,
                 current.y + (dy as f32 * scale) as i32,
-            ));
+            );
+            overlay.window().set_position(new_position);
+
+            let snapshot = {
+                let mut current_settings = settings_for_overlay_drag.lock().unwrap();
+                current_settings.overlay_position_x = Some(new_position.x);
+                current_settings.overlay_position_y = Some(new_position.y);
+                current_settings.clone()
+            };
+            save_settings(&snapshot);
         }
     });
 
     let ui_handle_for_tokio = ui.as_weak();
     let overlay_handle_for_tokio = transcript_overlay.as_weak();
     let settings_for_runtime = settings.clone();
+    #[cfg(target_os = "windows")]
+    let intended_target_for_runtime = intended_target.clone();
 
     let transcript_raw_for_clipboard: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let log_raw_for_clipboard: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -477,8 +590,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("⚡ Tokio Runtime Active");
 
             let mut active_session: Option<Session> = None;
-            let (finalize_tx, mut finalize_rx) = mpsc::unbounded_channel::<()>();
-            let overlay_visible = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (finalize_tx, mut finalize_rx) = mpsc::unbounded_channel::<u64>();
+            let overlay_visible = Arc::new(AtomicBool::new(false));
+            let gemini_rewrite_pending = Arc::new(AtomicBool::new(false));
+            let finalize_after_gemini_rewrite = Arc::new(AtomicBool::new(false));
+            let session_epoch = Arc::new(AtomicU64::new(0));
 
             loop {
                 tokio::select! {
@@ -487,14 +603,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ui.set_audio_level(level);
                         });
                     }
-                    Some(()) = finalize_rx.recv() => {
+                    Some(finalized_epoch) = finalize_rx.recv() => {
+                        if finalized_epoch != session_epoch.load(Ordering::SeqCst) {
+                            println!("⚡ Ignoring stale finalization for session {}", finalized_epoch);
+                            continue;
+                        }
+                        if gemini_rewrite_pending.load(Ordering::SeqCst) {
+                            println!("⚡ Deferring finalization while Gemini rewrite is pending");
+                            finalize_after_gemini_rewrite.store(true, Ordering::SeqCst);
+                            continue;
+                        }
                         if let Some(session) = active_session.take() {
                             if let Ok(mut state) = session.state.lock() {
                                 state.transition_to_idle();
                             }
                             println!("✅ Finalization complete, session closed");
                         }
-                        overlay_visible.store(false, std::sync::atomic::Ordering::SeqCst);
+                        overlay_visible.store(false, Ordering::SeqCst);
                         let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
                             ui.set_audio_level(0.0);
                             ui.set_is_recording(false);
@@ -506,6 +631,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             overlay.set_window_width(520);
                             overlay.set_window_height(120);
                             overlay.set_is_error(false);
+                            overlay.set_is_system_message(false);
                             overlay.set_is_visible(false);
                             let _ = overlay.hide();
                         });
@@ -515,6 +641,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         AppCommand::StartRecording => {
                             if let Some(session) = active_session.as_mut() {
                                 if session.state.lock().unwrap().can_start() {
+                                    #[cfg(target_os = "windows")]
+                                    {
+                                        let captured = injector::capture_foreground_target();
+                                        match &captured {
+                                            Some(target) => eprintln!("⌨ [resume_recording] captured target {:?}", target),
+                                            None => eprintln!("⌨ [resume_recording] no foreground target captured"),
+                                        }
+                                        *intended_target_for_runtime.lock().unwrap() = captured;
+                                    }
                                     if let Ok(mut pipeline) = session.transcript_pipeline.lock() {
                                         *pipeline = TranscriptPipeline::new();
                                     }
@@ -527,13 +662,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         ui.set_has_error(false);
                                         ui.set_transcript("".into());
                                     });
-                                    overlay_visible.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    overlay_visible.store(true, Ordering::SeqCst);
                                     let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
-                                        overlay.set_sentence_text("".into());
-                                        overlay.set_window_width(520);
-                                        overlay.set_window_height(120);
-                                        overlay.set_is_visible(true);
-                                        let _ = overlay.show();
+                                        reset_overlay_to_listening(&overlay);
                                     });
                                     if let Some(tx) = session.network_stop_tx.as_ref() {
                                         let _ = tx.send(network::ControlMessage::Start);
@@ -555,6 +686,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
 
+                            let current_session_epoch =
+                                session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+
+                            #[cfg(target_os = "windows")]
+                            {
+                                let captured = injector::capture_foreground_target();
+                                match &captured {
+                                    Some(target) => eprintln!("⌨ [start_recording] captured target {:?}", target),
+                                    None => eprintln!("⌨ [start_recording] no foreground target captured"),
+                                }
+                                *intended_target_for_runtime.lock().unwrap() = captured;
+                            }
+
                             let preferred_device = if current_settings.use_default_microphone {
                                 None
                             } else {
@@ -567,13 +711,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_has_error(false);
                                 ui.set_transcript("".into());
                             });
-                            overlay_visible.store(true, std::sync::atomic::Ordering::SeqCst);
+                            overlay_visible.store(true, Ordering::SeqCst);
                             let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
-                                overlay.set_sentence_text("Listening...".into());
-                                overlay.set_window_width(520);
-                                overlay.set_window_height(120);
-                                overlay.set_is_visible(true);
-                                let _ = overlay.show();
+                                reset_overlay_to_listening(&overlay);
                             });
 
                             let state = Arc::new(Mutex::new(RecordingState::BufferingPreConnect));
@@ -602,7 +742,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                     let client_state = state.clone();
                                     let injection_state = state.clone();
-                                    let transcript_pipeline_for_network = transcript_pipeline.clone();
                                     let transcript_pipeline_for_text = transcript_pipeline.clone();
                                     let transcript_history_for_text = transcript_history.clone();
                                     let transcript_raw_for_text = transcript_raw.clone();
@@ -612,6 +751,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let log_raw_for_cb = log_raw_for_clipboard.clone();
                                     let log_line_tx_for_text = log_line_tx.clone();
                                     let settings_for_text = settings_for_runtime.clone();
+                                    #[cfg(target_os = "windows")]
+                                    let intended_target_for_text = intended_target_for_runtime.clone();
                                     let finalize_tx_for_network = finalize_tx.clone();
                                     let finalize_tx_for_transcript = finalize_tx.clone();
                                     let ui_handle_for_network = ui_handle_for_tokio.clone();
@@ -621,6 +762,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let _overlay_handle_for_audio = overlay_handle_for_tokio.clone();
                                     let overlay_visible_for_audio = overlay_visible.clone();
                                     let overlay_visible_for_transcript = overlay_visible.clone();
+                                    let gemini_rewrite_pending_for_text = gemini_rewrite_pending.clone();
+                                    let finalize_after_gemini_rewrite_for_text =
+                                        finalize_after_gemini_rewrite.clone();
+                                    let session_epoch_for_network = session_epoch.clone();
+                                    let session_epoch_for_transcript = session_epoch.clone();
 
                                     let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
                                         ui.set_is_recording(true);
@@ -630,7 +776,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let (audio_to_net_tx, audio_to_net_rx) = mpsc::channel::<Vec<i16>>(50);
                                     tokio::spawn(async move {
                                         while let Some(chunk) = audio_rx.recv().await {
-                                            if overlay_visible_for_audio.load(std::sync::atomic::Ordering::SeqCst) {
+                                            if overlay_visible_for_audio.load(Ordering::SeqCst) {
                                                 let _ = audio_to_net_tx.send(chunk).await;
                                             }
                                         }
@@ -653,16 +799,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 ui.set_is_recording(false);
                                                 ui.set_has_error(true);
                                             });
-                                            let _ = finalize_tx_for_network.send(());
+                                            let _ = finalize_tx_for_network.send(current_session_epoch);
                                             return;
                                         }
 
-                                        let should_finalize = {
-                                            let pipeline = transcript_pipeline_for_network.lock().unwrap();
-                                            !pipeline.stop_requested()
-                                        };
-                                        if should_finalize {
-                                            let _ = finalize_tx_for_network.send(());
+                                        if session_epoch_for_network.load(Ordering::SeqCst) == current_session_epoch {
+                                            let _ = finalize_tx_for_network.send(current_session_epoch);
                                         }
                                         println!("⚡ Network client task ended");
                                     });
@@ -702,6 +844,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             let mut was_committed = false;
                                             let mut is_error = false;
                                             let mut stop_requested_for_msg = false;
+                                            let mut finalize_after_rewrite = false;
                                             let display_text = match msg {
                                                 network::TranscriptMessage::Partial(text) => {
                                                     latest_partial = text;
@@ -709,13 +852,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                         let pipeline = transcript_pipeline_for_text.lock().unwrap();
                                                         pipeline.committed_text().trim().to_string()
                                                     };
-                                                    if committed.is_empty() {
-                                                        latest_partial.clone()
-                                                    } else if latest_partial.trim().is_empty() {
-                                                        committed
-                                                    } else {
-                                                        format!("{} {}", committed, latest_partial.trim())
-                                                    }
+                                                    live_transcript_text(&committed, &latest_partial)
                                                 }
                                                 network::TranscriptMessage::Committed(text) => {
                                                     // Decide what text to actually commit:
@@ -750,10 +887,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                                     let final_text = if gemini_on {
                                                         println!("🤖 [Gemini] Rewriting committed text...");
+                                                        gemini_rewrite_pending_for_text.store(true, Ordering::SeqCst);
+                                                        let pending_text = "Gemini has the text and is modifying it.";
+                                                        let (w, h) = overlay_size_for_text(pending_text);
+                                                        let overlay_visible_setter =
+                                                            overlay_visible_for_transcript.clone();
+                                                        let session_epoch_for_overlay =
+                                                            session_epoch_for_transcript.clone();
+                                                        let _ = overlay_handle_for_transcript
+                                                            .upgrade_in_event_loop(move |overlay| {
+                                                                if session_epoch_for_overlay.load(Ordering::SeqCst)
+                                                                    != current_session_epoch
+                                                                {
+                                                                    return;
+                                                                }
+                                                                overlay.set_is_error(false);
+                                                                overlay.set_is_system_message(true);
+                                                                overlay.set_sentence_text(pending_text.into());
+                                                                overlay.set_window_width(w);
+                                                                overlay.set_window_height(h);
+                                                                overlay.set_is_visible(true);
+                                                                overlay_visible_setter.store(true, Ordering::SeqCst);
+                                                                let _ = overlay.show();
+                                                            });
                                                         gemini::rewrite_text(&gkey, &gmodel, &gpreset, &gcustom, &base_text).await
                                                     } else {
                                                         base_text
                                                     };
+                                                    gemini_rewrite_pending_for_text.store(false, Ordering::SeqCst);
+                                                    finalize_after_rewrite =
+                                                        finalize_after_gemini_rewrite_for_text
+                                                            .swap(false, Ordering::SeqCst);
 
                                                     let final_text = final_text.trim().trim_start_matches('-').trim().to_string();
                                                     stop_requested_for_msg = {
@@ -788,6 +952,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     if stop_requested_for_msg {
                                                         let final_payload = aggregated.trim().to_string();
                                                         if !final_payload.is_empty() {
+                                                            #[cfg(target_os = "windows")]
+                                                            {
+                                                                let captured = intended_target_for_text.lock().unwrap().clone();
+                                                                injector::log_foreground_target("pre_inject");
+                                                                if injector::foreground_belongs_to_current_process() {
+                                                                    eprintln!("⌨ [pre_inject] this process owns the foreground window");
+                                                                    if let Some(target) = captured.as_ref() {
+                                                                        let _ = injector::restore_foreground_target(target);
+                                                                        thread::sleep(std::time::Duration::from_millis(30));
+                                                                        injector::log_foreground_target("post_restore");
+                                                                    } else {
+                                                                        eprintln!("⌨ [pre_inject] no captured target available to restore");
+                                                                    }
+                                                                }
+                                                            }
                                                             println!("⌨ Injecting full transcript into active window");
                                                             let to_inject = format!("{} ", final_payload);
                                                             if let Err(e) = injector::inject_text(&to_inject) {
@@ -824,39 +1003,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 let pipeline = transcript_pipeline_for_text.lock().unwrap();
                                                 pipeline.committed_text().to_string()
                                             };
+                                            if session_epoch_for_transcript.load(Ordering::SeqCst)
+                                                != current_session_epoch
+                                            {
+                                                println!(
+                                                    "⚡ Ignoring stale transcript update for session {}",
+                                                    current_session_epoch
+                                                );
+                                                continue;
+                                            }
+                                            let session_epoch_for_ui = session_epoch_for_transcript.clone();
                                             let _ = ui_handle_for_transcript.upgrade_in_event_loop(move |ui| {
-                                                ui.set_transcript(text_for_ui.into());
+                                                if session_epoch_for_ui.load(Ordering::SeqCst)
+                                                    == current_session_epoch
+                                                {
+                                                    ui.set_transcript(text_for_ui.into());
+                                                }
                                             });
                                             let overlay_visible_setter = overlay_visible_for_transcript.clone();
+                                            let session_epoch_for_overlay = session_epoch_for_transcript.clone();
                                             let _ = overlay_handle_for_transcript
                                                 .upgrade_in_event_loop(move |overlay| {
+                                                    if session_epoch_for_overlay.load(Ordering::SeqCst)
+                                                        != current_session_epoch
+                                                    {
+                                                        return;
+                                                    }
                                                     overlay.set_is_error(is_error);
                                                     if hide_overlay {
                                                         overlay.set_sentence_text("".into());
                                                         overlay.set_window_width(520);
                                                         overlay.set_window_height(120);
                                                         overlay.set_is_error(false);
+                                                        overlay.set_is_system_message(false);
                                                         overlay.set_is_visible(false);
-                                                        overlay_visible_setter.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                        overlay_visible_setter.store(false, Ordering::SeqCst);
                                                         let _ = overlay.hide();
                                                     } else {
                                                         let (w, h) =
                                                             overlay_size_for_text(
                                                                 &aggregated_for_overlay,
                                                             );
+                                                        overlay.set_is_system_message(false);
                                                         overlay.set_sentence_text(
                                                             aggregated_for_overlay.into(),
                                                         );
                                                         overlay.set_window_width(w);
                                                         overlay.set_window_height(h);
                                                         overlay.set_is_visible(true);
-                                                        overlay_visible_setter.store(true, std::sync::atomic::Ordering::SeqCst);
+                                                        overlay_visible_setter.store(true, Ordering::SeqCst);
                                                         let _ = overlay.show();
                                                     }
                                                 });
 
-                                            if was_committed && stop_requested_for_msg {
-                                                let _ = finalize_tx_for_transcript.send(());
+                                            if (was_committed && stop_requested_for_msg)
+                                                || finalize_after_rewrite
+                                            {
+                                                let _ = finalize_tx_for_transcript.send(current_session_epoch);
                                             }
                                         }
                                     });
@@ -884,6 +1087,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         overlay.set_sentence_text("".into());
                                         overlay.set_window_width(520);
                                         overlay.set_window_height(120);
+                                        overlay.set_is_system_message(false);
                                         overlay.set_is_visible(false);
                                         let _ = overlay.hide();
                                     });
@@ -915,7 +1119,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     }
                                     });
-                                    });    let start_tx = cmd_tx.clone();
+    });
+    let start_tx = cmd_tx.clone();
     ui.on_start_recording(move || {
         let _ = start_tx.send(AppCommand::StartRecording);
     });
@@ -931,21 +1136,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings_for_save = settings.clone();
     let ui_weak_for_apply = ui.as_weak();
     ui.on_apply_settings(move || {
-        let (api_key, gemini_api_key, gemini_enabled, gemini_model, gemini_preset, gemini_custom, selected_mic, use_default_mic) =
-            if let Some(ui) = ui_weak_for_apply.upgrade() {
-                (
-                    ui.get_api_key_text().to_string(),
-                    ui.get_gemini_api_key_text().to_string(),
-                    ui.get_use_gemini_modifier(),
-                    ui.get_gemini_model_text().to_string(),
-                    ui.get_selected_gemini_preset().to_string(),
-                    ui.get_gemini_custom_prompt().to_string(),
-                    ui.get_selected_microphone().to_string(),
-                    ui.get_use_default_microphone(),
-                )
-            } else {
-                (String::new(), String::new(), false, "gemini-3.1-flash-lite-preview".to_string(), "Minimal corrections".to_string(), String::new(), String::new(), true)
-            };
+        let (
+            api_key,
+            gemini_api_key,
+            gemini_enabled,
+            gemini_model,
+            gemini_preset,
+            gemini_custom,
+            selected_mic,
+            use_default_mic,
+        ) = if let Some(ui) = ui_weak_for_apply.upgrade() {
+            (
+                ui.get_api_key_text().to_string(),
+                ui.get_gemini_api_key_text().to_string(),
+                ui.get_use_gemini_modifier(),
+                ui.get_gemini_model_text().to_string(),
+                ui.get_selected_gemini_preset().to_string(),
+                ui.get_gemini_custom_prompt().to_string(),
+                ui.get_selected_microphone().to_string(),
+                ui.get_use_default_microphone(),
+            )
+        } else {
+            (
+                String::new(),
+                String::new(),
+                false,
+                "gemini-3.1-flash-lite-preview".to_string(),
+                "Minimal corrections".to_string(),
+                String::new(),
+                String::new(),
+                true,
+            )
+        };
 
         let snapshot = {
             let mut current = settings_for_ui.lock().unwrap();
@@ -1036,17 +1258,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     s.selected_microphone = ui.get_selected_microphone().to_string();
                     s.use_default_microphone = ui.get_use_default_microphone();
                     s.overlay_opacity = ui.get_overlay_opacity();
-                    s.theme_background_top_color =
-                        ui.get_theme_background_top_color().to_string();
+                    s.theme_background_top_color = ui.get_theme_background_top_color().to_string();
                     s.theme_background_bottom_color =
                         ui.get_theme_background_bottom_color().to_string();
                     s.theme_window_color = ui.get_theme_window_color().to_string();
-                    s.theme_button_accent_color =
-                        ui.get_theme_button_accent_color().to_string();
+                    s.theme_button_accent_color = ui.get_theme_button_accent_color().to_string();
                     s.theme_title_color = ui.get_theme_title_color().to_string();
                     s.theme_text_color = ui.get_theme_text_color().to_string();
-                    s.overlay_background_color =
-                        ui.get_overlay_background_color().to_string();
+                    s.overlay_background_color = ui.get_overlay_background_color().to_string();
                     s.overlay_text_color = ui.get_overlay_text_color().to_string();
                 }
 
@@ -1072,7 +1291,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(combo) = detect_hotkey_combo() {
                             if !*hotkey_capture_latched_for_timer.borrow() {
                                 *hotkey_capture_latched_for_timer.borrow_mut() = true;
-                                match apply_hotkey(&hotkey_manager, &mut hotkey_state.borrow_mut(), &combo) {
+                                match apply_hotkey(
+                                    &hotkey_manager,
+                                    &mut hotkey_state.borrow_mut(),
+                                    &combo,
+                                ) {
                                     Ok(new_id) => {
                                         *hotkey_id_state.borrow_mut() = Some(new_id);
                                         *hotkey_text_for_timer.lock().unwrap() = combo.clone();
@@ -1082,17 +1305,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             saved.hotkey_text = combo.clone();
                                             save_settings(&saved);
                                         }
-                                        if let Some(capture) = hotkey_capture_window_for_timer.upgrade() {
+                                        if let Some(capture) =
+                                            hotkey_capture_window_for_timer.upgrade()
+                                        {
                                             capture.set_state_text("Registered".into());
                                             capture.set_combo_text(combo.into());
                                             let _ = capture.hide();
                                         }
                                     }
                                     Err(err) => {
-                                        ui.set_status_text(format!("Hotkey unchanged: {}", err).into());
+                                        ui.set_status_text(
+                                            format!("Hotkey unchanged: {}", err).into(),
+                                        );
                                         ui.set_active_tab(2);
-                                        if let Some(capture) = hotkey_capture_window_for_timer.upgrade() {
-                                            capture.set_state_text(format!("Failed: {}", err).into());
+                                        if let Some(capture) =
+                                            hotkey_capture_window_for_timer.upgrade()
+                                        {
+                                            capture
+                                                .set_state_text(format!("Failed: {}", err).into());
                                             capture.set_combo_text(combo.into());
                                         }
                                     }
@@ -1118,7 +1348,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                        if let TrayIconEvent::Click { button, button_state, .. } = event {
+                        if let TrayIconEvent::Click {
+                            button,
+                            button_state,
+                            ..
+                        } = event
+                        {
                             if button == MouseButton::Left && button_state == MouseButtonState::Up {
                                 ui.set_active_tab(0);
                                 let _ = ui.show();

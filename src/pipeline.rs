@@ -38,6 +38,10 @@ pub fn append_fragment(existing: &str, incoming: &str) -> String {
         return format!("{} ", incoming);
     }
 
+    if incoming.starts_with(output.trim()) {
+        return format!("{} ", incoming);
+    }
+
     let no_leading_space = [".", ",", "!", "?", ";", ":"];
     if no_leading_space.iter().any(|p| incoming.starts_with(p)) {
         // If it starts with punctuation, we might have added a space at the end of the previous fragment
@@ -108,5 +112,11 @@ mod tests {
     fn append_ignores_empty_fragment() {
         let a = append_fragment("hello ", "   ");
         assert_eq!(a, "hello ");
+    }
+
+    #[test]
+    fn append_replaces_repeated_cumulative_fragment() {
+        let a = append_fragment("hello ", "hello world");
+        assert_eq!(a, "hello world ");
     }
 }
