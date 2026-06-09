@@ -27,6 +27,14 @@ export component AppWindow inherits Window {
     in-out property <bool> context-menu-is-log: false;
 
     in-out property <string> api-key-text;
+    in-out property <string> elevenlabs-model-text;
+    in-out property <string> elevenlabs-language-code-text;
+    in-out property <bool> elevenlabs-no-verbatim: true;
+    in-out property <string> openai-api-key-text;
+    in-out property <string> openai-model-text;
+    in-out property <string> openai-language-code-text;
+    in property <[string]> transcription-provider-options;
+    in-out property <string> transcription-provider-text;
     in-out property <string> gemini-api-key-text;
     in property <[string]> microphone-options;
     in-out property <string> selected-microphone;
@@ -312,17 +320,160 @@ export component AppWindow inherits Window {
                             spacing: 12px;
 
                             VerticalBox {
-                                spacing: 5px;
+                                spacing: 8px;
+
                                 Text {
-                                    text: "ElevenLabs API Key";
-                                    color: #bac2de;
-                                    wrap: word-wrap;
+                                    text: "Transcription Provider";
+                                    font-size: 18px;
+                                    font-weight: 600;
+                                    color: root.theme-title-color;
                                 }
-                                api-key-input := LineEdit {
-                                    text <=> root.api-key-text;
-                                    placeholder-text: "sk_...";
-                                    input-type: password;
+
+                                VerticalBox {
+                                    spacing: 5px;
+                                    Text {
+                                        text: "Provider";
+                                        color: #bac2de;
+                                        wrap: word-wrap;
+                                    }
+                                    ComboBox {
+                                        model: root.transcription-provider-options;
+                                        current-value <=> root.transcription-provider-text;
+                                    }
                                 }
+
+                                Rectangle {
+                                    border-width: 1px;
+                                    border-color: #313244;
+                                    border-radius: 8px;
+                                    background: #00000000;
+
+                                    VerticalBox {
+                                        padding: 12px;
+                                        spacing: 8px;
+
+                                        Text {
+                                            text: "ElevenLabs";
+                                            font-size: 16px;
+                                            font-weight: 600;
+                                            color: root.theme-title-color;
+                                        }
+
+                                        VerticalBox {
+                                            spacing: 5px;
+                                            Text {
+                                                text: "API Key";
+                                                color: #bac2de;
+                                                wrap: word-wrap;
+                                            }
+                                            api-key-input := LineEdit {
+                                                text <=> root.api-key-text;
+                                                placeholder-text: "sk_...";
+                                                input-type: password;
+                                            }
+                                        }
+
+                                        VerticalBox {
+                                            spacing: 5px;
+                                            Text {
+                                                text: "Model";
+                                                color: #bac2de;
+                                                wrap: word-wrap;
+                                            }
+                                            LineEdit {
+                                                text <=> root.elevenlabs-model-text;
+                                                placeholder-text: "scribe_v2_realtime";
+                                            }
+                                        }
+
+                                        HorizontalBox {
+                                            spacing: 8px;
+
+                                            VerticalBox {
+                                                spacing: 5px;
+                                                Text {
+                                                    text: "Language";
+                                                    color: #bac2de;
+                                                    wrap: word-wrap;
+                                                }
+                                                LineEdit {
+                                                    text <=> root.elevenlabs-language-code-text;
+                                                    placeholder-text: "en";
+                                                }
+                                            }
+
+                                            CheckBox {
+                                                text: "Clean verbatim speech";
+                                                checked <=> root.elevenlabs-no-verbatim;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Rectangle {
+                                    border-width: 1px;
+                                    border-color: #313244;
+                                    border-radius: 8px;
+                                    background: #00000000;
+
+                                    VerticalBox {
+                                        padding: 12px;
+                                        spacing: 8px;
+
+                                        Text {
+                                            text: "OpenAI";
+                                            font-size: 16px;
+                                            font-weight: 600;
+                                            color: root.theme-title-color;
+                                        }
+
+                                        VerticalBox {
+                                            spacing: 5px;
+                                            Text {
+                                                text: "API Key";
+                                                color: #bac2de;
+                                                wrap: word-wrap;
+                                            }
+                                            LineEdit {
+                                                text <=> root.openai-api-key-text;
+                                                placeholder-text: "sk-...";
+                                                input-type: password;
+                                            }
+                                        }
+
+                                        VerticalBox {
+                                            spacing: 5px;
+                                            Text {
+                                                text: "Model";
+                                                color: #bac2de;
+                                                wrap: word-wrap;
+                                            }
+                                            LineEdit {
+                                                text <=> root.openai-model-text;
+                                                placeholder-text: "gpt-realtime-whisper";
+                                            }
+                                        }
+
+                                        VerticalBox {
+                                            spacing: 5px;
+                                            Text {
+                                                text: "Language";
+                                                color: #bac2de;
+                                                wrap: word-wrap;
+                                            }
+                                            LineEdit {
+                                                text <=> root.openai-language-code-text;
+                                                placeholder-text: "en";
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                height: 1px;
+                                horizontal-stretch: 1;
+                                background: #313244;
                             }
 
                             VerticalBox {

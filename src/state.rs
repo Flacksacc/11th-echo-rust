@@ -9,10 +9,6 @@ pub enum RecordingState {
 }
 
 impl RecordingState {
-    pub fn can_start(&self) -> bool {
-        matches!(self, RecordingState::Idle | RecordingState::Error)
-    }
-
     pub fn can_stop(&self) -> bool {
         matches!(
             self,
@@ -61,11 +57,9 @@ mod tests {
     #[test]
     fn start_stop_guards_work() {
         let mut state = RecordingState::Idle;
-        assert!(state.can_start());
         assert!(!state.can_stop());
 
         state = RecordingState::BufferingPreConnect;
-        assert!(!state.can_start());
         assert!(state.can_stop());
     }
 

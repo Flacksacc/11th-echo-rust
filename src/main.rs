@@ -2,10 +2,10 @@ mod audio;
 mod gemini;
 mod hotkey;
 mod injector;
-mod network;
 mod pipeline;
 mod settings;
 mod state;
+mod transcription;
 
 use arboard::Clipboard;
 use chrono::Local;
@@ -43,10 +43,9 @@ use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CYSCREEN};
 
 slint::include_modules!();
 
-const ELEVEN_MODEL_ID: &str = "scribe_v2_realtime";
-
 #[derive(Debug)]
 enum AppCommand {
+    ToggleRecording,
     StartRecording,
     StopRecording,
 }
@@ -54,14 +53,14 @@ enum AppCommand {
 struct Session {
     state: Arc<Mutex<RecordingState>>,
     _audio_stream: Option<cpal::Stream>,
-    network_stop_tx: Option<mpsc::UnboundedSender<network::ControlMessage>>,
+    network_stop_tx: Option<mpsc::UnboundedSender<transcription::TranscriptionCommand>>,
     transcript_pipeline: Arc<Mutex<TranscriptPipeline>>,
 }
 
 impl Session {
     fn stop_network(&mut self) {
         if let Some(tx) = self.network_stop_tx.as_ref() {
-            let _ = tx.send(network::ControlMessage::Stop);
+            let _ = tx.send(transcription::TranscriptionCommand::Stop);
         }
     }
 }
@@ -415,7 +414,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_hotkey_text(hotkey_text.lock().unwrap().clone().into());
     #[cfg(not(target_os = "windows"))]
     ui.set_hotkey_text("Unavailable".into());
-    ui.set_api_key_text(initial_settings.api_key.clone().into());
+    let initial_provider =
+        transcription::TranscriptionProvider::from_id(&initial_settings.transcription_provider);
+    ui.set_transcription_provider_options(ModelRc::new(VecModel::from(vec![
+        SharedString::from(transcription::DEFAULT_PROVIDER_LABEL),
+        SharedString::from(transcription::OPENAI_REALTIME_WHISPER_PROVIDER_LABEL),
+    ])));
+    ui.set_transcription_provider_text(initial_provider.label().into());
+    ui.set_api_key_text(initial_settings.elevenlabs_api_key.clone().into());
+    ui.set_elevenlabs_model_text(initial_settings.elevenlabs_model.clone().into());
+    ui.set_elevenlabs_language_code_text(initial_settings.elevenlabs_language_code.clone().into());
+    ui.set_elevenlabs_no_verbatim(initial_settings.elevenlabs_no_verbatim);
+    ui.set_openai_api_key_text(initial_settings.openai_api_key.clone().into());
+    ui.set_openai_model_text(initial_settings.openai_model.clone().into());
+    ui.set_openai_language_code_text(initial_settings.openai_language_code.clone().into());
     ui.set_gemini_api_key_text(initial_settings.gemini_api_key.clone().into());
     ui.set_selected_microphone(selected_microphone.clone().into());
     ui.set_use_default_microphone(initial_settings.use_default_microphone);
@@ -637,48 +649,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
                     Some(cmd) = cmd_rx.recv() => {
+                    let cmd = match cmd {
+                        AppCommand::ToggleRecording => {
+                            match active_session.as_ref() {
+                                Some(session) => {
+                                    let state = session.state.lock().unwrap();
+                                    if state.can_stop() {
+                                        AppCommand::StopRecording
+                                    } else {
+                                        println!("⚡ Recording session is already stopping");
+                                        continue;
+                                    }
+                                }
+                                None => AppCommand::StartRecording,
+                            }
+                        }
+                        cmd => cmd,
+                    };
+
                     match cmd {
                         AppCommand::StartRecording => {
-                            if let Some(session) = active_session.as_mut() {
-                                if session.state.lock().unwrap().can_start() {
-                                    #[cfg(target_os = "windows")]
-                                    {
-                                        let captured = injector::capture_foreground_target();
-                                        match &captured {
-                                            Some(target) => eprintln!("⌨ [resume_recording] captured target {:?}", target),
-                                            None => eprintln!("⌨ [resume_recording] no foreground target captured"),
-                                        }
-                                        *intended_target_for_runtime.lock().unwrap() = captured;
-                                    }
-                                    if let Ok(mut pipeline) = session.transcript_pipeline.lock() {
-                                        *pipeline = TranscriptPipeline::new();
-                                    }
-                                    if let Ok(mut s) = session.state.lock() {
-                                        s.transition_to_recording();
-                                    }
-                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
-                                        ui.set_status_text("Listening...".into());
-                                        ui.set_is_recording(true);
-                                        ui.set_has_error(false);
-                                        ui.set_transcript("".into());
-                                    });
-                                    overlay_visible.store(true, Ordering::SeqCst);
-                                    let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
-                                        reset_overlay_to_listening(&overlay);
-                                    });
-                                    if let Some(tx) = session.network_stop_tx.as_ref() {
-                                        let _ = tx.send(network::ControlMessage::Start);
-                                    }
-                                    println!("⚡ Resumed existing transcription session");
-                                    continue;
-                                } else {
-                                    println!("❌ Cannot start recording: session already active");
-                                    continue;
-                                }
+                            if active_session.is_some() {
+                                println!("❌ Cannot start recording: session already active");
+                                continue;
                             }
 
                             let current_settings = settings_for_runtime.lock().unwrap().clone();
-                            if current_settings.api_key.trim().is_empty() {
+                            if current_settings
+                                .transcription_config()
+                                .api_key
+                                .trim()
+                                .is_empty()
+                            {
                                 let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
                                     ui.set_status_text("Missing API key".into());
                                     ui.set_is_recording(false);
@@ -724,9 +726,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let log_raw: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
                             let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<i16>>(50);
                             let (network_stop_tx, network_stop_rx) =
-                                mpsc::unbounded_channel::<network::ControlMessage>();
+                                mpsc::unbounded_channel::<transcription::TranscriptionCommand>();
                             let (text_tx, mut text_rx) =
-                                mpsc::channel::<network::TranscriptMessage>(100);
+                                mpsc::channel::<transcription::TranscriptionEvent>(100);
                             let (log_line_tx, mut log_line_rx) =
                                 mpsc::unbounded_channel::<String>();
                             let audio_level_tx = level_tx.clone();
@@ -736,9 +738,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             match stream_result {
                                 Ok(stream) => {
-                                    let client = network::ElevenLabsClient::new(
-                                        current_settings.api_key,
-                                        ELEVEN_MODEL_ID.to_string(),
+                                    let client = transcription::TranscriberClient::from_config(
+                                        current_settings.transcription_config(),
                                     );
                                     let client_state = state.clone();
                                     let injection_state = state.clone();
@@ -810,26 +811,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     });
 
                                     tokio::spawn(async move {
-                                        while let Some(line) = log_line_rx.recv().await {
-                                            let ts = Local::now().format("%H:%M:%S");
-                                            let display_line: SharedString = format!("[{}] {}", ts, line).into();
-                                            let raw_line = line;
-                                            {
-                                                let mut disp = log_display_for_text.lock().unwrap();
-                                                let mut raw = log_raw_for_text.lock().unwrap();
-                                                disp.push(display_line);
-                                                raw.push(raw_line);
-                                                if disp.len() > 300 {
-                                                    let excess = disp.len() - 300;
-                                                    disp.drain(0..excess);
-                                                    raw.drain(0..excess);
+                                        let mut refresh =
+                                            tokio::time::interval(std::time::Duration::from_millis(100));
+                                        refresh.set_missed_tick_behavior(
+                                            tokio::time::MissedTickBehavior::Delay,
+                                        );
+                                        let mut dirty = false;
+
+                                        loop {
+                                            tokio::select! {
+                                                maybe_line = log_line_rx.recv() => {
+                                                    let Some(line) = maybe_line else {
+                                                        break;
+                                                    };
+                                                    let ts = Local::now().format("%H:%M:%S");
+                                                    let display_line: SharedString =
+                                                        format!("[{}] {}", ts, line).into();
+                                                    let raw_line = line;
+                                                    {
+                                                        let mut disp = log_display_for_text.lock().unwrap();
+                                                        let mut raw = log_raw_for_text.lock().unwrap();
+                                                        disp.push(display_line);
+                                                        raw.push(raw_line);
+                                                        if disp.len() > 300 {
+                                                            let excess = disp.len() - 300;
+                                                            disp.drain(0..excess);
+                                                            raw.drain(0..excess);
+                                                        }
+                                                        *log_raw_for_cb.lock().unwrap() = raw.clone();
+                                                    }
+                                                    dirty = true;
                                                 }
-                                                let items = disp.clone();
-                                                let _ = ui_handle_for_log.upgrade_in_event_loop(move |ui| {
-                                                    ui.set_log_items(ModelRc::new(VecModel::from(items)));
-                                                });
-                                                *log_raw_for_cb.lock().unwrap() = raw.clone();
+                                                _ = refresh.tick(), if dirty => {
+                                                    let items = log_display_for_text.lock().unwrap().clone();
+                                                    let _ = ui_handle_for_log.upgrade_in_event_loop(move |ui| {
+                                                        ui.set_log_items(ModelRc::new(VecModel::from(items)));
+                                                    });
+                                                    dirty = false;
+                                                }
                                             }
+                                        }
+
+                                        if dirty {
+                                            let items = log_display_for_text.lock().unwrap().clone();
+                                            let _ = ui_handle_for_log.upgrade_in_event_loop(move |ui| {
+                                                ui.set_log_items(ModelRc::new(VecModel::from(items)));
+                                            });
                                         }
                                     });
 
@@ -846,7 +873,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             let mut stop_requested_for_msg = false;
                                             let mut finalize_after_rewrite = false;
                                             let display_text = match msg {
-                                                network::TranscriptMessage::Partial(text) => {
+                                                transcription::TranscriptionEvent::Partial(text) => {
                                                     latest_partial = text;
                                                     let committed = {
                                                         let pipeline = transcript_pipeline_for_text.lock().unwrap();
@@ -854,7 +881,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     };
                                                     live_transcript_text(&committed, &latest_partial)
                                                 }
-                                                network::TranscriptMessage::Committed(text) => {
+                                                transcription::TranscriptionEvent::Committed(text) => {
                                                     // Decide what text to actually commit:
                                                     // - If ElevenLabs sends an empty committed transcript, only
                                                     //   commit the current partial if we have one. Falling back to
@@ -982,7 +1009,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     was_committed = true;
                                                     aggregated
                                                 }
-                                                network::TranscriptMessage::Error(err_json) => {
+                                                transcription::TranscriptionEvent::Error(err_json) => {
                                                     latest_partial.clear();
                                                     is_error = true;
                                                     let friendly = format!("Error from speech service:\n{}", err_json);
@@ -1072,7 +1099,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     });
                                     if let Some(session) = active_session.as_ref() {
                                         if let Some(tx) = session.network_stop_tx.as_ref() {
-                                            let _ = tx.send(network::ControlMessage::Start);
+                                            let _ =
+                                                tx.send(transcription::TranscriptionCommand::Start);
                                         }
                                     }
                                     }
@@ -1114,6 +1142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     session.stop_network();
                                     }
                                     }
+                                    AppCommand::ToggleRecording => unreachable!(),
                                     }
                                     }
                                     }
@@ -1137,7 +1166,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui_weak_for_apply = ui.as_weak();
     ui.on_apply_settings(move || {
         let (
-            api_key,
+            elevenlabs_api_key,
+            elevenlabs_model,
+            elevenlabs_language_code,
+            elevenlabs_no_verbatim,
+            openai_api_key,
+            openai_model,
+            openai_language_code,
+            transcription_provider,
             gemini_api_key,
             gemini_enabled,
             gemini_model,
@@ -1148,6 +1184,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) = if let Some(ui) = ui_weak_for_apply.upgrade() {
             (
                 ui.get_api_key_text().to_string(),
+                ui.get_elevenlabs_model_text().to_string(),
+                ui.get_elevenlabs_language_code_text().to_string(),
+                ui.get_elevenlabs_no_verbatim(),
+                ui.get_openai_api_key_text().to_string(),
+                ui.get_openai_model_text().to_string(),
+                ui.get_openai_language_code_text().to_string(),
+                ui.get_transcription_provider_text().to_string(),
                 ui.get_gemini_api_key_text().to_string(),
                 ui.get_use_gemini_modifier(),
                 ui.get_gemini_model_text().to_string(),
@@ -1159,6 +1202,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             (
                 String::new(),
+                transcription::DEFAULT_ELEVENLABS_REALTIME_MODEL_ID.to_string(),
+                transcription::DEFAULT_LANGUAGE_CODE.to_string(),
+                true,
+                String::new(),
+                transcription::DEFAULT_OPENAI_REALTIME_WHISPER_MODEL_ID.to_string(),
+                transcription::DEFAULT_LANGUAGE_CODE.to_string(),
+                transcription::DEFAULT_PROVIDER_LABEL.to_string(),
                 String::new(),
                 false,
                 "gemini-3.1-flash-lite-preview".to_string(),
@@ -1169,23 +1219,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         };
 
-        let snapshot = {
-            let mut current = settings_for_ui.lock().unwrap();
-            current.api_key = api_key;
-            current.gemini_api_key = gemini_api_key;
-            current.gemini_enabled = gemini_enabled;
-            current.gemini_model = gemini_model;
-            current.gemini_prompt_preset = gemini_preset;
-            current.gemini_custom_prompt = gemini_custom;
-            current.selected_microphone = selected_mic;
-            current.use_default_microphone = use_default_mic;
-            current.clone()
+        let mut snapshot = {
+            let mut next = settings_for_ui.lock().unwrap().clone();
+            next.api_key = elevenlabs_api_key.clone();
+            next.transcription_provider =
+                transcription::TranscriptionProvider::from_id(&transcription_provider)
+                    .id()
+                    .to_string();
+            next.elevenlabs_api_key = elevenlabs_api_key;
+            next.elevenlabs_model = elevenlabs_model.clone();
+            next.elevenlabs_language_code = elevenlabs_language_code.clone();
+            next.elevenlabs_no_verbatim = elevenlabs_no_verbatim;
+            next.openai_api_key = openai_api_key;
+            next.openai_model = openai_model.clone();
+            next.openai_language_code = openai_language_code.clone();
+            match transcription::TranscriptionProvider::from_id(&transcription_provider) {
+                transcription::TranscriptionProvider::ElevenLabsRealtime => {
+                    next.transcription_model = elevenlabs_model;
+                    next.transcription_language_code = elevenlabs_language_code;
+                    next.transcription_no_verbatim = elevenlabs_no_verbatim;
+                }
+                transcription::TranscriptionProvider::OpenAiRealtimeWhisper => {
+                    next.transcription_model = openai_model;
+                    next.transcription_language_code = openai_language_code;
+                    next.transcription_no_verbatim = false;
+                }
+            }
+            next.gemini_api_key = gemini_api_key;
+            next.gemini_enabled = gemini_enabled;
+            next.gemini_model = gemini_model;
+            next.gemini_prompt_preset = gemini_preset;
+            next.gemini_custom_prompt = gemini_custom;
+            next.selected_microphone = selected_mic;
+            next.use_default_microphone = use_default_mic;
+            next
         };
-        save_settings(&snapshot);
+        snapshot.normalize_transcription_settings();
+        let saved = save_settings(&snapshot);
+        if saved {
+            if let Ok(mut current) = settings_for_ui.lock() {
+                *current = snapshot.clone();
+            }
+        }
 
         if let Some(ui) = ui_weak_for_settings.upgrade() {
-            ui.set_status_text("Settings applied".into());
-            ui.set_active_tab(0);
+            if saved {
+                ui.set_api_key_text(snapshot.elevenlabs_api_key.clone().into());
+                ui.set_elevenlabs_model_text(snapshot.elevenlabs_model.clone().into());
+                ui.set_elevenlabs_language_code_text(
+                    snapshot.elevenlabs_language_code.clone().into(),
+                );
+                ui.set_elevenlabs_no_verbatim(snapshot.elevenlabs_no_verbatim);
+                ui.set_openai_api_key_text(snapshot.openai_api_key.clone().into());
+                ui.set_openai_model_text(snapshot.openai_model.clone().into());
+                ui.set_openai_language_code_text(snapshot.openai_language_code.clone().into());
+                ui.set_status_text("Settings applied".into());
+                ui.set_active_tab(0);
+            } else {
+                ui.set_status_text("Settings save failed".into());
+                ui.set_has_error(true);
+                ui.set_active_tab(3);
+            }
         }
     });
 
@@ -1249,7 +1343,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ui) = ui_handle_for_timer.upgrade() {
                 {
                     let mut s = settings_for_timer.lock().unwrap();
-                    s.api_key = ui.get_api_key_text().to_string();
                     s.gemini_api_key = ui.get_gemini_api_key_text().to_string();
                     s.gemini_enabled = ui.get_use_gemini_modifier();
                     s.gemini_model = ui.get_gemini_model_text().to_string();
@@ -1339,11 +1432,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if current_hotkey_id.is_some_and(|id| event.id == id)
                             && event.state == HotKeyState::Pressed
                         {
-                            if ui.get_is_recording() {
-                                let _ = cmd_tx_for_timer.send(AppCommand::StopRecording);
-                            } else {
-                                let _ = cmd_tx_for_timer.send(AppCommand::StartRecording);
-                            }
+                            let _ = cmd_tx_for_timer.send(AppCommand::ToggleRecording);
                         }
                     }
 
