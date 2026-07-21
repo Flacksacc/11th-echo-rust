@@ -1,0 +1,7 @@
+[target.x86_64-pc-windows-msvc]
+# Slint's generated and accessibility UI trees can require substantially more
+# than Windows' default stack when the large Settings page is instantiated.
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/STACK:32000000"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/STACK:32000000"]

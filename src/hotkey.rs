@@ -102,10 +102,7 @@ mod tests {
             parse_hotkey_spec("Ctrl+A").unwrap().key,
             HotkeyKey::Letter('A')
         );
-        assert_eq!(
-            parse_hotkey_spec("Alt+9").unwrap().key,
-            HotkeyKey::Digit(9)
-        );
+        assert_eq!(parse_hotkey_spec("Alt+9").unwrap().key, HotkeyKey::Digit(9));
         assert_eq!(
             parse_hotkey_spec("Shift+F12").unwrap().key,
             HotkeyKey::Function(12)

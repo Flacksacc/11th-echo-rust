@@ -2,25 +2,34 @@ use std::error::Error;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
 mod elevenlabs_realtime;
+mod local_sherpa;
 mod openai_realtime_whisper;
 
 pub use elevenlabs_realtime::ElevenLabsRealtimeTranscriber;
+pub use local_sherpa::{
+    download_local_models, local_engine_status, local_models_available, physical_core_count,
+    preload_local_engine, wait_for_local_engine, LocalEngineStatus, LocalSherpaConfig,
+    LocalSherpaTranscriber,
+};
 pub use openai_realtime_whisper::OpenAiRealtimeWhisperTranscriber;
 
 pub const DEFAULT_PROVIDER_ID: &str = "elevenlabs_realtime";
 pub const DEFAULT_PROVIDER_LABEL: &str = "ElevenLabs Realtime";
 pub const OPENAI_REALTIME_WHISPER_PROVIDER_ID: &str = "openai_realtime_whisper";
 pub const OPENAI_REALTIME_WHISPER_PROVIDER_LABEL: &str = "OpenAI Realtime Whisper";
+pub const LOCAL_SHERPA_PROVIDER_ID: &str = "local_sherpa_onnx";
+pub const LOCAL_SHERPA_PROVIDER_LABEL: &str = "Local CPU - Parakeet";
 pub const DEFAULT_ELEVENLABS_REALTIME_MODEL_ID: &str = "scribe_v2_realtime";
 pub const DEFAULT_OPENAI_REALTIME_WHISPER_MODEL_ID: &str = "gpt-realtime-whisper";
 pub const DEFAULT_LANGUAGE_CODE: &str = "en";
 
 pub type AudioChunk = Vec<i16>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptionProvider {
     ElevenLabsRealtime,
     OpenAiRealtimeWhisper,
+    LocalSherpaOnnx,
 }
 
 impl TranscriptionProvider {
@@ -30,6 +39,7 @@ impl TranscriptionProvider {
             OPENAI_REALTIME_WHISPER_PROVIDER_ID | OPENAI_REALTIME_WHISPER_PROVIDER_LABEL => {
                 Self::OpenAiRealtimeWhisper
             }
+            LOCAL_SHERPA_PROVIDER_ID | LOCAL_SHERPA_PROVIDER_LABEL => Self::LocalSherpaOnnx,
             _ => Self::ElevenLabsRealtime,
         }
     }
@@ -38,6 +48,7 @@ impl TranscriptionProvider {
         match self {
             Self::ElevenLabsRealtime => DEFAULT_PROVIDER_ID,
             Self::OpenAiRealtimeWhisper => OPENAI_REALTIME_WHISPER_PROVIDER_ID,
+            Self::LocalSherpaOnnx => LOCAL_SHERPA_PROVIDER_ID,
         }
     }
 
@@ -45,6 +56,7 @@ impl TranscriptionProvider {
         match self {
             Self::ElevenLabsRealtime => DEFAULT_PROVIDER_LABEL,
             Self::OpenAiRealtimeWhisper => OPENAI_REALTIME_WHISPER_PROVIDER_LABEL,
+            Self::LocalSherpaOnnx => LOCAL_SHERPA_PROVIDER_LABEL,
         }
     }
 
@@ -52,6 +64,7 @@ impl TranscriptionProvider {
         match self {
             Self::ElevenLabsRealtime => DEFAULT_ELEVENLABS_REALTIME_MODEL_ID,
             Self::OpenAiRealtimeWhisper => DEFAULT_OPENAI_REALTIME_WHISPER_MODEL_ID,
+            Self::LocalSherpaOnnx => "parakeet-tdt-0.6b-v2-int8",
         }
     }
 }
@@ -63,6 +76,7 @@ pub struct TranscriptionConfig {
     pub model_id: String,
     pub language_code: String,
     pub no_verbatim: bool,
+    pub local: LocalSherpaConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +95,7 @@ pub enum TranscriptionEvent {
 pub enum TranscriberClient {
     ElevenLabsRealtime(ElevenLabsRealtimeTranscriber),
     OpenAiRealtimeWhisper(OpenAiRealtimeWhisperTranscriber),
+    LocalSherpaOnnx(LocalSherpaTranscriber),
 }
 
 impl TranscriberClient {
@@ -101,6 +116,9 @@ impl TranscriberClient {
                     config.language_code,
                 ))
             }
+            TranscriptionProvider::LocalSherpaOnnx => {
+                Self::LocalSherpaOnnx(LocalSherpaTranscriber::new(config.local))
+            }
         }
     }
 
@@ -118,6 +136,9 @@ impl TranscriberClient {
             Self::OpenAiRealtimeWhisper(client) => {
                 client.run(audio_rx, command_rx, event_tx, log_tx).await
             }
+            Self::LocalSherpaOnnx(client) => {
+                client.run(audio_rx, command_rx, event_tx, log_tx).await
+            }
         }
     }
 }
@@ -125,7 +146,7 @@ impl TranscriberClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        TranscriberClient, TranscriptionConfig, TranscriptionProvider,
+        LocalSherpaConfig, TranscriberClient, TranscriptionConfig, TranscriptionProvider,
         DEFAULT_ELEVENLABS_REALTIME_MODEL_ID, DEFAULT_LANGUAGE_CODE,
         DEFAULT_OPENAI_REALTIME_WHISPER_MODEL_ID,
     };
@@ -154,6 +175,7 @@ mod tests {
             model_id: DEFAULT_ELEVENLABS_REALTIME_MODEL_ID.to_string(),
             language_code: DEFAULT_LANGUAGE_CODE.to_string(),
             no_verbatim: true,
+            local: LocalSherpaConfig::default(),
         });
 
         assert!(matches!(client, TranscriberClient::ElevenLabsRealtime(_)));
@@ -167,6 +189,7 @@ mod tests {
             model_id: DEFAULT_OPENAI_REALTIME_WHISPER_MODEL_ID.to_string(),
             language_code: DEFAULT_LANGUAGE_CODE.to_string(),
             no_verbatim: true,
+            local: LocalSherpaConfig::default(),
         });
 
         assert!(matches!(

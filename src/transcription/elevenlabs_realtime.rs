@@ -4,6 +4,7 @@ use serde_json::json;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::future::Future;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver}; // Bounded receiver
 use tokio_tungstenite::connect_async;
@@ -13,6 +14,42 @@ use url::Url;
 use super::{AudioChunk, TranscriptionCommand, TranscriptionEvent};
 
 const ELEVENLABS_WSS_URL: &str = "wss://api.elevenlabs.io/v1/speech-to-text/realtime";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const SESSION_READY_TIMEOUT: Duration = Duration::from_secs(15);
+const FINAL_COMMIT_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_PRE_READY_AUDIO_SAMPLES: usize = 16_000 * 15;
+
+#[derive(Default)]
+struct PreReadyAudioQueue {
+    chunks: VecDeque<AudioChunk>,
+    samples: usize,
+}
+
+impl PreReadyAudioQueue {
+    fn push(&mut self, chunk: AudioChunk) -> Result<(), AudioChunk> {
+        if self.samples.saturating_add(chunk.len()) > MAX_PRE_READY_AUDIO_SAMPLES {
+            return Err(chunk);
+        }
+        self.samples += chunk.len();
+        self.chunks.push_back(chunk);
+        Ok(())
+    }
+
+    fn pop_front(&mut self) -> Option<AudioChunk> {
+        let chunk = self.chunks.pop_front()?;
+        self.samples -= chunk.len();
+        Some(chunk)
+    }
+
+    fn len(&self) -> usize {
+        self.chunks.len()
+    }
+}
+
+fn request_commit(session_ready: bool, awaiting_final_commit: &mut bool) -> bool {
+    *awaiting_final_commit = true;
+    session_ready
+}
 
 pub struct ElevenLabsRealtimeTranscriber {
     api_key: String,
@@ -127,7 +164,8 @@ where
             command = control_rx.recv() => {
                 match command {
                     Some(TranscriptionCommand::Start) => accepting_audio = true,
-                    Some(TranscriptionCommand::Stop) | None => return Ok(None),
+                    Some(TranscriptionCommand::Stop) => accepting_audio = false,
+                    None => return Ok(None),
                 }
             }
             result = &mut connection => {
@@ -177,30 +215,73 @@ impl ElevenLabsRealtimeTranscriber {
             .insert("xi-api-key", self.api_key.parse()?);
 
         emit!("➡️ [API OUT] WebSocket CONNECT {}", url);
-        let Some(((ws_stream, response), mut accepting_audio)) =
-            connect_until_stopped(connect_async(request), &mut control_rx).await?
+        let connection = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request));
+        let Some((connection_result, mut accepting_audio)) =
+            (match connect_until_stopped(connection, &mut control_rx).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let message =
+                        "ElevenLabs connection timed out after 15 seconds. Please try again."
+                            .to_string();
+                    emit!("❌ {}", message);
+                    let _ = text_tx.send(TranscriptionEvent::Error(message)).await;
+                    return Ok(());
+                }
+            })
         else {
             emit!("➡️ WebSocket connection cancelled before completion");
             return Ok(());
         };
-        emit!(
-            "⬅️ [API IN] WebSocket CONNECT status={} headers={:?}",
-            response.status(),
-            response.headers()
-        );
+        let (ws_stream, response) = connection_result?;
+        emit!("⬅️ [API IN] WebSocket CONNECT status={}", response.status());
         emit!("✅ Connected to ElevenLabs WebSocket");
 
         let (mut write, mut read) = ws_stream.split();
 
         let mut session_ready = false;
-        let mut awaiting_final_commit = false;
-        let mut queued_audio: VecDeque<Vec<i16>> = VecDeque::new();
+        let mut awaiting_final_commit = !accepting_audio;
+        let mut final_commit_deadline = None;
+        let mut audio_stream_ended = false;
+        let mut queued_audio = PreReadyAudioQueue::default();
+        if awaiting_final_commit {
+            // Stop may arrive while TLS is connecting. Give the forwarding task
+            // a short idle window to deliver audio captured before Stop.
+            while let Some(chunk) = audio_rx.recv().await {
+                if queued_audio.push(chunk).is_err() {
+                    let message = "ElevenLabs received more than 15 seconds of audio before connecting. Please try again.".to_string();
+                    emit!("❌ {}", message);
+                    let _ = text_tx.send(TranscriptionEvent::Error(message)).await;
+                    return Ok(());
+                }
+            }
+            audio_stream_ended = true;
+        }
+        let session_ready_timeout = tokio::time::sleep(SESSION_READY_TIMEOUT);
+        tokio::pin!(session_ready_timeout);
+        let mut final_commit_watchdog = tokio::time::interval(Duration::from_millis(250));
+        final_commit_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                _ = final_commit_watchdog.tick(), if final_commit_deadline.is_some() => {
+                    if tokio::time::Instant::now() >= final_commit_deadline.unwrap() {
+                        let message = "ElevenLabs did not return a final transcript within 20 seconds. Please try again.".to_string();
+                        emit!("❌ {}", message);
+                        let _ = text_tx.send(TranscriptionEvent::Error(message)).await;
+                        let _ = write.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
+                        break;
+                    }
+                }
+                _ = &mut session_ready_timeout, if !session_ready => {
+                    let message = "ElevenLabs did not start the transcription session within 15 seconds. Please try again.".to_string();
+                    emit!("❌ {}", message);
+                    let _ = text_tx.send(TranscriptionEvent::Error(message)).await;
+                    let _ = write.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
+                    break;
+                }
                 message = read.next() => {
                     match message {
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                            emit!("⬅️ [API IN] WS text: {}", text);
+                            emit!("⬅️ [API IN] WS text frame: {} bytes", text.len());
                             match parse_incoming_message(&text) {
                                 ParsedIncoming::SessionStarted => {
                                     session_ready = true;
@@ -218,15 +299,30 @@ impl ElevenLabsRealtimeTranscriber {
                                             break;
                                         }
                                     }
+                                    if awaiting_final_commit {
+                                        for index in 1..=2 {
+                                            emit!("➡️ [API OUT] WS silence chunk {}/2 (pre-commit)", index);
+                                            if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(silence_chunk_payload(false))).await {
+                                                emit!("❌ Failed to send delayed pre-commit silence: {}", e);
+                                                break;
+                                            }
+                                        }
+                                        emit!("➡️ [API OUT] WS delayed commit chunk");
+                                        if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(silence_chunk_payload(true))).await {
+                                            emit!("❌ Failed to send delayed commit chunk: {}", e);
+                                            break;
+                                        }
+                                        final_commit_deadline = Some(tokio::time::Instant::now() + FINAL_COMMIT_TIMEOUT);
+                                    }
                                 }
                                 ParsedIncoming::PartialTranscript(content) => {
                                     if !content.is_empty() {
-                                        emit!("📝 [PARTIAL] {}", content);
+                                        emit!("📝 Partial transcript: {} characters", content.chars().count());
                                         let _ = text_tx.send(TranscriptionEvent::Partial(content)).await;
                                     }
                                 }
                                 ParsedIncoming::CommittedTranscript(content) => {
-                                    emit!("📝 [COMMITTED] {}", content);
+                                    emit!("📝 Committed transcript: {} characters", content.chars().count());
                                     let _ = text_tx.send(TranscriptionEvent::Committed(content)).await;
                                     if awaiting_final_commit {
                                         emit!("➡️ Final committed transcript received, closing WebSocket");
@@ -235,7 +331,7 @@ impl ElevenLabsRealtimeTranscriber {
                                     }
                                 }
                                 ParsedIncoming::Error(err_json) => {
-                                    emit!("❌ [API ERROR] {}", err_json);
+                                    emit!("❌ ElevenLabs reported a transcription error");
                                     let _ = text_tx.send(TranscriptionEvent::Error(err_json)).await;
                                     emit!("➡️ API reported terminal error, closing WebSocket");
                                     let _ = write.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
@@ -276,8 +372,28 @@ impl ElevenLabsRealtimeTranscriber {
                         }
                         TranscriptionCommand::Stop => {
                             accepting_audio = false;
-                            awaiting_final_commit = true;
                             emit!("➡️ [API OUT] Manual commit requested");
+
+                            while let Some(chunk) = audio_rx.recv().await {
+                                if session_ready {
+                                    let payload = audio_chunk_payload(&chunk, false);
+                                    if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(payload)).await {
+                                        emit!("❌ Failed to flush buffered audio before commit: {}", e);
+                                        break;
+                                    }
+                                } else if queued_audio.push(chunk).is_err() {
+                                    let message = "ElevenLabs received more than 15 seconds of buffered audio. Please try again.".to_string();
+                                    emit!("❌ {}", message);
+                                    let _ = text_tx.send(TranscriptionEvent::Error(message)).await;
+                                    break;
+                                }
+                            }
+                            audio_stream_ended = true;
+
+                            if !request_commit(session_ready, &mut awaiting_final_commit) {
+                                emit!("➡️ Session is not ready; queued audio will be flushed before commit");
+                                continue;
+                            }
 
                             let pre_commit_1 = silence_chunk_payload(false);
                             emit!("➡️ [API OUT] WS silence chunk 1/2 (pre-commit)");
@@ -299,17 +415,24 @@ impl ElevenLabsRealtimeTranscriber {
                                 emit!("❌ Failed to send commit chunk: {}", e);
                                 break;
                             }
+                            final_commit_deadline = Some(tokio::time::Instant::now() + FINAL_COMMIT_TIMEOUT);
                         }
                     }
                 }
-                maybe_chunk = audio_rx.recv() => {
+                maybe_chunk = audio_rx.recv(), if !audio_stream_ended => {
                     match maybe_chunk {
                         Some(chunk) => {
                             if !accepting_audio {
                                 continue;
                             }
                             if !session_ready {
-                                queued_audio.push_back(chunk);
+                                if queued_audio.push(chunk).is_err() {
+                                    let message = "ElevenLabs was not ready after 15 seconds of queued audio. Please try again.".to_string();
+                                    emit!("❌ {}", message);
+                                    let _ = text_tx.send(TranscriptionEvent::Error(message)).await;
+                                    let _ = write.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
+                                    break;
+                                }
                             } else {
                                 let payload = audio_chunk_payload(&chunk, false);
                                 emit!(
@@ -325,6 +448,14 @@ impl ElevenLabsRealtimeTranscriber {
                         }
                         None => {
                             emit!("➡️ [API OUT] Audio stream ended, forcing manual commit");
+                            audio_stream_ended = true;
+                            if awaiting_final_commit {
+                                continue;
+                            }
+                            awaiting_final_commit = true;
+                            if !session_ready {
+                                continue;
+                            }
                             let pre_commit_1 = silence_chunk_payload(false);
                             emit!("➡️ [API OUT] WS silence chunk 1/2 (pre-commit)");
                             if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(pre_commit_1)).await {
@@ -345,7 +476,7 @@ impl ElevenLabsRealtimeTranscriber {
                                 emit!("❌ Failed to send commit chunk after audio close: {}", e);
                                 break;
                             }
-                            break;
+                            final_commit_deadline = Some(tokio::time::Instant::now() + FINAL_COMMIT_TIMEOUT);
                         }
                     }
                 }
@@ -360,12 +491,38 @@ impl ElevenLabsRealtimeTranscriber {
 mod tests {
     use super::{
         audio_chunk_payload, connect_until_stopped, parse_incoming_message, realtime_url,
-        silence_chunk_payload, ParsedIncoming,
+        request_commit, silence_chunk_payload, ParsedIncoming, PreReadyAudioQueue,
     };
     use crate::transcription::TranscriptionCommand;
     use std::future;
-    use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn pre_ready_audio_queue_rejects_more_than_fifteen_seconds() {
+        let mut queue = PreReadyAudioQueue::default();
+        assert!(queue.push(vec![0; 16_000 * 15]).is_ok());
+        assert!(queue.push(vec![0]).is_err());
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn pre_ready_audio_queue_releases_capacity_when_flushed() {
+        let mut queue = PreReadyAudioQueue::default();
+        queue.push(vec![0; 16_000]).unwrap();
+        assert_eq!(queue.pop_front().unwrap().len(), 16_000);
+        assert!(queue.push(vec![0; 16_000 * 15]).is_ok());
+    }
+
+    #[test]
+    fn stop_before_session_ready_defers_commit_without_discarding_audio() {
+        let mut queue = PreReadyAudioQueue::default();
+        queue.push(vec![7; 1_600]).unwrap();
+        let mut awaiting_final_commit = false;
+
+        assert!(!request_commit(false, &mut awaiting_final_commit));
+        assert!(awaiting_final_commit);
+        assert_eq!(queue.pop_front(), Some(vec![7; 1_600]));
+    }
 
     #[test]
     fn parse_session_started_event() {
@@ -462,20 +619,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_cancels_connection_attempt() {
+    async fn stop_during_connection_is_preserved() {
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         control_tx.send(TranscriptionCommand::Start).unwrap();
         control_tx.send(TranscriptionCommand::Stop).unwrap();
 
-        let result = tokio::time::timeout(
-            Duration::from_millis(100),
-            connect_until_stopped(future::pending::<Result<(), ()>>(), &mut control_rx),
-        )
-        .await
-        .expect("stop should cancel a pending connection")
-        .unwrap();
+        let result =
+            connect_until_stopped(future::ready(Ok::<_, ()>("connected")), &mut control_rx)
+                .await
+                .unwrap();
 
-        assert!(result.is_none());
+        assert_eq!(result, Some(("connected", false)));
     }
 
     #[tokio::test]

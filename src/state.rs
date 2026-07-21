@@ -1,5 +1,6 @@
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum RecordingState {
+    #[default]
     Idle,
     BufferingPreConnect,
     Connecting,
@@ -41,12 +42,6 @@ impl RecordingState {
 
     pub fn transition_to_idle(&mut self) {
         *self = RecordingState::Idle;
-    }
-}
-
-impl Default for RecordingState {
-    fn default() -> Self {
-        RecordingState::Idle
     }
 }
 

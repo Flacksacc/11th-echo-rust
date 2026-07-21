@@ -3,6 +3,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
+use std::future::Future;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 use tokio_tungstenite::connect_async;
@@ -12,6 +14,73 @@ use url::Url;
 use super::{AudioChunk, TranscriptionCommand, TranscriptionEvent};
 
 const OPENAI_REALTIME_URL: &str = "wss://api.openai.com/v1/realtime";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const SESSION_READY_TIMEOUT: Duration = Duration::from_secs(15);
+const FINAL_COMMIT_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_PRE_READY_AUDIO_SAMPLES: usize = 16_000 * 15;
+
+#[derive(Default)]
+struct PreReadyAudioQueue {
+    chunks: VecDeque<AudioChunk>,
+    samples: usize,
+}
+
+impl PreReadyAudioQueue {
+    fn push(&mut self, chunk: AudioChunk) -> Result<(), AudioChunk> {
+        if self.samples.saturating_add(chunk.len()) > MAX_PRE_READY_AUDIO_SAMPLES {
+            return Err(chunk);
+        }
+        self.samples += chunk.len();
+        self.chunks.push_back(chunk);
+        Ok(())
+    }
+
+    fn pop_front(&mut self) -> Option<AudioChunk> {
+        let chunk = self.chunks.pop_front()?;
+        self.samples -= chunk.len();
+        Some(chunk)
+    }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.samples = 0;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.chunks.len()
+    }
+}
+
+async fn connect_until_stopped<F, T, E>(
+    connection: F,
+    control_rx: &mut UnboundedReceiver<TranscriptionCommand>,
+) -> Result<Option<(T, bool)>, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    tokio::pin!(connection);
+    let mut accepting_audio = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            command = control_rx.recv() => {
+                match command {
+                    Some(TranscriptionCommand::Start) => accepting_audio = true,
+                    Some(TranscriptionCommand::Stop) => accepting_audio = false,
+                    None => return Ok(None),
+                }
+            }
+            result = &mut connection => {
+                return result.map(|connected| Some((connected, accepting_audio)));
+            }
+        }
+    }
+}
 
 pub struct OpenAiRealtimeWhisperTranscriber {
     api_key: String,
@@ -70,19 +139,31 @@ impl OpenAiRealtimeWhisperTranscriber {
             .insert("Authorization", format!("Bearer {}", self.api_key).parse()?);
 
         emit!("➡️ [API OUT] WebSocket CONNECT {}", url);
-        let (ws_stream, response) = connect_async(request).await?;
-        emit!(
-            "⬅️ [API IN] WebSocket CONNECT status={} headers={:?}",
-            response.status(),
-            response.headers()
-        );
+        let connection = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request));
+        let Some((connection_result, mut accepting_audio)) =
+            (match connect_until_stopped(connection, &mut control_rx).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let message = "OpenAI connection timed out after 15 seconds. Please try again."
+                        .to_string();
+                    emit!("❌ {}", message);
+                    let _ = text_tx.send(TranscriptionEvent::Error(message)).await;
+                    return Ok(());
+                }
+            })
+        else {
+            emit!("➡️ OpenAI WebSocket connection cancelled before completion");
+            return Ok(());
+        };
+        let (ws_stream, response) = connection_result?;
+        emit!("⬅️ [API IN] WebSocket CONNECT status={}", response.status());
         emit!("✅ Connected to OpenAI Realtime WebSocket");
 
         let (mut write, mut read) = ws_stream.split();
         let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<WsEvent>();
 
         let session_payload = session_update_payload(&self.model_id, &self.language_code);
-        emit!("➡️ [API OUT] WS session.update: {}", session_payload);
+        emit!("➡️ [API OUT] WS session.update");
         write
             .send(tokio_tungstenite::tungstenite::Message::Text(
                 session_payload,
@@ -91,7 +172,7 @@ impl OpenAiRealtimeWhisperTranscriber {
 
         let log_tx_read = log_tx.clone();
         let text_tx_read = text_tx.clone();
-        let read_task = tokio::spawn(async move {
+        let mut read_task = tokio::spawn(async move {
             let mut partials_by_item: HashMap<String, String> = HashMap::new();
             macro_rules! emit_read {
                 ($($arg:tt)*) => {{
@@ -103,7 +184,7 @@ impl OpenAiRealtimeWhisperTranscriber {
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                        emit_read!("⬅️ [API IN] WS text: {}", text);
+                        emit_read!("⬅️ [API IN] WS text frame: {} bytes", text.len());
                         match parse_incoming_message(&text) {
                             ParsedIncoming::SessionReady => {
                                 emit_read!("✅ [API IN] transcription session ready");
@@ -116,7 +197,10 @@ impl OpenAiRealtimeWhisperTranscriber {
                                         .and_modify(|existing| existing.push_str(&delta))
                                         .or_insert(delta)
                                         .clone();
-                                    emit_read!("📝 [PARTIAL] {}", partial);
+                                    emit_read!(
+                                        "📝 Partial transcript: {} characters",
+                                        partial.chars().count()
+                                    );
                                     let _ = text_tx_read
                                         .send(TranscriptionEvent::Partial(partial))
                                         .await;
@@ -127,14 +211,17 @@ impl OpenAiRealtimeWhisperTranscriber {
                                 transcript,
                             } => {
                                 partials_by_item.remove(&item_id);
-                                emit_read!("📝 [COMMITTED] {}", transcript);
+                                emit_read!(
+                                    "📝 Committed transcript: {} characters",
+                                    transcript.chars().count()
+                                );
                                 let _ = text_tx_read
                                     .send(TranscriptionEvent::Committed(transcript))
                                     .await;
                                 let _ = evt_tx.send(WsEvent::CommittedTranscriptReceived);
                             }
                             ParsedIncoming::Error(err_json) => {
-                                emit_read!("❌ [API ERROR] {}", err_json);
+                                emit_read!("❌ OpenAI reported a transcription error");
                                 let _ =
                                     text_tx_read.send(TranscriptionEvent::Error(err_json)).await;
                                 let _ = evt_tx.send(WsEvent::TerminalError);
@@ -168,13 +255,49 @@ impl OpenAiRealtimeWhisperTranscriber {
         });
 
         let mut session_ready = false;
-        let mut accepting_audio = false;
-        let mut awaiting_final_commit = false;
+        let mut awaiting_final_commit = !accepting_audio;
+        let mut final_commit_deadline = None;
         let mut appended_audio = false;
-        let mut queued_audio: VecDeque<AudioChunk> = VecDeque::new();
+        let mut audio_stream_ended = false;
+        let mut queued_audio = PreReadyAudioQueue::default();
+        if awaiting_final_commit {
+            // Stop may arrive while TLS is connecting. Give the forwarding task
+            // a short idle window to deliver audio captured before Stop.
+            while let Some(chunk) = audio_rx.recv().await {
+                if queued_audio.push(chunk).is_err() {
+                    let message = "OpenAI received more than 15 seconds of audio before connecting. Please try again.".to_string();
+                    emit!("❌ {}", message);
+                    let _ = text_tx.send(TranscriptionEvent::Error(message)).await;
+                    read_task.abort();
+                    let _ = read_task.await;
+                    return Ok(());
+                }
+            }
+            audio_stream_ended = true;
+        }
+        let session_ready_timeout = tokio::time::sleep(SESSION_READY_TIMEOUT);
+        tokio::pin!(session_ready_timeout);
+        let mut final_commit_watchdog = tokio::time::interval(Duration::from_millis(250));
+        final_commit_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
+                _ = final_commit_watchdog.tick(), if final_commit_deadline.is_some() => {
+                    if tokio::time::Instant::now() >= final_commit_deadline.unwrap() {
+                        let message = "OpenAI did not return a final transcript within 20 seconds. Please try again.".to_string();
+                        emit!("❌ {}", message);
+                        let _ = text_tx.send(TranscriptionEvent::Error(message)).await;
+                        let _ = write.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
+                        break;
+                    }
+                }
+                _ = &mut session_ready_timeout, if !session_ready => {
+                    let message = "OpenAI did not start the transcription session within 15 seconds. Please try again.".to_string();
+                    emit!("❌ {}", message);
+                    let _ = text_tx.send(TranscriptionEvent::Error(message)).await;
+                    let _ = write.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
+                    break;
+                }
                 Some(evt) = evt_rx.recv() => {
                     match evt {
                         WsEvent::SessionReady => {
@@ -201,6 +324,7 @@ impl OpenAiRealtimeWhisperTranscriber {
                                         emit!("❌ Failed to send delayed commit: {}", e);
                                         break;
                                     }
+                                    final_commit_deadline = Some(tokio::time::Instant::now() + FINAL_COMMIT_TIMEOUT);
                                 } else {
                                     emit!("➡️ No audio was sent; closing OpenAI WebSocket");
                                     let _ = text_tx.send(TranscriptionEvent::Committed(String::new())).await;
@@ -248,6 +372,23 @@ impl OpenAiRealtimeWhisperTranscriber {
                             awaiting_final_commit = true;
                             emit!("➡️ [API OUT] Manual commit requested");
 
+                            while let Some(chunk) = audio_rx.recv().await {
+                                if session_ready {
+                                    let payload = audio_append_payload(&chunk);
+                                    if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(payload)).await {
+                                        emit!("❌ Failed to flush buffered audio before commit: {}", e);
+                                        break;
+                                    }
+                                    appended_audio = true;
+                                } else if queued_audio.push(chunk).is_err() {
+                                    let message = "OpenAI received more than 15 seconds of buffered audio. Please try again.".to_string();
+                                    emit!("❌ {}", message);
+                                    let _ = text_tx.send(TranscriptionEvent::Error(message)).await;
+                                    break;
+                                }
+                            }
+                            audio_stream_ended = true;
+
                             if !appended_audio && queued_audio.is_empty() {
                                 emit!("➡️ No audio was sent; closing OpenAI WebSocket");
                                 let _ = text_tx.send(TranscriptionEvent::Committed(String::new())).await;
@@ -279,17 +420,24 @@ impl OpenAiRealtimeWhisperTranscriber {
                                 emit!("❌ Failed to send commit: {}", e);
                                 break;
                             }
+                            final_commit_deadline = Some(tokio::time::Instant::now() + FINAL_COMMIT_TIMEOUT);
                         }
                     }
                 }
-                maybe_chunk = audio_rx.recv() => {
+                maybe_chunk = audio_rx.recv(), if !audio_stream_ended => {
                     match maybe_chunk {
                         Some(chunk) => {
                             if !accepting_audio {
                                 continue;
                             }
                             if !session_ready {
-                                queued_audio.push_back(chunk);
+                                if queued_audio.push(chunk).is_err() {
+                                    let message = "OpenAI was not ready after 15 seconds of queued audio. Please try again.".to_string();
+                                    emit!("❌ {}", message);
+                                    let _ = text_tx.send(TranscriptionEvent::Error(message)).await;
+                                    let _ = write.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
+                                    break;
+                                }
                             } else {
                                 let payload = audio_append_payload(&chunk);
                                 emit!(
@@ -306,6 +454,7 @@ impl OpenAiRealtimeWhisperTranscriber {
                         }
                         None => {
                             emit!("➡️ [API OUT] Audio stream ended, forcing manual commit");
+                            audio_stream_ended = true;
                             if appended_audio || !queued_audio.is_empty() {
                                 while let Some(chunk) = queued_audio.pop_front() {
                                     let payload = audio_append_payload(&chunk);
@@ -317,16 +466,28 @@ impl OpenAiRealtimeWhisperTranscriber {
                                 let commit_payload = input_audio_buffer_commit_payload();
                                 if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(commit_payload)).await {
                                     emit!("❌ Failed to send commit after audio close: {}", e);
+                                    break;
                                 }
+                                awaiting_final_commit = true;
+                                final_commit_deadline = Some(tokio::time::Instant::now() + FINAL_COMMIT_TIMEOUT);
+                            } else {
+                                let _ = text_tx.send(TranscriptionEvent::Committed(String::new())).await;
+                                let _ = write.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
+                                break;
                             }
-                            break;
                         }
                     }
                 }
             }
         }
 
-        let _ = read_task.await;
+        if tokio::time::timeout(Duration::from_secs(2), &mut read_task)
+            .await
+            .is_err()
+        {
+            read_task.abort();
+            let _ = read_task.await;
+        }
         Ok(())
     }
 }
@@ -448,9 +609,64 @@ fn parse_incoming_message(text: &str) -> ParsedIncoming {
 #[cfg(test)]
 mod tests {
     use super::{
-        audio_append_payload, parse_incoming_message, realtime_url, resample_pcm16_16k_to_24k,
-        session_update_payload, ParsedIncoming,
+        audio_append_payload, connect_until_stopped, parse_incoming_message, realtime_url,
+        resample_pcm16_16k_to_24k, session_update_payload, ParsedIncoming, PreReadyAudioQueue,
     };
+    use crate::transcription::TranscriptionCommand;
+    use std::future;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn stop_during_connection_is_preserved() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        control_tx.send(TranscriptionCommand::Start).unwrap();
+        control_tx.send(TranscriptionCommand::Stop).unwrap();
+
+        let result =
+            connect_until_stopped(future::ready(Ok::<_, ()>("connected")), &mut control_rx)
+                .await
+                .unwrap();
+
+        assert_eq!(result, Some(("connected", false)));
+    }
+
+    #[tokio::test]
+    async fn start_received_during_connect_is_preserved() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        control_tx.send(TranscriptionCommand::Start).unwrap();
+
+        let result =
+            connect_until_stopped(future::ready(Ok::<_, ()>("connected")), &mut control_rx)
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(result, ("connected", true));
+    }
+
+    #[tokio::test]
+    async fn connection_attempt_has_a_finite_timeout() {
+        let (_control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let result = connect_until_stopped(
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                future::pending::<Result<(), ()>>(),
+            ),
+            &mut control_rx,
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pre_ready_audio_queue_is_bounded_by_audio_duration() {
+        let mut queue = PreReadyAudioQueue::default();
+        assert!(queue.push(vec![0; 16_000 * 15]).is_ok());
+        assert!(queue.push(vec![0]).is_err());
+        assert_eq!(queue.len(), 1);
+    }
 
     #[test]
     fn realtime_url_uses_model_query() {

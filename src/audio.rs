@@ -1,10 +1,13 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use tokio::sync::mpsc::Sender; // Use bounded sender for backpressure
-use tokio::sync::mpsc::error::TrySendError;
-use std::error::Error;
-use rubato::{Resampler, SincFixedIn, SincInterpolationType, SincInterpolationParameters, WindowFunction};
-use std::sync::{Arc, Mutex};
+use rubato::{
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 use std::collections::VecDeque;
+use std::error::Error;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::Sender; // Use bounded sender for backpressure
 
 /// Audio configuration constants
 const TARGET_SAMPLE_RATE: u32 = 16000;
@@ -101,27 +104,42 @@ pub fn start_audio_capture(
     let host = cpal::default_host();
     let device = if let Some(name) = preferred_device_name {
         if name.trim().is_empty() {
-            host.default_input_device().ok_or("No input device available")?
+            host.default_input_device()
+                .ok_or("No input device available")?
         } else if let Ok(mut devices) = host.input_devices() {
             devices
                 .find(|d| d.name().map(|n| n == name).unwrap_or(false))
                 .or_else(|| host.default_input_device())
                 .ok_or("No input device available")?
         } else {
-            host.default_input_device().ok_or("No input device available")?
+            host.default_input_device()
+                .ok_or("No input device available")?
         }
     } else {
-        host.default_input_device().ok_or("No input device available")?
+        host.default_input_device()
+            .ok_or("No input device available")?
     };
     let config = device.default_input_config()?;
     let input_sample_rate = config.sample_rate().0;
-    
-    println!("🎤 Input device: {} @ {}Hz", device.name().unwrap_or_default(), input_sample_rate);
+    let input_channels = config.channels() as usize;
+
+    crate::echo_info!(
+        "audio",
+        "Input device={} sample_rate_hz={} channels={}",
+        device.name().unwrap_or_default(),
+        input_sample_rate,
+        input_channels
+    );
 
     // Setup Resampler if needed
     let resampler = if input_sample_rate != TARGET_SAMPLE_RATE {
-        println!("🔄 Resampling from {}Hz to {}Hz", input_sample_rate, TARGET_SAMPLE_RATE);
-        
+        crate::echo_info!(
+            "audio",
+            "Resampling input_hz={} target_hz={}",
+            input_sample_rate,
+            TARGET_SAMPLE_RATE
+        );
+
         let params = SincInterpolationParameters {
             sinc_len: 256,
             f_cutoff: 0.95,
@@ -129,14 +147,15 @@ pub fn start_audio_capture(
             oversampling_factor: 256,
             window: WindowFunction::BlackmanHarris2,
         };
-        
+
         SincFixedIn::<f32>::new(
             TARGET_SAMPLE_RATE as f64 / input_sample_rate as f64,
             2.0, // Max ratio
             params,
-            CHUNK_SIZE, 
-            1 // channels
-        ).ok()
+            CHUNK_SIZE,
+            1, // channels
+        )
+        .ok()
     } else {
         None
     };
@@ -145,46 +164,57 @@ pub fn start_audio_capture(
     let resampler_state = Arc::new(Mutex::new(resampler));
     // Buffer to hold incoming samples until we have enough for a resampler chunk
     let buffer_state = Arc::new(Mutex::new(Vec::<f32>::with_capacity(CHUNK_SIZE * 2)));
-    let ring_buffer_state = Arc::new(Mutex::new(CircularSampleBuffer::new(PRECONNECT_BUFFER_SAMPLES)));
-    
-    let err_fn = move |err| eprintln!("❌ Audio stream error: {}", err);
+    let ring_buffer_state = Arc::new(Mutex::new(CircularSampleBuffer::new(
+        PRECONNECT_BUFFER_SAMPLES,
+    )));
 
-    let sender_level = level_sender.clone();
+    let err_fn = move |err| crate::echo_error!("audio", "Capture stream error: {}", err);
+    let (raw_tx, raw_rx) = crossbeam_channel::bounded::<Vec<f32>>(32);
+    let worker_rx = raw_rx.clone();
+    let worker_sender = sender.clone();
+    thread::spawn(move || {
+        while let Ok(raw) = worker_rx.recv() {
+            let mono = if input_channels <= 1 {
+                raw
+            } else {
+                raw.chunks(input_channels)
+                    .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
+                    .collect()
+            };
+            process_audio_f32(
+                &mono,
+                &worker_sender,
+                &level_sender,
+                &resampler_state,
+                &buffer_state,
+                &ring_buffer_state,
+                input_sample_rate,
+            );
+        }
+    });
+
     let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &config.into(),
-            move |data: &[f32], _: &_| {
-                process_audio_f32(
-                    data,
-                    &sender,
-                    &sender_level,
-                    &resampler_state,
-                    &buffer_state,
-                    &ring_buffer_state,
-                    input_sample_rate
-                );
-            },
-            err_fn,
-            None 
-        )?,
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &config.into(),
-            move |data: &[i16], _: &_| {
-                // Convert i16 -> f32 for resampling
-                let samples_f32: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                process_audio_f32(
-                    &samples_f32,
-                    &sender,
-                    &sender_level,
-                    &resampler_state,
-                    &buffer_state,
-                    &ring_buffer_state,
-                    input_sample_rate
-                );
-            },
-            err_fn,
-            None
-        )?,
+        cpal::SampleFormat::F32 => {
+            let drop_rx = raw_rx.clone();
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[f32], _: &_| enqueue_raw_audio(&raw_tx, &drop_rx, data.to_vec()),
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::I16 => {
+            let drop_rx = raw_rx.clone();
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[i16], _: &_| {
+                    let samples = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+                    enqueue_raw_audio(&raw_tx, &drop_rx, samples);
+                },
+                err_fn,
+                None,
+            )?
+        }
         _ => return Err("Unsupported sample format".into()),
     };
 
@@ -192,14 +222,29 @@ pub fn start_audio_capture(
     Ok(stream)
 }
 
+fn enqueue_raw_audio(
+    sender: &crossbeam_channel::Sender<Vec<f32>>,
+    drop_receiver: &crossbeam_channel::Receiver<Vec<f32>>,
+    samples: Vec<f32>,
+) {
+    match sender.try_send(samples) {
+        Ok(()) => {}
+        Err(crossbeam_channel::TrySendError::Full(samples)) => {
+            let _ = drop_receiver.try_recv();
+            let _ = sender.try_send(samples);
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
+    }
+}
+
 fn process_audio_f32(
-    input: &[f32], 
-    sender: &Sender<Vec<i16>>, 
+    input: &[f32],
+    sender: &Sender<Vec<i16>>,
     level_sender: &Sender<f32>,
     resampler_state: &Arc<Mutex<Option<SincFixedIn<f32>>>>,
     buffer_state: &Arc<Mutex<Vec<f32>>>,
     ring_buffer_state: &Arc<Mutex<CircularSampleBuffer>>,
-    _input_rate: u32
+    _input_rate: u32,
 ) {
     // Calculate peak level for feedback
     let mut peak = 0.0f32;
@@ -215,7 +260,7 @@ fn process_audio_f32(
     buffer.extend_from_slice(input);
 
     let mut resampler_guard = resampler_state.lock().unwrap();
-    
+
     if let Some(resampler) = resampler_guard.as_mut() {
         while buffer.len() >= CHUNK_SIZE {
             // Rubato requires strict chunk sizes for SincFixedIn
@@ -266,7 +311,7 @@ fn enqueue_and_flush(
 
 #[cfg(test)]
 mod tests {
-    use super::{CircularSampleBuffer, CHUNK_SIZE, enqueue_and_flush};
+    use super::{enqueue_and_flush, CircularSampleBuffer, CHUNK_SIZE};
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 

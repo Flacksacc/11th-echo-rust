@@ -1,6 +1,7 @@
 use crate::settings::AppSettings;
 use reqwest::Client;
 use serde_json::json;
+use std::time::Duration;
 
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
@@ -20,9 +21,18 @@ fn build_prompt(settings: &AppSettings, original: &str) -> String {
     )
 }
 
-pub async fn rewrite_text(api_key: &str, model: &str, prompt_preset: &str, custom_prompt: &str, original: &str) -> String {
+pub async fn rewrite_text(
+    api_key: &str,
+    model: &str,
+    prompt_preset: &str,
+    custom_prompt: &str,
+    original: &str,
+) -> String {
     if api_key.trim().is_empty() {
-        eprintln!("⚠️ Gemini rewriting is enabled but no API key is configured; skipping rewrite.");
+        crate::echo_warn!(
+            "gemini",
+            "Rewriting is enabled but no API key is configured; skipping rewrite"
+        );
         return original.to_string();
     }
 
@@ -39,7 +49,12 @@ pub async fn rewrite_text(api_key: &str, model: &str, prompt_preset: &str, custo
         ..Default::default()
     };
     let prompt = build_prompt(&settings_stub, original);
-    println!("🤖 [Gemini] Sending rewrite request to {} ({} chars)", model_id, original.len());
+    crate::echo_info!(
+        "gemini",
+        "Sending rewrite request model={} input_characters={}",
+        model_id,
+        original.chars().count()
+    );
 
     let body = json!({
         "contents": [{
@@ -51,7 +66,17 @@ pub async fn rewrite_text(api_key: &str, model: &str, prompt_preset: &str, custo
         }
     });
 
-    let client = Client::new();
+    let client = match Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            crate::echo_error!("gemini", "Could not initialize HTTP client: {e}");
+            return original.to_string();
+        }
+    };
     let response = match client
         .post(&endpoint)
         .header("x-goog-api-key", api_key)
@@ -61,7 +86,7 @@ pub async fn rewrite_text(api_key: &str, model: &str, prompt_preset: &str, custo
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("❌ Gemini request failed: {}", e);
+            crate::echo_error!("gemini", "Request failed: {}", e);
             return original.to_string();
         }
     };
@@ -70,7 +95,12 @@ pub async fn rewrite_text(api_key: &str, model: &str, prompt_preset: &str, custo
     let value: serde_json::Value = match response.json().await {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("❌ Failed to decode Gemini response (status {}): {}", status, e);
+            crate::echo_error!(
+                "gemini",
+                "Failed to decode response status={}: {}",
+                status,
+                e
+            );
             return original.to_string();
         }
     };
@@ -86,18 +116,18 @@ pub async fn rewrite_text(api_key: &str, model: &str, prompt_preset: &str, custo
     {
         let cleaned = text.trim();
         if cleaned.is_empty() {
-            println!("🤖 [Gemini] Got empty response, using original text");
+            crate::echo_warn!("gemini", "Response was empty; using original text");
             original.to_string()
         } else {
-            println!("🤖 [Gemini] Rewrite complete: \"{}\" -> \"{}\"", original, cleaned);
+            crate::echo_info!(
+                "gemini",
+                "Rewrite complete output_characters={}",
+                cleaned.chars().count()
+            );
             cleaned.to_string()
         }
     } else {
-        eprintln!(
-            "❌ Unexpected Gemini response structure (status {}): {}",
-            status,
-            value
-        );
+        crate::echo_error!("gemini", "Unexpected response structure status={}", status);
         original.to_string()
     }
 }

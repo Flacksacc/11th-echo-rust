@@ -4,7 +4,7 @@ use std::thread;
 #[cfg(windows)]
 use std::time::{Duration, Instant};
 #[cfg(windows)]
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::GetLastError;
 #[cfg(windows)]
 use windows::Win32::System::Threading::GetCurrentProcessId;
 #[cfg(windows)]
@@ -15,165 +15,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindow, SetForegroundWindow, GUITHREADINFO,
+    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
 };
-
-#[cfg(windows)]
-#[derive(Clone, Debug)]
-pub struct ForegroundTarget {
-    hwnd_raw: isize,
-    pub process_id: u32,
-    pub thread_id: u32,
-    pub title: String,
-    pub class_name: String,
-}
-
-#[cfg(windows)]
-impl ForegroundTarget {
-    fn hwnd(&self) -> HWND {
-        HWND(self.hwnd_raw)
-    }
-
-    fn describe(&self) -> String {
-        format!(
-            "hwnd=0x{:X} pid={} tid={} class='{}' title='{}'",
-            self.hwnd_raw as usize, self.process_id, self.thread_id, self.class_name, self.title
-        )
-    }
-}
 
 #[cfg(windows)]
 fn is_key_down(vk: VIRTUAL_KEY) -> bool {
     unsafe { (GetAsyncKeyState(vk.0 as i32) as u16) & 0x8000 != 0 }
-}
-
-#[cfg(windows)]
-fn utf16_buf_to_string(buf: &[u16], len: i32) -> String {
-    if len <= 0 {
-        return String::new();
-    }
-    String::from_utf16_lossy(&buf[..len as usize])
-}
-
-#[cfg(windows)]
-fn window_text(hwnd: HWND) -> String {
-    let mut buf = [0u16; 256];
-    let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
-    utf16_buf_to_string(&buf, len)
-}
-
-#[cfg(windows)]
-fn class_name(hwnd: HWND) -> String {
-    let mut buf = [0u16; 128];
-    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
-    utf16_buf_to_string(&buf, len)
-}
-
-#[cfg(windows)]
-fn current_focus_description() -> Option<String> {
-    unsafe {
-        let foreground = GetForegroundWindow();
-        if foreground.0 == 0 {
-            return None;
-        }
-
-        let thread_id = GetWindowThreadProcessId(foreground, None);
-        if thread_id == 0 {
-            return None;
-        }
-
-        let mut info = GUITHREADINFO {
-            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
-            ..Default::default()
-        };
-
-        if GetGUIThreadInfo(thread_id, &mut info).is_err() {
-            return None;
-        }
-
-        let focus = info.hwndFocus;
-        if focus.0 == 0 {
-            return Some("focus=<none>".to_string());
-        }
-
-        Some(format!(
-            "focus_hwnd=0x{:X} class='{}' title='{}'",
-            focus.0 as usize,
-            class_name(focus),
-            window_text(focus)
-        ))
-    }
-}
-
-#[cfg(windows)]
-pub fn capture_foreground_target() -> Option<ForegroundTarget> {
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.0 == 0 {
-            return None;
-        }
-
-        let mut process_id = 0u32;
-        let thread_id = GetWindowThreadProcessId(hwnd, Some(&mut process_id));
-        if thread_id == 0 {
-            return None;
-        }
-
-        Some(ForegroundTarget {
-            hwnd_raw: hwnd.0 as isize,
-            process_id,
-            thread_id,
-            title: window_text(hwnd),
-            class_name: class_name(hwnd),
-        })
-    }
-}
-
-#[cfg(windows)]
-pub fn log_foreground_target(context: &str) {
-    match capture_foreground_target() {
-        Some(target) => {
-            let focus =
-                current_focus_description().unwrap_or_else(|| "focus=<unavailable>".to_string());
-            eprintln!("⌨ [{context}] foreground {} {focus}", target.describe());
-        }
-        None => {
-            eprintln!("⌨ [{context}] foreground=<none>");
-        }
-    }
-}
-
-#[cfg(windows)]
-pub fn foreground_belongs_to_current_process() -> bool {
-    capture_foreground_target()
-        .map(|target| target.process_id == unsafe { GetCurrentProcessId() })
-        .unwrap_or(false)
-}
-
-#[cfg(windows)]
-pub fn restore_foreground_target(target: &ForegroundTarget) -> bool {
-    unsafe {
-        let hwnd = target.hwnd();
-        if !IsWindow(hwnd).as_bool() {
-            eprintln!(
-                "⌨ [restore] captured target is no longer a valid window: {}",
-                target.describe()
-            );
-            return false;
-        }
-
-        let restored = SetForegroundWindow(hwnd).as_bool();
-        if restored {
-            eprintln!("⌨ [restore] restored captured target {}", target.describe());
-        } else {
-            eprintln!(
-                "⌨ [restore] failed to restore captured target {}",
-                target.describe()
-            );
-        }
-        restored
-    }
 }
 
 #[cfg(windows)]
@@ -223,50 +70,99 @@ fn pressed_modifiers() -> Vec<&'static str> {
 }
 
 #[cfg(windows)]
-fn wait_for_modifiers_to_clear() {
+fn wait_for_modifiers_to_clear() -> Result<(), Box<dyn Error + Send + Sync>> {
     let start = Instant::now();
     let mut last_log_at: Option<Instant> = None;
 
     while modifiers_are_pressed() {
         let now = Instant::now();
+        if now.duration_since(start) >= Duration::from_secs(5) {
+            crate::echo_error!(
+                "injector",
+                "Direct input cancelled because modifiers remained pressed keys={}",
+                pressed_modifiers().join(",")
+            );
+            return Err("Modifier keys remained pressed; text injection was cancelled".into());
+        }
         if now.duration_since(start) >= Duration::from_secs(1)
-            && last_log_at.is_none_or(|prev| now.duration_since(prev) >= Duration::from_secs(1))
+            && last_log_at
+                .is_none_or(|previous| now.duration_since(previous) >= Duration::from_secs(1))
         {
-            let pressed = pressed_modifiers();
-            eprintln!(
-                "⌛ Waiting {:.1}s for modifiers to clear before injection: {}",
+            crate::echo_warn!(
+                "injector",
+                "Waiting {:.1}s for modifiers to clear before injection: {}",
                 now.duration_since(start).as_secs_f32(),
-                pressed.join(", ")
+                pressed_modifiers().join(", ")
             );
             last_log_at = Some(now);
         }
         thread::sleep(Duration::from_millis(1));
     }
+    Ok(())
 }
 
-/// Inject UTF-16 text into the system input stream using Win32 SendInput.
-/// This will go to whichever window has focus.
-///
-/// Returns Ok(()) if successful, or an Error if SendInput fails.
+/// Inject UTF-16 text directly into whichever Windows control currently has
+/// focus. No start-time destination or clipboard is used.
 #[cfg(windows)]
 pub fn inject_text(text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let utf16 = text
+        .encode_utf16()
+        .filter(|code_unit| *code_unit != 0)
+        .collect::<Vec<_>>();
     if utf16.is_empty() {
         return Ok(());
     }
 
-    wait_for_modifiers_to_clear();
-    log_foreground_target("before_sendinput");
+    wait_for_modifiers_to_clear()?;
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.0 == 0 {
+        crate::echo_error!(
+            "injector",
+            "Direct input cancelled reason=no_foreground_window utf16_units={}",
+            utf16.len()
+        );
+        return Err("No Windows application currently has focus".into());
+    }
 
-    let mut inputs: Vec<INPUT> = Vec::with_capacity(utf16.len() * 2);
+    let mut foreground_process_id = 0u32;
+    let foreground_thread_id =
+        unsafe { GetWindowThreadProcessId(foreground, Some(&mut foreground_process_id)) };
+    let mut gui_info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    let gui_info_available = foreground_thread_id != 0
+        && unsafe { GetGUIThreadInfo(foreground_thread_id, &mut gui_info) }.is_ok();
+    let focused_control = if gui_info_available {
+        gui_info.hwndFocus
+    } else {
+        Default::default()
+    };
+    let mut class_buffer = [0u16; 128];
+    let class_length = if focused_control.0 != 0 {
+        unsafe { GetClassNameW(focused_control, &mut class_buffer) }
+    } else {
+        0
+    };
+    let focused_class = if class_length > 0 {
+        String::from_utf16_lossy(&class_buffer[..class_length as usize])
+    } else {
+        "unavailable".to_string()
+    };
+    crate::echo_info!(
+        "injector",
+        "Direct input starting utf16_units={} foreground_hwnd=0x{:X} foreground_pid={} foreground_tid={} focus_hwnd=0x{:X} focus_class={} foreground_is_echo={}",
+        utf16.len(),
+        foreground.0 as usize,
+        foreground_process_id,
+        foreground_thread_id,
+        focused_control.0 as usize,
+        focused_class,
+        foreground_process_id == unsafe { GetCurrentProcessId() }
+    );
 
-    // Inject UTF-16 characters only after all modifiers are released.
-    for &code_unit in &utf16 {
-        if code_unit == 0 {
-            continue;
-        }
-
-        // Key down
+    let mut inputs = Vec::with_capacity(utf16.len() * 2);
+    for code_unit in utf16 {
         inputs.push(INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
@@ -279,8 +175,6 @@ pub fn inject_text(text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
                 },
             },
         });
-
-        // Key up
         inputs.push(INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
@@ -295,33 +189,37 @@ pub fn inject_text(text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
         });
     }
 
-    if inputs.is_empty() {
-        return Ok(());
-    }
-
     unsafe {
         let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        let last_error = GetLastError();
         if sent != inputs.len() as u32 {
-            // SendInput returned less than expected.
-            eprintln!(
-                "⚠ SendInput only sent {} out of {} inputs",
+            crate::echo_error!(
+                "injector",
+                "SendInput incomplete sent={} requested={} win32_error={}",
                 sent,
-                inputs.len()
+                inputs.len(),
+                last_error.0
             );
-            if sent == 0 {
-                return Err("SendInput returned 0 - possible causes: no window focused, input blocked by system (UIPI), or insufficient privileges".into());
-            }
+            return Err("Windows did not accept the complete transcript; the focused application may be running with higher privileges".into());
         }
+        crate::echo_info!(
+            "injector",
+            "SendInput completed sent={} requested={}",
+            sent,
+            inputs.len()
+        );
     }
-
-    log_foreground_target("after_sendinput");
 
     Ok(())
 }
 
 #[cfg(not(windows))]
 pub fn inject_text(text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    println!("INJECT (No-op on Linux): {}", text);
+    crate::echo_info!(
+        "injector",
+        "Direct input is a no-op on this platform characters={}",
+        text.chars().count()
+    );
     Ok(())
 }
 

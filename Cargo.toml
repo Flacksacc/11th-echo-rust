@@ -1,5 +1,5 @@
 [package]
-name = "eleventh_echo_rust"
+name = "echo"
 version = "0.1.0"
 edition = "2021"
 
@@ -17,6 +17,9 @@ tokio = { version = "1.36", features = ["full"] }
 # Audio
 cpal = "0.15"
 rubato = "0.14" # High-quality resampling
+crossbeam-channel = "0.5"
+bzip2 = "0.4"
+tar = "0.4"
 
 # Networking
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
@@ -28,20 +31,26 @@ base64 = "0.22"
 http = "1.1"
 
 # HTTP client for Gemini API
-reqwest = { version = "0.12", features = ["json", "native-tls"] }
+reqwest = { version = "0.12", features = ["json", "native-tls", "stream"] }
 
 # Logging & Error Handling
 anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
 chrono = "0.4.44"
+num_cpus = "1.16"
+sha2 = "0.10"
+sherpa-onnx = "=1.13.4"
 
 # System Integration
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.14"
 global-hotkey = "0.5"
 tao = "0.28" # Event loop for tray/hotkeys
+winreg = "0.52"
 windows = { version = "0.54", features = [
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Foundation",
@@ -53,3 +62,4 @@ windows = { version = "0.54", features = [
 
 [build-dependencies]
 slint-build = "1.8"
+winresource = "0.1"

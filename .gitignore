@@ -1,1 +1,4 @@
 /target
+/installer/output
+/installer/cache
+/installer/assets

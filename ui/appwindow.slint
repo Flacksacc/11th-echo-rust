@@ -1,17 +1,194 @@
 import { Button, VerticalBox, HorizontalBox, LineEdit, ComboBox, CheckBox, ScrollView, Slider } from "std-widgets.slint";
 
+component NavItem inherits Rectangle {
+    in property <image> icon;
+    in property <string> label;
+    in property <string> detail;
+    in property <bool> selected: false;
+    in property <color> accent: #4ade80;
+    callback activated();
+
+    accessible-role: tab;
+    accessible-label: root.label;
+    accessible-action-default => { root.activated(); }
+
+    width: 108px;
+    height: 56px;
+    border-radius: 8px;
+    border-width: nav-focus.has-focus ? 1px : 0px;
+    border-color: root.accent;
+    background: root.selected ? #173b2a : touch.has-hover ? #10271d : transparent;
+
+    Rectangle {
+        width: parent.width - 20px;
+        height: 3px;
+        x: 10px;
+        y: parent.height - 3px;
+        border-radius: 2px;
+        background: root.selected ? root.accent : transparent;
+    }
+
+    Image {
+        x: 10px;
+        y: 17px;
+        width: 22px;
+        height: 22px;
+        source: root.icon;
+        colorize: root.selected ? root.accent : #91aa9b;
+        image-fit: contain;
+    }
+    Text {
+        x: 39px;
+        y: 7px;
+        width: parent.width - 47px;
+        text: root.label;
+        color: root.selected ? #f0fff4 : #d5e8dc;
+        font-size: 13px;
+        font-weight: root.selected ? 700 : 500;
+        overflow: elide;
+    }
+    Text {
+        x: 39px;
+        y: 30px;
+        width: parent.width - 47px;
+        text: root.detail;
+        color: #789487;
+        font-size: 10px;
+        overflow: elide;
+    }
+
+    nav-focus := FocusScope {
+        width: 0px;
+        height: 0px;
+        key-pressed(event) => {
+            if event.text == " " || event.text == "\n" {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { nav-focus.focus(); root.activated(); }
+    }
+}
+
+component PageTitle inherits VerticalBox {
+    in property <string> title;
+    in property <string> subtitle;
+    spacing: 2px;
+    height: 58px;
+
+    Text {
+        text: root.title;
+        color: #effff3;
+        font-size: 25px;
+        font-weight: 700;
+    }
+    Text {
+        text: root.subtitle;
+        color: #86a493;
+        font-size: 12px;
+    }
+}
+
+component SectionTitle inherits VerticalBox {
+    in property <string> title;
+    in property <string> subtitle;
+    spacing: 2px;
+    height: root.subtitle == "" ? 30px : 48px;
+
+    Text {
+        text: root.title;
+        color: #e8f9ed;
+        font-size: 17px;
+        font-weight: 700;
+    }
+    if root.subtitle != "" : Text {
+        text: root.subtitle;
+        color: #7f9d8c;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
+}
+
+component LabeledSlider inherits Rectangle {
+    in property <string> label;
+    in property <string> hint;
+    in-out property <float> value;
+    in property <float> minimum;
+    in property <float> maximum;
+    in property <float> step: 0;
+
+    height: 68px;
+    background: transparent;
+
+    Text {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        text: root.label + ": " + root.value;
+        color: #d6e9dc;
+        font-size: 12px;
+    }
+    Text {
+        x: 0;
+        y: 19px;
+        width: parent.width;
+        text: root.hint;
+        color: #708b7b;
+        font-size: 10px;
+        overflow: elide;
+    }
+    Slider {
+        x: 0;
+        y: 38px;
+        width: parent.width;
+        minimum: root.minimum;
+        maximum: root.maximum;
+        step: root.step;
+        value <=> root.value;
+    }
+}
+
+component ColorChoice inherits Rectangle {
+    in property <color> choice-color;
+    in property <string> label: "Color palette";
+    in property <bool> selected: false;
+    callback chosen();
+
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.chosen(); }
+
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    border-width: root.selected ? 3px : 1px;
+    border-color: root.selected ? #ffffff : #52645a;
+    background: root.choice-color;
+    TouchArea { clicked => { root.chosen(); } }
+}
+
 export component AppWindow inherits Window {
-    title: "11th Echo";
+    title: "Echo";
     icon: @image-url("../eleventhecho.png");
-    min-width: 520px;
-    min-height: 360px;
+    min-width: 760px;
+    min-height: 600px;
     max-width: 1920px;
     max-height: 1080px;
     background: @linear-gradient(0deg, root.theme-background-top-color, root.theme-background-bottom-color);
 
     in-out property <int> active-tab: 0;
+    in-out property <int> settings-tab: 0;
+    in-out property <bool> local-advanced-visible: false;
+    in-out property <bool> settings-dirty: false;
+    in-out property <bool> unsaved-settings-prompt-visible: false;
+    in-out property <int> pending-navigation-tab: 0;
 
     in property <bool> is-recording: false;
+    in property <bool> is-finalizing: false;
     in property <float> audio-level: 0.0;
     in property <string> status-text: "Idle";
     in property <string> hotkey-text: "Ctrl+Space";
@@ -35,10 +212,27 @@ export component AppWindow inherits Window {
     in-out property <string> openai-language-code-text;
     in property <[string]> transcription-provider-options;
     in-out property <string> transcription-provider-text;
+    in-out property <float> local-cpu-threads: 2;
+    in property <float> local-max-cpu-threads: 4;
+    in-out property <float> local-vad-threshold: 0.5;
+    in-out property <float> local-silence-ms: 600;
+    in-out property <float> local-pre-roll-ms: 250;
+    in-out property <float> local-post-roll-ms: 150;
+    in-out property <float> local-min-speech-ms: 200;
+    in-out property <float> local-max-segment-seconds: 30;
+    in-out property <float> local-partial-interval-ms: 1000;
+    in-out property <bool> local-redecode-full-session: false;
+    in-out property <bool> local-download-prompt-visible: false;
+    in-out property <bool> local-download-progress-visible: false;
+    in-out property <bool> local-repair-pending: false;
+    in-out property <float> local-download-progress: 0;
+    in-out property <string> local-download-status: "Preparing local speech model...";
+    in-out property <string> local-download-error: "";
     in-out property <string> gemini-api-key-text;
     in property <[string]> microphone-options;
     in-out property <string> selected-microphone;
     in-out property <bool> use-default-microphone: true;
+    in-out property <bool> start-with-windows: false;
     in property <string> default-microphone-text: "Unknown";
 
     in-out property <float> overlay-opacity: 0.85;
@@ -63,134 +257,283 @@ export component AppWindow inherits Window {
     callback clear-transcript();
     callback copy-transcript(int);
     callback copy-log-item(int);
+    callback accept-local-model-download();
+    callback decline-local-model-download();
+    callback request-navigation(int);
+    callback save-unsaved-settings();
+    callback discard-unsaved-settings();
+    callback cancel-unsaved-settings();
 
     VerticalBox {
-        padding: 16px;
-        spacing: 12px;
+        spacing: 0px;
 
-        HorizontalBox {
-            spacing: 8px;
-            Button {
-                text: "Main";
-                primary: root.active-tab == 0;
-                clicked => { root.active-tab = 0; }
-            }
-            Button {
-                text: "Transcription";
-                primary: root.active-tab == 1;
-                clicked => { root.active-tab = 1; }
-            }
-            Button {
-                text: "Log";
-                primary: root.active-tab == 2;
-                clicked => { root.active-tab = 2; }
-            }
-            Button {
-                text: "Settings";
-                primary: root.active-tab == 3;
-                clicked => { root.active-tab = 3; }
-            }
-        }
+        Rectangle {
+            height: 84px;
+            background: #07140e;
+            border-width: 0px;
 
-        if (root.active-tab == 0) : Rectangle {
-            background: root.theme-window-color;
-            border-radius: 8px;
-            border-width: 1px;
-            border-color: #313244;
-            vertical-stretch: 1;
-
-            VerticalBox {
-                padding: 20px;
-                spacing: 14px;
+            HorizontalBox {
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-top: 14px;
+                padding-bottom: 14px;
+                spacing: 6px;
 
                 Rectangle {
-                    width: 18px;
-                    height: 18px;
-                    border-radius: 9px;
-                    background: root.has-error ? #f38ba8 : root.is-recording ? root.theme-button-accent-color : #f38ba8;
-                }
-
-                Text {
-                    text: "Status: " + root.status-text;
-                    color: root.has-error ? #f38ba8 : root.is-recording ? root.theme-button-accent-color : #bac2de;
-                    horizontal-alignment: center;
-                }
-
-                Rectangle {
-                    height: 6px;
-                    background: #313244;
-                    border-radius: 3px;
-                    Rectangle {
-                        x: 0;
-                        width: parent.width * root.audio-level;
-                        background: root.is-recording ? root.theme-button-accent-color : #6c7086;
-                        border-radius: 3px;
-                        animate width { duration: 50ms; }
-                    }
-                }
-
-                Text {
-                    text: "Hotkey: " + root.hotkey-text;
-                    color: #9399b2;
-                    horizontal-alignment: center;
-                }
-            }
-        }
-
-        if (root.active-tab == 1) : Rectangle {
-            background: root.theme-window-color;
-            border-radius: 8px;
-            border-width: 1px;
-            border-color: #313244;
-            vertical-stretch: 1;
-
-            VerticalBox {
-                padding: 16px;
-                spacing: 10px;
-
-                HorizontalBox {
-                    spacing: 10px;
+                    width: 100px;
+                    background: transparent;
                     Text {
-                        text: "Transcripts";
-                        font-size: 22px;
-                        font-weight: 700;
+                        x: 0;
+                        y: 3px;
+                        text: "ECHO";
                         color: root.theme-title-color;
+                        font-size: 22px;
+                        font-weight: 800;
+                        letter-spacing: 2px;
                     }
-                    Button {
-                        text: "Clear";
-                        clicked => { root.clear-transcript(); }
+                    Text {
+                        x: 0;
+                        y: 34px;
+                        text: "Speech, anywhere";
+                        color: #6f8f7c;
+                        font-size: 10px;
+                    }
+                }
+
+                NavItem {
+                    icon: @image-url("../assets/icons/home.svg");
+                    label: "Home";
+                    detail: "Capture";
+                    selected: root.active-tab == 0;
+                    accent: root.theme-button-accent-color;
+                    activated => { root.request-navigation(0); }
+                }
+                NavItem {
+                    icon: @image-url("../assets/icons/activity.svg");
+                    label: "Activity";
+                    detail: "Events";
+                    selected: root.active-tab == 2;
+                    accent: root.theme-button-accent-color;
+                    activated => { root.request-navigation(2); }
+                }
+                NavItem {
+                    icon: @image-url("../assets/icons/settings.svg");
+                    label: "Settings";
+                    detail: "Preferences";
+                    selected: root.active-tab == 3;
+                    accent: root.theme-button-accent-color;
+                    activated => { root.request-navigation(3); }
+                }
+
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+
+                Rectangle {
+                    width: 170px;
+                    border-radius: 9px;
+                    background: #0c2117;
+                    border-width: 1px;
+                    border-color: #183829;
+
+                    Rectangle {
+                        x: 13px;
+                        y: 13px;
+                        width: 10px;
+                        height: 10px;
+                        border-radius: 5px;
+                        background: root.has-error ? #fb7185 : root.is-recording ? root.theme-button-accent-color : root.is-finalizing ? #fbbf24 : #64748b;
+                    }
+                    Text {
+                        x: 32px;
+                        y: 9px;
+                        width: parent.width - 44px;
+                        text: root.status-text;
+                        color: root.has-error ? #fda4af : #d8ebdf;
+                        font-size: 12px;
+                        font-weight: 600;
+                        overflow: elide;
+                    }
+                    Text {
+                        x: 13px;
+                        y: 35px;
+                        width: parent.width - 26px;
+                        text: "Hotkey  " + root.hotkey-text;
+                        color: #789487;
+                        font-size: 10px;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            background: @linear-gradient(0deg, root.theme-background-top-color, root.theme-background-bottom-color);
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+
+            if root.active-tab == 0 : VerticalBox {
+                padding: 28px;
+                spacing: 16px;
+
+                PageTitle { title: "Ready when you are"; subtitle: "Use the hotkey from any application, or start a capture here."; }
+
+                Rectangle {
+                    height: 124px;
+                    border-radius: 14px;
+                    background: root.theme-window-color;
+                    border-width: 1px;
+                    border-color: #1e4934;
+
+                    mic-toggle := Rectangle {
+                        x: (parent.width - 58px) / 2;
+                        y: 10px;
+                        width: 58px;
+                        height: 58px;
+                        border-radius: 29px;
+                        background: root.is-recording ? #194d32 : root.is-finalizing ? #2b2814 : mic-touch.has-hover ? #173528 : #10271c;
+                        border-width: mic-focus.has-focus ? 3px : 2px;
+                        border-color: root.is-recording ? root.theme-button-accent-color : mic-focus.has-focus ? root.theme-button-accent-color : #31523f;
+
+                        accessible-role: button;
+                        accessible-label: root.is-finalizing ? "Finalizing transcription" : root.is-recording ? "Stop transcription" : "Start transcription";
+                        accessible-action-default => {
+                            if !root.is-finalizing {
+                                if root.is-recording { root.stop-recording(); } else { root.start-recording(); }
+                            }
+                        }
+
+                        Rectangle {
+                            x: 21px;
+                            y: 12px;
+                            width: 16px;
+                            height: 24px;
+                            border-radius: 8px;
+                            background: root.is-recording ? root.theme-button-accent-color : #91aa9b;
+                        }
+
+                        Rectangle {
+                            x: 18px;
+                            y: 29px;
+                            width: 22px;
+                            height: 11px;
+                            border-width: 2px;
+                            border-color: root.is-recording ? root.theme-button-accent-color : #91aa9b;
+                            border-radius: 8px;
+                            background: transparent;
+                        }
+                        Rectangle {
+                            x: 28px;
+                            y: 39px;
+                            width: 2px;
+                            height: 7px;
+                            background: root.is-recording ? root.theme-button-accent-color : #91aa9b;
+                        }
+                        Rectangle {
+                            x: 23px;
+                            y: 45px;
+                            width: 12px;
+                            height: 2px;
+                            border-radius: 1px;
+                            background: root.is-recording ? root.theme-button-accent-color : #91aa9b;
+                        }
+
+                        mic-focus := FocusScope {
+                            width: 0px;
+                            height: 0px;
+                            key-pressed(event) => {
+                                if event.text == " " || event.text == "\n" {
+                                    if !root.is-finalizing {
+                                        if root.is-recording { root.stop-recording(); } else { root.start-recording(); }
+                                    }
+                                    return accept;
+                                }
+                                return reject;
+                            }
+                        }
+
+                        mic-touch := TouchArea {
+                            enabled: !root.is-finalizing;
+                            clicked => {
+                                mic-focus.focus();
+                                if root.is-recording { root.stop-recording(); } else { root.start-recording(); }
+                            }
+                        }
+                    }
+
+                    Text {
+                        y: 76px;
+                        width: parent.width;
+                        text: root.status-text;
+                        horizontal-alignment: center;
+                        color: root.has-error ? #fb7185 : root.is-recording ? root.theme-button-accent-color : #88a595;
+                        font-size: 12px;
+                        font-weight: root.is-recording ? 700 : 500;
+                        overflow: elide;
+                    }
+
+                    Rectangle {
+                        x: 24px;
+                        y: 105px;
+                        width: parent.width - 48px;
+                        height: 5px;
+                        border-radius: 3px;
+                        background: #183025;
+                        Rectangle {
+                            width: parent.width * Math.max(0, Math.min(1, root.audio-level));
+                            height: parent.height;
+                            border-radius: 3px;
+                            background: root.theme-button-accent-color;
+                            animate width { duration: 60ms; }
+                        }
                     }
                 }
 
                 Rectangle {
                     vertical-stretch: 1;
-                    border-radius: 8px;
+                    min-height: 180px;
+                    border-radius: 14px;
+                    background: root.theme-window-color;
                     border-width: 1px;
-                    border-color: #45475a;
-                    background: #11111b;
-                    clip: true;
+                    border-color: #193b2b;
 
+                    Text { x: 20px; y: 17px; text: "Transcripts"; color: root.theme-title-color; font-size: 15px; font-weight: 700; }
+                    Text {
+                        x: 20px; y: 38px;
+                        text: "Your 500 most recent transcripts";
+                        color: #607b6b;
+                        font-size: 10px;
+                    }
+                    Button {
+                        x: parent.width - 116px;
+                        y: 14px;
+                        width: 96px;
+                        height: 34px;
+                        text: "Clear history";
+                        clicked => { root.clear-transcript(); }
+                    }
+
+                    if root.transcript-history.length == 0 : Text {
+                        y: 58px;
+                        width: parent.width;
+                        height: parent.height - 58px;
+                        text: "No transcripts yet";
+                        color: #668070;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                     ScrollView {
-                        x: 6px;
-                        y: 6px;
-                        width: parent.width - 12px;
-                        height: parent.height - 12px;
-
+                        x: 12px; y: 62px; width: parent.width - 24px; height: parent.height - 74px;
                         VerticalBox {
-                            spacing: 2px;
-                            padding: 0;
-
+                            spacing: 7px;
                             for line[i] in root.transcript-history : Rectangle {
-                                height: transcript-line.preferred-height + 6px;
+                                height: home-transcript-line.preferred-height + 24px;
                                 vertical-stretch: 0;
-                                background: Math.mod(i, 2) == 0 ? #11111b : #0e0e18;
-                                border-radius: 2px;
-
+                                border-radius: 8px;
+                                background: Math.mod(i, 2) == 0 ? #0b2116 : #0d261a;
+                                border-width: 1px;
+                                border-color: #173829;
                                 TouchArea {
-                                    width: parent.width;
-                                    height: parent.height;
                                     pointer-event(event) => {
-                                        if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                                        if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
                                             root.context-menu-index = i;
                                             root.context-menu-is-log = false;
                                             root.context-menu-x = self.mouse-x + self.absolute-position.x;
@@ -198,15 +541,9 @@ export component AppWindow inherits Window {
                                             root.context-menu-visible = true;
                                         }
                                     }
-
-                                    transcript-line := Text {
-                                        x: 6px;
-                                        y: 3px;
-                                        width: parent.width - 12px;
-                                        text: line;
-                                        wrap: word-wrap;
-                                        color: root.theme-text-color;
-                                        font-size: 12px;
+                                    home-transcript-line := Text {
+                                        x: 12px; y: 10px; width: parent.width - 24px;
+                                        text: line; wrap: word-wrap; color: root.theme-text-color; font-size: 12px;
                                     }
                                 }
                             }
@@ -214,55 +551,29 @@ export component AppWindow inherits Window {
                     }
                 }
             }
-        }
 
-        if (root.active-tab == 2) : Rectangle {
-            background: root.theme-window-color;
-            border-radius: 8px;
-            border-width: 1px;
-            border-color: #313244;
-            vertical-stretch: 1;
-
-            VerticalBox {
-                padding: 16px;
-                spacing: 10px;
-
-                Text {
-                    text: "Log";
-                    font-size: 22px;
-                    font-weight: 700;
-                    color: root.theme-title-color;
-                }
-
+            if root.active-tab == 2 : VerticalBox {
+                padding: 28px;
+                spacing: 14px;
+                PageTitle { title: "Activity"; subtitle: "Connection, recording, and transcription events."; }
                 Rectangle {
                     vertical-stretch: 1;
-                    border-radius: 8px;
+                    border-radius: 14px;
+                    background: #07140e;
                     border-width: 1px;
-                    border-color: #45475a;
-                    background: #11111b;
+                    border-color: #193b2b;
                     clip: true;
-
                     ScrollView {
-                        x: 6px;
-                        y: 6px;
-                        width: parent.width - 12px;
-                        height: parent.height - 12px;
-
+                        x: 12px; y: 12px; width: parent.width - 24px; height: parent.height - 24px;
                         VerticalBox {
                             spacing: 2px;
-                            padding: 0;
-
                             for line[i] in root.log-items : Rectangle {
-                                height: log-line.preferred-height + 4px;
+                                height: log-line.preferred-height + 12px;
                                 vertical-stretch: 0;
-                                background: Math.mod(i, 2) == 0 ? #11111b : #0e0e18;
-                                border-radius: 2px;
-
+                                background: Math.mod(i, 2) == 0 ? #07140e : #0a1a12;
                                 TouchArea {
-                                    width: parent.width;
-                                    height: parent.height;
                                     pointer-event(event) => {
-                                        if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                                        if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
                                             root.context-menu-index = i;
                                             root.context-menu-is-log = true;
                                             root.context-menu-x = self.mouse-x + self.absolute-position.x;
@@ -270,640 +581,213 @@ export component AppWindow inherits Window {
                                             root.context-menu-visible = true;
                                         }
                                     }
-
-                                    log-line := Text {
-                                        x: 6px;
-                                        y: 2px;
-                                        width: parent.width - 12px;
-                                        text: line;
-                                        wrap: word-wrap;
-                                        color: #94a3b8;
-                                        font-size: 11px;
-                                    }
+                                    log-line := Text { x: 8px; y: 6px; width: parent.width - 16px; text: line; wrap: word-wrap; color: #8ba596; font-size: 11px; }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
 
-        if (root.active-tab == 3) : Rectangle {
-            background: root.theme-window-color;
-            border-radius: 8px;
-            border-width: 1px;
-            border-color: #313244;
-            vertical-stretch: 1;
-
-            VerticalBox {
-                padding: 20px;
+            if root.active-tab == 3 : VerticalBox {
+                padding: 28px;
                 spacing: 12px;
+                PageTitle { title: "Settings"; subtitle: root.settings-dirty ? "You have unsaved changes." : "Settings are up to date."; }
 
-                Text {
-                    text: "Settings";
-                    font-size: 24px;
-                    font-weight: 700;
-                    color: root.theme-title-color;
-                }
-
-                Rectangle {
+                VerticalBox {
+                    spacing: 12px;
                     vertical-stretch: 1;
-                    border-width: 0px;
 
-                    ScrollView {
-                        x: 0px;
-                        y: 0px;
-                        width: parent.width;
-                        height: parent.height;
+                    Rectangle {
+                        height: 76px;
+                        border-radius: 12px;
+                        background: #081911;
+                        border-width: 1px;
+                        border-color: #173829;
+                        HorizontalBox {
+                            padding: 10px;
+                            spacing: 4px;
+                            NavItem { width: 136px; icon: @image-url("../assets/icons/general.svg"); label: "General"; detail: "Input & startup"; selected: root.settings-tab == 0; accent: root.theme-button-accent-color; activated => { root.settings-tab = 0; } }
+                            NavItem { width: 136px; icon: @image-url("../assets/icons/speech.svg"); label: "Speech engine"; detail: "Provider & model"; selected: root.settings-tab == 1; accent: root.theme-button-accent-color; activated => { root.settings-tab = 1; } }
+                            NavItem { width: 136px; icon: @image-url("../assets/icons/rewrite.svg"); label: "Text rewriting"; detail: "Gemini cleanup"; selected: root.settings-tab == 2; accent: root.theme-button-accent-color; activated => { root.settings-tab = 2; } }
+                            NavItem { width: 136px; icon: @image-url("../assets/icons/appearance.svg"); label: "Appearance"; detail: "Theme & overlay"; selected: root.settings-tab == 3; accent: root.theme-button-accent-color; activated => { root.settings-tab = 3; } }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                        }
+                    }
 
-                        VerticalBox {
-                            spacing: 12px;
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        vertical-stretch: 1;
+                        border-radius: 12px;
+                        background: root.theme-window-color;
+                        border-width: 1px;
+                        border-color: #193b2b;
+                        clip: true;
 
+                        if root.settings-tab == 0 : ScrollView {
+                            x: 20px; y: 18px; width: parent.width - 40px; height: parent.height - 36px;
                             VerticalBox {
-                                spacing: 8px;
+                                spacing: 13px;
+                                SectionTitle { title: "Input and shortcuts"; subtitle: "Choose where audio comes from and how recording starts."; }
+                                Text { text: "Microphone"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                ComboBox { model: root.microphone-options; current-value <=> root.selected-microphone; enabled: !root.use-default-microphone; }
+                                Text { text: "Windows default: " + root.default-microphone-text; color: #738e7e; font-size: 10px; wrap: word-wrap; }
+                                CheckBox { text: "Follow the Windows default microphone"; checked <=> root.use-default-microphone; }
 
-                                Text {
-                                    text: "Transcription Provider";
-                                    font-size: 18px;
-                                    font-weight: 600;
-                                    color: root.theme-title-color;
+                                Rectangle { height: 1px; background: #1c3a2a; }
+                                Text { text: "Global recording hotkey"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                HorizontalBox {
+                                    spacing: 10px;
+                                    Rectangle {
+                                        horizontal-stretch: 1; height: 38px; border-radius: 7px; background: #091911; border-width: 1px; border-color: #294938;
+                                        Text { x: 12px; width: parent.width - 24px; height: parent.height; text: root.hotkey-text; color: root.theme-text-color; vertical-alignment: center; }
+                                    }
+                                    Button { text: "Change hotkey"; clicked => { root.start-hotkey-capture(); } }
+                                }
+                                Text { text: "The hotkey works while Echo is running in the background."; color: #738e7e; font-size: 10px; }
+
+                                Rectangle { height: 1px; background: #1c3a2a; }
+                                SectionTitle { title: "Startup"; subtitle: "Keep speech capture available after signing in."; }
+                                CheckBox { text: "Start Echo when I sign in to Windows"; checked <=> root.start-with-windows; }
+                            }
+                        }
+
+                        if root.settings-tab == 1 : ScrollView {
+                            x: 20px; y: 18px; width: parent.width - 40px; height: parent.height - 36px;
+                            VerticalBox {
+                                spacing: 12px;
+                                SectionTitle { title: "Speech engine"; subtitle: "Choose one transcription provider. Only relevant options are shown."; }
+                                Text { text: "Provider"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                ComboBox { model: root.transcription-provider-options; current-value <=> root.transcription-provider-text; }
+
+                                if root.transcription-provider-text == "ElevenLabs Realtime" : VerticalBox {
+                                    spacing: 10px;
+                                    Rectangle { height: 1px; background: #1c3a2a; }
+                                    SectionTitle { title: "ElevenLabs Realtime"; subtitle: "Low-latency cloud transcription."; }
+                                    Text { text: "API key"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                    LineEdit { text <=> root.api-key-text; placeholder-text: "sk_..."; input-type: password; }
+                                    Text { text: "Model"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                    LineEdit { text <=> root.elevenlabs-model-text; placeholder-text: "scribe_v2_realtime"; }
+                                    Text { text: "Language code"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                    LineEdit { text <=> root.elevenlabs-language-code-text; placeholder-text: "en"; }
+                                    CheckBox { text: "Clean filler words and disfluencies"; checked <=> root.elevenlabs-no-verbatim; }
                                 }
 
-                                VerticalBox {
-                                    spacing: 5px;
-                                    Text {
-                                        text: "Provider";
-                                        color: #bac2de;
-                                        wrap: word-wrap;
+                                if root.transcription-provider-text == "OpenAI Realtime Whisper" : VerticalBox {
+                                    spacing: 10px;
+                                    Rectangle { height: 1px; background: #1c3a2a; }
+                                    SectionTitle { title: "OpenAI Realtime Whisper"; subtitle: "Streaming cloud transcription through OpenAI."; }
+                                    Text { text: "API key"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                    LineEdit { text <=> root.openai-api-key-text; placeholder-text: "sk-..."; input-type: password; }
+                                    Text { text: "Model"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                    LineEdit { text <=> root.openai-model-text; placeholder-text: "gpt-realtime-whisper"; }
+                                    Text { text: "Language code"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                    LineEdit { text <=> root.openai-language-code-text; placeholder-text: "en"; }
+                                }
+
+                                if root.transcription-provider-text == "Local CPU - Parakeet" : VerticalBox {
+                                    spacing: 10px;
+                                    Rectangle { height: 1px; background: #1c3a2a; }
+                                    SectionTitle { title: "Local CPU — Sherpa ONNX"; subtitle: "Private, offline transcription using Parakeet and Silero VAD."; }
+                                    Rectangle {
+                                        height: 58px; border-radius: 8px; background: #0b2418; border-width: 1px; border-color: #245038;
+                                        Text { x: 12px; y: 9px; text: "Runs entirely on this computer"; color: #b9edca; font-size: 12px; font-weight: 700; }
+                                        Text { x: 12px; y: 30px; width: parent.width - 24px; text: "No API key or network connection is required after the model is installed."; color: #71917d; font-size: 10px; overflow: elide; }
                                     }
-                                    ComboBox {
-                                        model: root.transcription-provider-options;
-                                        current-value <=> root.transcription-provider-text;
+                                    LabeledSlider { label: "CPU threads"; hint: "More threads can reduce latency but increase CPU use."; minimum: 1; maximum: root.local-max-cpu-threads; step: 1; value <=> root.local-cpu-threads; }
+                                    LabeledSlider { label: "Speech sensitivity"; hint: "Lower values detect quieter speech and more background noise."; minimum: 0.1; maximum: 0.9; value <=> root.local-vad-threshold; }
+                                    CheckBox { text: "Re-decode the full session when recording stops"; checked <=> root.local-redecode-full-session; }
+                                    Button { text: root.local-advanced-visible ? "Hide advanced settings" : "Show advanced settings"; clicked => { root.local-advanced-visible = !root.local-advanced-visible; } }
+                                    if root.local-advanced-visible : VerticalBox {
+                                        spacing: 5px;
+                                        LabeledSlider { label: "End-of-speech pause (ms)"; hint: "Silence required before a phrase becomes stable."; minimum: 100; maximum: 3000; value <=> root.local-silence-ms; }
+                                        LabeledSlider { label: "Pre-roll (ms)"; hint: "Audio retained before speech is detected."; minimum: 0; maximum: 1000; value <=> root.local-pre-roll-ms; }
+                                        LabeledSlider { label: "Post-roll (ms)"; hint: "Audio retained after speech ends."; minimum: 0; maximum: 1000; value <=> root.local-post-roll-ms; }
+                                        LabeledSlider { label: "Minimum speech (ms)"; hint: "Shorter sounds are ignored."; minimum: 50; maximum: 2000; value <=> root.local-min-speech-ms; }
+                                        LabeledSlider { label: "Maximum phrase (seconds)"; hint: "Long speech is split without stopping recording."; minimum: 5; maximum: 120; value <=> root.local-max-segment-seconds; }
+                                        LabeledSlider { label: "Provisional refresh (ms)"; hint: "Short intervals update sooner and consume more CPU."; minimum: 250; maximum: 5000; value <=> root.local-partial-interval-ms; }
+                                        Button {
+                                            text: "Reset local defaults";
+                                            clicked => {
+                                                root.local-cpu-threads = Math.round(Math.max(1, Math.min(4, root.local-max-cpu-threads / 2)));
+                                                root.local-vad-threshold = 0.5;
+                                                root.local-silence-ms = 600;
+                                                root.local-pre-roll-ms = 250;
+                                                root.local-post-roll-ms = 150;
+                                                root.local-min-speech-ms = 200;
+                                                root.local-max-segment-seconds = 30;
+                                                root.local-partial-interval-ms = 1000;
+                                                root.local-redecode-full-session = false;
+                                            }
+                                        }
                                     }
                                 }
+                            }
+                        }
+
+                        if root.settings-tab == 2 : ScrollView {
+                            x: 20px; y: 18px; width: parent.width - 40px; height: parent.height - 36px;
+                            VerticalBox {
+                                spacing: 12px;
+                                SectionTitle { title: "Gemini text rewriting"; subtitle: "Optionally polish the transcript before it is pasted."; }
+                                CheckBox { text: "Rewrite completed transcripts with Gemini"; checked <=> root.use-gemini-modifier; }
+                                Rectangle {
+                                    height: 54px; border-radius: 8px; background: #0b2117; border-width: 1px; border-color: #1d422f;
+                                    Text { x: 12px; y: 9px; text: root.use-gemini-modifier ? "Rewriting is enabled" : "Rewriting is disabled"; color: root.use-gemini-modifier ? #a8e9bd : #9aafa1; font-size: 12px; font-weight: 700; }
+                                    Text { x: 12px; y: 29px; text: "Your original transcript remains available in history."; color: #6d8878; font-size: 10px; }
+                                }
+                                Text { text: "Gemini API key"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                LineEdit { text <=> root.gemini-api-key-text; placeholder-text: "AIza..."; input-type: password; enabled: root.use-gemini-modifier; }
+                                Text { text: "Model"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                LineEdit { text <=> root.gemini-model-text; placeholder-text: "gemini-3.1-flash-lite-preview"; enabled: root.use-gemini-modifier; }
+                                Text { text: "Rewrite style"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                ComboBox { model: root.gemini-preset-options; current-value <=> root.selected-gemini-preset; enabled: root.use-gemini-modifier; }
+                                if root.selected-gemini-preset == "Custom" : VerticalBox {
+                                    spacing: 7px;
+                                    Text { text: "Custom instruction"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                    LineEdit { text <=> root.gemini-custom-prompt; placeholder-text: "Describe how Gemini should rewrite your text"; enabled: root.use-gemini-modifier; }
+                                }
+                            }
+                        }
+
+                        if root.settings-tab == 3 : ScrollView {
+                            x: 20px; y: 18px; width: parent.width - 40px; height: parent.height - 36px;
+                            VerticalBox {
+                                spacing: 13px;
+                                SectionTitle { title: "Appearance"; subtitle: "Choose a palette and tune the live transcription overlay."; }
+                                Text { text: "Color palette"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                HorizontalBox {
+                                    spacing: 10px;
+                                    ColorChoice {
+                                        label: "Forest green palette"; choice-color: #4ade80; selected: root.theme-button-accent-color == #4ade80;
+                                        chosen => { root.theme-background-top-color=#02140b; root.theme-background-bottom-color=#000806; root.theme-window-color=#041b11; root.theme-button-accent-color=#4ade80; root.theme-title-color=#e4ffe9; root.theme-text-color=#ccefd6; root.overlay-background-color=#03150c; root.overlay-text-color=#e6fff0; }
+                                    }
+                                    ColorChoice {
+                                        label: "Ocean blue palette"; choice-color: #38bdf8; selected: root.theme-button-accent-color == #38bdf8;
+                                        chosen => { root.theme-background-top-color=#071523; root.theme-background-bottom-color=#030811; root.theme-window-color=#091b2a; root.theme-button-accent-color=#38bdf8; root.theme-title-color=#e0f2fe; root.theme-text-color=#c7e8f8; root.overlay-background-color=#061827; root.overlay-text-color=#e0f2fe; }
+                                    }
+                                    ColorChoice {
+                                        label: "Violet palette"; choice-color: #a78bfa; selected: root.theme-button-accent-color == #a78bfa;
+                                        chosen => { root.theme-background-top-color=#170f27; root.theme-background-bottom-color=#08050f; root.theme-window-color=#1a1029; root.theme-button-accent-color=#a78bfa; root.theme-title-color=#f1eaff; root.theme-text-color=#ded2f6; root.overlay-background-color=#160d24; root.overlay-text-color=#f1eaff; }
+                                    }
+                                    ColorChoice {
+                                        label: "Rose palette"; choice-color: #fb7185; selected: root.theme-button-accent-color == #fb7185;
+                                        chosen => { root.theme-background-top-color=#251015; root.theme-background-bottom-color=#0e0507; root.theme-window-color=#281217; root.theme-button-accent-color=#fb7185; root.theme-title-color=#fff1f2; root.theme-text-color=#f7d4d9; root.overlay-background-color=#240e14; root.overlay-text-color=#fff1f2; }
+                                    }
+                                }
+                                Rectangle { height: 1px; background: #1c3a2a; }
+                                Text { text: "Overlay opacity: " + root.overlay-opacity; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                Slider { minimum: 0.3; maximum: 1.0; value <=> root.overlay-opacity; }
+                                Text { text: "The overlay remains movable and always on top while transcription is active."; color: #718c7c; font-size: 10px; wrap: word-wrap; }
 
                                 Rectangle {
-                                    border-width: 1px;
-                                    border-color: #313244;
-                                    border-radius: 8px;
-                                    background: #00000000;
-
-                                    VerticalBox {
-                                        padding: 12px;
-                                        spacing: 8px;
-
-                                        Text {
-                                            text: "ElevenLabs";
-                                            font-size: 16px;
-                                            font-weight: 600;
-                                            color: root.theme-title-color;
-                                        }
-
-                                        VerticalBox {
-                                            spacing: 5px;
-                                            Text {
-                                                text: "API Key";
-                                                color: #bac2de;
-                                                wrap: word-wrap;
-                                            }
-                                            api-key-input := LineEdit {
-                                                text <=> root.api-key-text;
-                                                placeholder-text: "sk_...";
-                                                input-type: password;
-                                            }
-                                        }
-
-                                        VerticalBox {
-                                            spacing: 5px;
-                                            Text {
-                                                text: "Model";
-                                                color: #bac2de;
-                                                wrap: word-wrap;
-                                            }
-                                            LineEdit {
-                                                text <=> root.elevenlabs-model-text;
-                                                placeholder-text: "scribe_v2_realtime";
-                                            }
-                                        }
-
-                                        HorizontalBox {
-                                            spacing: 8px;
-
-                                            VerticalBox {
-                                                spacing: 5px;
-                                                Text {
-                                                    text: "Language";
-                                                    color: #bac2de;
-                                                    wrap: word-wrap;
-                                                }
-                                                LineEdit {
-                                                    text <=> root.elevenlabs-language-code-text;
-                                                    placeholder-text: "en";
-                                                }
-                                            }
-
-                                            CheckBox {
-                                                text: "Clean verbatim speech";
-                                                checked <=> root.elevenlabs-no-verbatim;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                Rectangle {
-                                    border-width: 1px;
-                                    border-color: #313244;
-                                    border-radius: 8px;
-                                    background: #00000000;
-
-                                    VerticalBox {
-                                        padding: 12px;
-                                        spacing: 8px;
-
-                                        Text {
-                                            text: "OpenAI";
-                                            font-size: 16px;
-                                            font-weight: 600;
-                                            color: root.theme-title-color;
-                                        }
-
-                                        VerticalBox {
-                                            spacing: 5px;
-                                            Text {
-                                                text: "API Key";
-                                                color: #bac2de;
-                                                wrap: word-wrap;
-                                            }
-                                            LineEdit {
-                                                text <=> root.openai-api-key-text;
-                                                placeholder-text: "sk-...";
-                                                input-type: password;
-                                            }
-                                        }
-
-                                        VerticalBox {
-                                            spacing: 5px;
-                                            Text {
-                                                text: "Model";
-                                                color: #bac2de;
-                                                wrap: word-wrap;
-                                            }
-                                            LineEdit {
-                                                text <=> root.openai-model-text;
-                                                placeholder-text: "gpt-realtime-whisper";
-                                            }
-                                        }
-
-                                        VerticalBox {
-                                            spacing: 5px;
-                                            Text {
-                                                text: "Language";
-                                                color: #bac2de;
-                                                wrap: word-wrap;
-                                            }
-                                            LineEdit {
-                                                text <=> root.openai-language-code-text;
-                                                placeholder-text: "en";
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            Rectangle {
-                                height: 1px;
-                                horizontal-stretch: 1;
-                                background: #313244;
-                            }
-
-                            VerticalBox {
-                                spacing: 5px;
-                                Text {
-                                    text: "Default Microphone: " + root.default-microphone-text;
-                                    color: #9399b2;
-                                    wrap: word-wrap;
-                                }
-                                use-default := CheckBox {
-                                    text: "Use default microphone";
-                                    checked <=> root.use-default-microphone;
-                                }
-                            }
-
-                            VerticalBox {
-                                spacing: 5px;
-                                Text {
-                                    text: "Microphone";
-                                    color: #bac2de;
-                                }
-                                mic-combo := ComboBox {
-                                    model: root.microphone-options;
-                                    current-value <=> root.selected-microphone;
-                                    enabled: !use-default.checked;
-                                }
-                            }
-
-                            VerticalBox {
-                                spacing: 5px;
-                                Text {
-                                    text: "Hotkey (example: Ctrl+Space, Ctrl+Shift+F8)";
-                                    color: #bac2de;
-                                    wrap: word-wrap;
-                                }
-                                HorizontalBox {
-                                    spacing: 8px;
-                                    Text {
-                                        text: root.hotkey-text;
-                                        color: root.theme-text-color;
-                                        vertical-alignment: center;
-                                        wrap: word-wrap;
-                                    }
-                                    Button {
-                                        text: "Set Hotkey";
-                                        clicked => {
-                                            root.start-hotkey-capture();
-                                        }
-                                    }
-                                }
-                            }
-
-                            Rectangle {
-                                height: 1px;
-                                horizontal-stretch: 1;
-                                background: #313244;
-                            }
-
-                            VerticalBox {
-                                spacing: 8px;
-
-                                Text {
-                                    text: "Gemini Text Rewriter";
-                                    font-size: 18px;
-                                    font-weight: 600;
-                                    color: root.theme-title-color;
-                                }
-
-                                use-gemini := CheckBox {
-                                    text: "Enable Gemini text modification before injection";
-                                    checked <=> root.use-gemini-modifier;
-                                }
-
-                                VerticalBox {
-                                    spacing: 5px;
-                                    Text {
-                                        text: "Gemini API Key";
-                                        color: #bac2de;
-                                        wrap: word-wrap;
-                                    }
-                                    LineEdit {
-                                        text <=> root.gemini-api-key-text;
-                                        placeholder-text: "AIza...";
-                                        input-type: password;
-                                        enabled: use-gemini.checked;
-                                    }
-                                }
-
-                                VerticalBox {
-                                    spacing: 5px;
-                                    Text {
-                                        text: "Gemini Model";
-                                        color: #bac2de;
-                                        wrap: word-wrap;
-                                    }
-                                    LineEdit {
-                                        text <=> root.gemini-model-text;
-                                        placeholder-text: "gemini-3.1-flash-lite-preview";
-                                        enabled: use-gemini.checked;
-                                    }
-                                }
-
-                                VerticalBox {
-                                    spacing: 5px;
-                                    Text {
-                                        text: "Rewrite style";
-                                        color: #bac2de;
-                                        wrap: word-wrap;
-                                    }
-                                    ComboBox {
-                                        model: root.gemini-preset-options;
-                                        current-value <=> root.selected-gemini-preset;
-                                        enabled: use-gemini.checked;
-                                    }
-                                }
-
-                                VerticalBox {
-                                    spacing: 5px;
-                                    Text {
-                                        text: "Custom prompt (used when preset is \"Custom\")";
-                                        color: #bac2de;
-                                        wrap: word-wrap;
-                                    }
-                                    LineEdit {
-                                        text <=> root.gemini-custom-prompt;
-                                        placeholder-text: "Describe how Gemini should rewrite your text";
-                                        enabled: use-gemini.checked && root.selected-gemini-preset == "Custom";
-                                    }
-                                }
-                            }
-
-                            Rectangle {
-                                height: 1px;
-                                horizontal-stretch: 1;
-                                background: #313244;
-                            }
-
-                            VerticalBox {
-                                spacing: 8px;
-
-                                Text {
-                                    text: "Overlay & Theme";
-                                    font-size: 18px;
-                                    font-weight: 600;
-                                    color: root.theme-title-color;
-                                }
-
-                                HorizontalBox {
-                                    spacing: 8px;
-                                    Text {
-                                        text: "Overlay transparency";
-                                        color: #bac2de;
-                                        vertical-alignment: center;
-                                        wrap: word-wrap;
-                                    }
-                                    Slider {
-                                        minimum: 0.3;
-                                        maximum: 1.0;
-                                        value <=> root.overlay-opacity;
-                                    }
-                                }
-
-                                HorizontalBox {
-                                    spacing: 8px;
-                                    Text {
-                                        text: "Background gradient (top)";
-                                        color: #bac2de;
-                                        wrap: word-wrap;
-                                    }
-                                    HorizontalBox {
-                                        spacing: 4px;
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #02140b;
-                                            TouchArea { clicked => { root.theme-background-top-color = #02140b; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #042418;
-                                            TouchArea { clicked => { root.theme-background-top-color = #042418; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #064e2a;
-                                            TouchArea { clicked => { root.theme-background-top-color = #064e2a; } }
-                                        }
-                                    }
-                                }
-
-                                HorizontalBox {
-                                    spacing: 8px;
-                                    Text {
-                                        text: "Background gradient (bottom)";
-                                        color: #bac2de;
-                                        wrap: word-wrap;
-                                    }
-                                    HorizontalBox {
-                                        spacing: 4px;
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #000806;
-                                            TouchArea { clicked => { root.theme-background-bottom-color = #000806; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #02140b;
-                                            TouchArea { clicked => { root.theme-background-bottom-color = #02140b; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #042418;
-                                            TouchArea { clicked => { root.theme-background-bottom-color = #042418; } }
-                                        }
-                                    }
-                                }
-
-                                HorizontalBox {
-                                    spacing: 8px;
-                                    Text {
-                                        text: "Window color";
-                                        color: #bac2de;
-                                        wrap: word-wrap;
-                                    }
-                                    HorizontalBox {
-                                        spacing: 4px;
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #041b11;
-                                            TouchArea { clicked => { root.theme-window-color = #041b11; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #02140b;
-                                            TouchArea { clicked => { root.theme-window-color = #02140b; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #06351f;
-                                            TouchArea { clicked => { root.theme-window-color = #06351f; } }
-                                        }
-                                    }
-                                }
-
-                                HorizontalBox {
-                                    spacing: 8px;
-                                    Text {
-                                        text: "Accent / button color";
-                                        color: #bac2de;
-                                        wrap: word-wrap;
-                                    }
-                                    HorizontalBox {
-                                        spacing: 4px;
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #4ade80;
-                                            TouchArea { clicked => { root.theme-button-accent-color = #4ade80; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #22c55e;
-                                            TouchArea { clicked => { root.theme-button-accent-color = #22c55e; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #16a34a;
-                                            TouchArea { clicked => { root.theme-button-accent-color = #16a34a; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #15803d;
-                                            TouchArea { clicked => { root.theme-button-accent-color = #15803d; } }
-                                        }
-                                    }
-                                }
-
-                                HorizontalBox {
-                                    spacing: 8px;
-                                    Text {
-                                        text: "Title bar color";
-                                        color: #bac2de;
-                                        wrap: word-wrap;
-                                    }
-                                    HorizontalBox {
-                                        spacing: 4px;
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #e4ffe9;
-                                            TouchArea { clicked => { root.theme-title-color = #e4ffe9; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #ccefd6;
-                                            TouchArea { clicked => { root.theme-title-color = #ccefd6; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #bbdec6;
-                                            TouchArea { clicked => { root.theme-title-color = #bbdec6; } }
-                                        }
-                                    }
-                                }
-
-                                HorizontalBox {
-                                    spacing: 8px;
-                                    Text {
-                                        text: "Text color";
-                                        color: #bac2de;
-                                        wrap: word-wrap;
-                                    }
-                                    HorizontalBox {
-                                        spacing: 4px;
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #ccefd6;
-                                            TouchArea { clicked => { root.theme-text-color = #ccefd6; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #b7e2c5;
-                                            TouchArea { clicked => { root.theme-text-color = #b7e2c5; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #e6fff0;
-                                            TouchArea { clicked => { root.theme-text-color = #e6fff0; } }
-                                        }
-                                    }
-                                }
-
-                                HorizontalBox {
-                                    spacing: 8px;
-                                    Text {
-                                        text: "Overlay background";
-                                        color: #bac2de;
-                                        wrap: word-wrap;
-                                    }
-                                    HorizontalBox {
-                                        spacing: 4px;
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #03150c;
-                                            TouchArea { clicked => { root.overlay-background-color = #03150c; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #02140b;
-                                            TouchArea { clicked => { root.overlay-background-color = #02140b; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #042418;
-                                            TouchArea { clicked => { root.overlay-background-color = #042418; } }
-                                        }
-                                    }
-                                }
-
-                                HorizontalBox {
-                                    spacing: 8px;
-                                    Text {
-                                        text: "Overlay text color";
-                                        color: #bac2de;
-                                        wrap: word-wrap;
-                                    }
-                                    HorizontalBox {
-                                        spacing: 4px;
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #e6fff0;
-                                            TouchArea { clicked => { root.overlay-text-color = #e6fff0; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #ccefd6;
-                                            TouchArea { clicked => { root.overlay-text-color = #ccefd6; } }
-                                        }
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            border-radius: 4px;
-                                            background: #ffffff;
-                                            TouchArea { clicked => { root.overlay-text-color = #ffffff; } }
-                                        }
+                                    height: 116px; border-radius: 10px; background: #07140e; border-width: 1px; border-color: #244534;
+                                    Text { x: 14px; y: 12px; text: "Overlay preview"; color: #779383; font-size: 10px; }
+                                    Rectangle {
+                                        x: 14px; y: 35px; width: parent.width - 28px; height: 64px; border-radius: 8px;
+                                        background: root.overlay-background-color; opacity: root.overlay-opacity; border-width: 1px; border-color: #3b5848;
+                                        Text { x: 12px; y: 10px; text: "Live"; color: root.theme-button-accent-color; font-size: 10px; }
+                                        Text { x: 12px; y: 29px; text: "Your words will appear here as you speak."; color: root.overlay-text-color; font-size: 12px; }
                                     }
                                 }
                             }
@@ -912,58 +796,94 @@ export component AppWindow inherits Window {
                 }
 
                 HorizontalBox {
-                    spacing: 10px;
-                    Button {
-                        text: "Apply";
-                        primary: true;
-                        clicked => {
-                            root.apply-settings();
-                        }
-                    }
+                    height: 40px;
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Button { text: "Save settings"; primary: true; clicked => { root.apply-settings(); } }
                 }
             }
         }
     }
 
-    if root.context-menu-visible : Rectangle {
-        x: 0;
-        y: 0;
-        width: root.width;
-        height: root.height;
-
-        TouchArea {
-            clicked => { root.context-menu-visible = false; }
-        }
-
+    if root.local-download-prompt-visible || root.local-download-progress-visible : Rectangle {
+        x: 0; y: 0; width: root.width; height: root.height; background: #000000b8;
+        TouchArea { clicked => {} }
         Rectangle {
-            x: root.context-menu-x;
-            y: root.context-menu-y;
-            width: 160px;
-            height: 32px;
-            background: #1e293b;
-            border-radius: 6px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 540px;
+            height: root.local-download-progress-visible ? 218px : 276px;
+            background: #0b2117;
+            border-color: #2a5a40;
             border-width: 1px;
-            border-color: #334155;
-            drop-shadow-blur: 8px;
+            border-radius: 14px;
+            drop-shadow-blur: 18px;
             drop-shadow-color: #00000080;
 
+            VerticalBox {
+                padding: 24px;
+                spacing: 13px;
+                Text { text: root.local-download-progress-visible ? "Installing local speech" : "Install local speech files?"; color: #edfff2; font-size: 21px; font-weight: 700; }
+                if root.local-download-prompt-visible && root.local-download-error != "" : Text { text: root.local-download-error; color: #fda4af; wrap: word-wrap; }
+                Text {
+                    text: root.local-download-progress-visible ? root.local-download-status : "Offline transcription requires about 461 MB of downloads and 665 MB of disk space. Echo will download and verify Parakeet and Silero automatically.";
+                    color: #a9c3b2; wrap: word-wrap; font-size: 12px;
+                }
+                if root.local-download-progress-visible : Rectangle {
+                    height: 14px; background: #193427; border-radius: 7px;
+                    Rectangle { width: parent.width * Math.max(0, Math.min(1, root.local-download-progress)); height: parent.height; background: root.theme-button-accent-color; border-radius: 7px; animate width { duration: 100ms; } }
+                }
+                if !root.local-download-progress-visible : HorizontalBox {
+                    spacing: 10px;
+                    Button { text: "Download and install"; primary: true; clicked => { root.accept-local-model-download(); } }
+                    Button { text: "Not now"; clicked => { root.decline-local-model-download(); } }
+                }
+            }
+        }
+    }
+
+    if root.unsaved-settings-prompt-visible : Rectangle {
+        x: 0; y: 0; width: root.width; height: root.height; background: #000000b8;
+        TouchArea { clicked => {} }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 500px;
+            height: 230px;
+            background: #0b2117;
+            border-color: #2a5a40;
+            border-width: 1px;
+            border-radius: 14px;
+            drop-shadow-blur: 18px;
+            drop-shadow-color: #00000080;
+
+            VerticalBox {
+                padding: 24px;
+                spacing: 14px;
+                Text { text: "Save settings changes?"; color: #edfff2; font-size: 21px; font-weight: 700; }
+                Text { text: "You changed one or more settings. Save them before leaving this page?"; color: #a9c3b2; wrap: word-wrap; font-size: 12px; }
+                HorizontalBox {
+                    spacing: 10px;
+                    Button { text: "Save"; primary: true; clicked => { root.save-unsaved-settings(); } }
+                    Button { text: "Don't save"; clicked => { root.discard-unsaved-settings(); } }
+                    Button { text: "Cancel"; clicked => { root.cancel-unsaved-settings(); } }
+                }
+            }
+        }
+    }
+
+    if root.context-menu-visible && !root.local-download-prompt-visible && !root.local-download-progress-visible && !root.unsaved-settings-prompt-visible : Rectangle {
+        x: 0; y: 0; width: root.width; height: root.height;
+        TouchArea { clicked => { root.context-menu-visible = false; } }
+        Rectangle {
+            x: root.context-menu-x; y: root.context-menu-y; width: 170px; height: 38px;
+            background: #12291d; border-radius: 7px; border-width: 1px; border-color: #31523f;
             TouchArea {
                 clicked => {
-                    if root.context-menu-is-log {
-                        root.copy-log-item(root.context-menu-index);
-                    } else {
-                        root.copy-transcript(root.context-menu-index);
-                    }
+                    if root.context-menu-is-log { root.copy-log-item(root.context-menu-index); }
+                    else { root.copy-transcript(root.context-menu-index); }
                     root.context-menu-visible = false;
                 }
-
-                Text {
-                    x: 12px;
-                    y: 6px;
-                    text: "Copy to clipboard";
-                    color: #e2e8f0;
-                    font-size: 13px;
-                }
+                Text { x: 12px; width: parent.width - 24px; height: parent.height; text: "Copy to clipboard"; color: #e2f5e8; font-size: 12px; vertical-alignment: center; }
             }
         }
     }
@@ -972,34 +892,27 @@ export component AppWindow inherits Window {
 export component HotkeyCaptureWindow inherits Window {
     title: "Capture Hotkey";
     icon: @image-url("../eleventhecho.png");
-    width: 360px;
-    height: 180px;
-    background: #1e1e2e;
+    width: 390px;
+    height: 190px;
+    background: #07140e;
 
     in property <string> state-text: "Waiting for key combo...";
     in property <string> combo-text: "";
 
-    VerticalBox {
-        padding: 16px;
-        spacing: 10px;
-
-        Text {
-            text: root.state-text;
-            color: #cdd6f4;
-            wrap: word-wrap;
-        }
-
-        Text {
-            text: root.combo-text;
-            color: #a6e3a1;
-            font-size: 18px;
-            font-weight: 700;
+    Rectangle {
+        x: 16px; y: 16px; width: parent.width - 32px; height: parent.height - 32px;
+        border-radius: 12px; background: #0b2117; border-width: 1px; border-color: #28513a;
+        VerticalBox {
+            padding: 20px; spacing: 12px;
+            Text { text: "Press your shortcut"; color: #effff3; font-size: 19px; font-weight: 700; }
+            Text { text: root.state-text; color: #91aa9b; wrap: word-wrap; }
+            Text { text: root.combo-text == "" ? "Waiting…" : root.combo-text; color: #4ade80; font-size: 18px; font-weight: 700; }
         }
     }
 }
 
 export component TranscriptOverlayWindow inherits Window {
-    title: "11th Echo Live";
+    title: "Echo Live";
     icon: @image-url("../eleventhecho.png");
     no-frame: true;
     always-on-top: true;
@@ -1020,45 +933,18 @@ export component TranscriptOverlayWindow inherits Window {
     callback move-window(int, int);
 
     TouchArea {
-        width: parent.width;
-        height: parent.height;
         moved => {
-            if (self.pressed) {
-                root.move-window(
-                    (self.mouse-x - self.pressed-x) / 1px,
-                    (self.mouse-y - self.pressed-y) / 1px
-                );
+            if self.pressed {
+                root.move-window((self.mouse-x - self.pressed-x) / 1px, (self.mouse-y - self.pressed-y) / 1px);
             }
         }
-
         Rectangle {
-            width: parent.width;
-            height: parent.height;
-            border-radius: 8px;
-            border-width: 1px;
-            border-color: root.is-error ? #f38ba8 : #45475a;
+            width: parent.width; height: parent.height; border-radius: 10px; border-width: 1px;
+            border-color: root.is-error ? #fb7185 : #3a5a48;
             background: root.is-error ? #2b0b14 : root.overlay-background-color;
             opacity: root.overlay-opacity;
-
-            Text {
-                x: 10px;
-                y: 8px;
-                text: root.is-system-message ? "Gemini" : "Live";
-                color: root.is-error ? #f38ba8 : root.is-system-message ? #4ade80 : root.overlay-text-color;
-                font-size: 12px;
-            }
-
-            Text {
-                x: 10px;
-                y: 28px;
-                width: parent.width - 20px;
-                height: parent.height - 36px;
-                text: root.sentence-text;
-                color: root.is-error ? #ffe5e5 : root.is-system-message ? #4ade80 : root.overlay-text-color;
-                wrap: word-wrap;
-                overflow: elide;
-                vertical-alignment: top;
-            }
+            Text { x: 12px; y: 9px; text: root.is-system-message ? "Echo" : "Live"; color: root.is-error ? #fda4af : root.is-system-message ? #4ade80 : root.overlay-text-color; font-size: 11px; font-weight: 700; }
+            Text { x: 12px; y: 31px; width: parent.width - 24px; height: parent.height - 42px; text: root.sentence-text; color: root.is-error ? #ffe4e6 : root.is-system-message ? #86efac : root.overlay-text-color; wrap: word-wrap; overflow: elide; vertical-alignment: top; }
         }
     }
 }
