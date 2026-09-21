@@ -1,0 +1,5 @@
+Parakeet v3, smoother dictation, and safer updates
+- Local CPU transcription now lets you choose Parakeet TDT 0.6B v2 (English) or download Parakeet TDT 0.6B v3 (25 languages). Both are 600M-parameter INT8 transducer models.
+- Opening Echo from the Start menu now requests foreground activation of the existing window, including when it is minimized or hidden.
+- Local transcription supports an end-of-speech pause of up to 10 seconds to keep natural thinking pauses within a phrase.
+- Existing settings are preserved.

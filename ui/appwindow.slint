@@ -1,63 +1,69 @@
-import { Button, VerticalBox, HorizontalBox, LineEdit, ComboBox, CheckBox, ScrollView, Slider } from "std-widgets.slint";
+import { Button, VerticalBox, HorizontalBox, LineEdit, TextEdit, ComboBox, CheckBox, ScrollView, Slider } from "std-widgets.slint";
 
-component NavItem inherits Rectangle {
+component SettingsNavItem inherits Rectangle {
     in property <image> icon;
     in property <string> label;
-    in property <string> detail;
+    in property <string> first-line;
+    in property <string> second-line: "";
     in property <bool> selected: false;
     in property <color> accent: #4ade80;
     callback activated();
 
+    width: 112px;
+    height: 44px;
+    border-radius: 8px;
+    border-width: settings-nav-focus.has-focus ? 1px : 0px;
+    border-color: root.accent;
+    background: root.selected ? #173b2a : settings-nav-touch.has-hover ? #10271d : transparent;
     accessible-role: tab;
     accessible-label: root.label;
     accessible-action-default => { root.activated(); }
 
-    width: 108px;
-    height: 56px;
-    border-radius: 8px;
-    border-width: nav-focus.has-focus ? 1px : 0px;
-    border-color: root.accent;
-    background: root.selected ? #173b2a : touch.has-hover ? #10271d : transparent;
-
     Rectangle {
-        width: parent.width - 20px;
-        height: 3px;
-        x: 10px;
+        x: 6px;
         y: parent.height - 3px;
+        width: parent.width - 12px;
+        height: 3px;
         border-radius: 2px;
         background: root.selected ? root.accent : transparent;
     }
 
     Image {
-        x: 10px;
-        y: 17px;
-        width: 22px;
-        height: 22px;
+        x: 8px;
+        y: (parent.height - self.height) / 2;
+        width: 24px;
+        height: 24px;
         source: root.icon;
         colorize: root.selected ? root.accent : #91aa9b;
         image-fit: contain;
     }
+
     Text {
-        x: 39px;
-        y: 7px;
-        width: parent.width - 47px;
-        text: root.label;
+        x: 40px;
+        y: root.second-line == "" ? 0px : 4px;
+        width: parent.width - 46px;
+        height: root.second-line == "" ? parent.height : 18px;
+        text: root.first-line;
         color: root.selected ? #f0fff4 : #d5e8dc;
-        font-size: 13px;
-        font-weight: root.selected ? 700 : 500;
+        font-size: 14px;
+        font-weight: root.selected ? 700 : 600;
+        vertical-alignment: center;
         overflow: elide;
     }
-    Text {
-        x: 39px;
-        y: 30px;
-        width: parent.width - 47px;
-        text: root.detail;
-        color: #789487;
-        font-size: 10px;
+    if root.second-line != "" : Text {
+        x: 40px;
+        y: 22px;
+        width: parent.width - 46px;
+        height: 18px;
+        text: root.second-line;
+        color: root.selected ? #f0fff4 : #d5e8dc;
+        font-size: 14px;
+        font-weight: root.selected ? 700 : 600;
+        vertical-alignment: center;
         overflow: elide;
     }
 
-    nav-focus := FocusScope {
+    settings-nav-focus := FocusScope {
         width: 0px;
         height: 0px;
         key-pressed(event) => {
@@ -68,9 +74,8 @@ component NavItem inherits Rectangle {
             return reject;
         }
     }
-
-    touch := TouchArea {
-        clicked => { nav-focus.focus(); root.activated(); }
+    settings-nav-touch := TouchArea {
+        clicked => { settings-nav-focus.focus(); root.activated(); }
     }
 }
 
@@ -120,6 +125,7 @@ component LabeledSlider inherits Rectangle {
     in property <float> minimum;
     in property <float> maximum;
     in property <float> step: 0;
+    in property <float> display-divisor: 1;
 
     height: 68px;
     background: transparent;
@@ -128,7 +134,7 @@ component LabeledSlider inherits Rectangle {
         x: 0;
         y: 0;
         width: parent.width;
-        text: root.label + ": " + root.value;
+        text: root.label + ": " + (root.step >= 1 ? Math.round(root.value / root.display-divisor) : root.value / root.display-divisor);
         color: #d6e9dc;
         font-size: 12px;
     }
@@ -145,10 +151,11 @@ component LabeledSlider inherits Rectangle {
         x: 0;
         y: 38px;
         width: parent.width;
-        minimum: root.minimum;
-        maximum: root.maximum;
-        step: root.step;
-        value <=> root.value;
+        minimum: root.minimum / root.display-divisor;
+        maximum: root.maximum / root.display-divisor;
+        step: root.step / root.display-divisor;
+        value: root.value / root.display-divisor;
+        changed(value) => { root.value = value * root.display-divisor; }
     }
 }
 
@@ -182,7 +189,6 @@ export component AppWindow inherits Window {
 
     in-out property <int> active-tab: 0;
     in-out property <int> settings-tab: 0;
-    in-out property <bool> local-advanced-visible: false;
     in-out property <bool> settings-dirty: false;
     in-out property <bool> unsaved-settings-prompt-visible: false;
     in-out property <int> pending-navigation-tab: 0;
@@ -196,12 +202,11 @@ export component AppWindow inherits Window {
 
     in-out property <string> transcript;
     in-out property <[string]> transcript-history;
-    in-out property <[string]> log-items;
+    in-out property <string> activity-log-text;
     in-out property <int> context-menu-index: -1;
     in-out property <bool> context-menu-visible: false;
     in-out property <length> context-menu-x: 0;
     in-out property <length> context-menu-y: 0;
-    in-out property <bool> context-menu-is-log: false;
 
     in-out property <string> api-key-text;
     in-out property <string> elevenlabs-model-text;
@@ -212,10 +217,12 @@ export component AppWindow inherits Window {
     in-out property <string> openai-language-code-text;
     in property <[string]> transcription-provider-options;
     in-out property <string> transcription-provider-text;
+    in property <[string]> local-model-options;
+    in-out property <string> local-model-text;
     in-out property <float> local-cpu-threads: 2;
     in property <float> local-max-cpu-threads: 4;
     in-out property <float> local-vad-threshold: 0.5;
-    in-out property <float> local-silence-ms: 600;
+    in-out property <float> local-silence-ms: 1000;
     in-out property <float> local-pre-roll-ms: 250;
     in-out property <float> local-post-roll-ms: 150;
     in-out property <float> local-min-speech-ms: 200;
@@ -232,8 +239,17 @@ export component AppWindow inherits Window {
     in property <[string]> microphone-options;
     in-out property <string> selected-microphone;
     in-out property <bool> use-default-microphone: true;
+    in-out property <bool> keep-microphone-ready: false;
     in-out property <bool> start-with-windows: false;
-    in property <string> default-microphone-text: "Unknown";
+    in-out property <bool> update-checks-enabled: true;
+    in property <bool> updater-configured: false;
+    in property <string> app-version: "0.0.0";
+    in-out property <string> update-available-version: "";
+    in-out property <string> update-release-notes: "";
+    in-out property <string> update-status: "Updates are checked securely in the background.";
+    in-out property <int> update-state: 0;
+    in-out property <float> update-progress: 0;
+    in-out property <bool> update-panel-visible: false;
 
     in-out property <float> overlay-opacity: 0.85;
     in-out property <color> theme-background-top-color: #02140b;
@@ -256,27 +272,28 @@ export component AppWindow inherits Window {
     callback start-hotkey-capture();
     callback clear-transcript();
     callback copy-transcript(int);
-    callback copy-log-item(int);
     callback accept-local-model-download();
     callback decline-local-model-download();
     callback request-navigation(int);
     callback save-unsaved-settings();
     callback discard-unsaved-settings();
     callback cancel-unsaved-settings();
+    callback check-for-updates();
+    callback install-update();
 
     VerticalBox {
         spacing: 0px;
 
         Rectangle {
-            height: 84px;
+            height: 68px;
             background: #07140e;
             border-width: 0px;
 
             HorizontalBox {
                 padding-left: 12px;
                 padding-right: 12px;
-                padding-top: 14px;
-                padding-bottom: 14px;
+                padding-top: 12px;
+                padding-bottom: 12px;
                 spacing: 6px;
 
                 Rectangle {
@@ -284,42 +301,35 @@ export component AppWindow inherits Window {
                     background: transparent;
                     Text {
                         x: 0;
-                        y: 3px;
+                        y: 7px;
                         text: "ECHO";
                         color: root.theme-title-color;
                         font-size: 22px;
                         font-weight: 800;
                         letter-spacing: 2px;
                     }
-                    Text {
-                        x: 0;
-                        y: 34px;
-                        text: "Speech, anywhere";
-                        color: #6f8f7c;
-                        font-size: 10px;
-                    }
                 }
 
-                NavItem {
+                SettingsNavItem {
                     icon: @image-url("../assets/icons/home.svg");
                     label: "Home";
-                    detail: "Capture";
+                    first-line: "Home";
                     selected: root.active-tab == 0;
                     accent: root.theme-button-accent-color;
                     activated => { root.request-navigation(0); }
                 }
-                NavItem {
+                SettingsNavItem {
                     icon: @image-url("../assets/icons/activity.svg");
                     label: "Activity";
-                    detail: "Events";
+                    first-line: "Activity";
                     selected: root.active-tab == 2;
                     accent: root.theme-button-accent-color;
                     activated => { root.request-navigation(2); }
                 }
-                NavItem {
+                SettingsNavItem {
                     icon: @image-url("../assets/icons/settings.svg");
                     label: "Settings";
-                    detail: "Preferences";
+                    first-line: "Settings";
                     selected: root.active-tab == 3;
                     accent: root.theme-button-accent-color;
                     activated => { root.request-navigation(3); }
@@ -328,38 +338,26 @@ export component AppWindow inherits Window {
                 Rectangle { horizontal-stretch: 1; background: transparent; }
 
                 Rectangle {
-                    width: 170px;
-                    border-radius: 9px;
-                    background: #0c2117;
+                    width: root.update-available-version == "" ? 88px : 154px;
+                    border-radius: 8px;
+                    background: root.update-available-version == "" ? #10271c : #174e32;
                     border-width: 1px;
-                    border-color: #183829;
-
-                    Rectangle {
-                        x: 13px;
-                        y: 13px;
-                        width: 10px;
-                        height: 10px;
-                        border-radius: 5px;
-                        background: root.has-error ? #fb7185 : root.is-recording ? root.theme-button-accent-color : root.is-finalizing ? #fbbf24 : #64748b;
-                    }
-                    Text {
-                        x: 32px;
-                        y: 9px;
-                        width: parent.width - 44px;
-                        text: root.status-text;
-                        color: root.has-error ? #fda4af : #d8ebdf;
-                        font-size: 12px;
-                        font-weight: 600;
-                        overflow: elide;
-                    }
-                    Text {
-                        x: 13px;
-                        y: 35px;
-                        width: parent.width - 26px;
-                        text: "Hotkey  " + root.hotkey-text;
-                        color: #789487;
-                        font-size: 10px;
-                        overflow: elide;
+                    border-color: root.update-available-version == "" ? #294938 : root.theme-button-accent-color;
+                    accessible-role: button;
+                    accessible-label: root.update-available-version == "" ? "Echo version " + root.app-version : "Update " + root.update-available-version + " available";
+                    TouchArea {
+                        clicked => { root.update-panel-visible = true; }
+                        Text {
+                            width: parent.width;
+                            height: parent.height;
+                            text: root.update-available-version == "" ? "v" + root.app-version : "Update " + root.update-available-version;
+                            color: root.update-available-version == "" ? #91aa9b : #d8ffe5;
+                            font-size: 11px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
                     }
                 }
             }
@@ -373,8 +371,6 @@ export component AppWindow inherits Window {
             if root.active-tab == 0 : VerticalBox {
                 padding: 28px;
                 spacing: 16px;
-
-                PageTitle { title: "Ready when you are"; subtitle: "Use the hotkey from any application, or start a capture here."; }
 
                 Rectangle {
                     height: 124px;
@@ -460,19 +456,30 @@ export component AppWindow inherits Window {
                     }
 
                     Text {
-                        y: 76px;
+                        y: 72px;
+                        width: parent.width;
+                        text: "Hotkey  " + root.hotkey-text;
+                        horizontal-alignment: center;
+                        color: #91aa9b;
+                        font-size: 12px;
+                        font-weight: 600;
+                        overflow: elide;
+                    }
+
+                    Text {
+                        y: 90px;
                         width: parent.width;
                         text: root.status-text;
                         horizontal-alignment: center;
                         color: root.has-error ? #fb7185 : root.is-recording ? root.theme-button-accent-color : #88a595;
-                        font-size: 12px;
+                        font-size: 11px;
                         font-weight: root.is-recording ? 700 : 500;
                         overflow: elide;
                     }
 
                     Rectangle {
                         x: 24px;
-                        y: 105px;
+                        y: 112px;
                         width: parent.width - 48px;
                         height: 5px;
                         border-radius: 3px;
@@ -535,7 +542,6 @@ export component AppWindow inherits Window {
                                     pointer-event(event) => {
                                         if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
                                             root.context-menu-index = i;
-                                            root.context-menu-is-log = false;
                                             root.context-menu-x = self.mouse-x + self.absolute-position.x;
                                             root.context-menu-y = self.mouse-y + self.absolute-position.y;
                                             root.context-menu-visible = true;
@@ -555,7 +561,8 @@ export component AppWindow inherits Window {
             if root.active-tab == 2 : VerticalBox {
                 padding: 28px;
                 spacing: 14px;
-                PageTitle { title: "Activity"; subtitle: "Connection, recording, and transcription events."; }
+                PageTitle { title: "Activity"; subtitle: "Select and copy any diagnostic text you need."; }
+
                 Rectangle {
                     vertical-stretch: 1;
                     border-radius: 14px;
@@ -563,28 +570,17 @@ export component AppWindow inherits Window {
                     border-width: 1px;
                     border-color: #193b2b;
                     clip: true;
-                    ScrollView {
-                        x: 12px; y: 12px; width: parent.width - 24px; height: parent.height - 24px;
-                        VerticalBox {
-                            spacing: 2px;
-                            for line[i] in root.log-items : Rectangle {
-                                height: log-line.preferred-height + 12px;
-                                vertical-stretch: 0;
-                                background: Math.mod(i, 2) == 0 ? #07140e : #0a1a12;
-                                TouchArea {
-                                    pointer-event(event) => {
-                                        if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
-                                            root.context-menu-index = i;
-                                            root.context-menu-is-log = true;
-                                            root.context-menu-x = self.mouse-x + self.absolute-position.x;
-                                            root.context-menu-y = self.mouse-y + self.absolute-position.y;
-                                            root.context-menu-visible = true;
-                                        }
-                                    }
-                                    log-line := Text { x: 8px; y: 6px; width: parent.width - 16px; text: line; wrap: word-wrap; color: #8ba596; font-size: 11px; }
-                                }
-                            }
-                        }
+                    activity-log-editor := TextEdit {
+                        x: 8px;
+                        y: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height - 16px;
+                        text: root.activity-log-text;
+                        read-only: true;
+                        wrap: no-wrap;
+                        font-family: "Consolas";
+                        font-size: 11px;
+                        placeholder-text: "Diagnostic events will appear here.";
                     }
                 }
             }
@@ -599,18 +595,21 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
 
                     Rectangle {
-                        height: 76px;
+                        height: 68px;
                         border-radius: 12px;
                         background: #081911;
                         border-width: 1px;
                         border-color: #173829;
                         HorizontalBox {
-                            padding: 10px;
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            padding-top: 12px;
+                            padding-bottom: 12px;
                             spacing: 4px;
-                            NavItem { width: 136px; icon: @image-url("../assets/icons/general.svg"); label: "General"; detail: "Input & startup"; selected: root.settings-tab == 0; accent: root.theme-button-accent-color; activated => { root.settings-tab = 0; } }
-                            NavItem { width: 136px; icon: @image-url("../assets/icons/speech.svg"); label: "Speech engine"; detail: "Provider & model"; selected: root.settings-tab == 1; accent: root.theme-button-accent-color; activated => { root.settings-tab = 1; } }
-                            NavItem { width: 136px; icon: @image-url("../assets/icons/rewrite.svg"); label: "Text rewriting"; detail: "Gemini cleanup"; selected: root.settings-tab == 2; accent: root.theme-button-accent-color; activated => { root.settings-tab = 2; } }
-                            NavItem { width: 136px; icon: @image-url("../assets/icons/appearance.svg"); label: "Appearance"; detail: "Theme & overlay"; selected: root.settings-tab == 3; accent: root.theme-button-accent-color; activated => { root.settings-tab = 3; } }
+                            SettingsNavItem { width: 104px; icon: @image-url("../assets/icons/general.svg"); label: "General"; first-line: "General"; selected: root.settings-tab == 0; accent: root.theme-button-accent-color; activated => { root.settings-tab = 0; } }
+                            SettingsNavItem { width: 128px; icon: @image-url("../assets/icons/speech.svg"); label: "Speech engine"; first-line: "Speech"; second-line: "engine"; selected: root.settings-tab == 1; accent: root.theme-button-accent-color; activated => { root.settings-tab = 1; } }
+                            SettingsNavItem { width: 138px; icon: @image-url("../assets/icons/rewrite.svg"); label: "Text rewriting"; first-line: "Text"; second-line: "rewriting"; selected: root.settings-tab == 2; accent: root.theme-button-accent-color; activated => { root.settings-tab = 2; } }
+                            SettingsNavItem { width: 136px; icon: @image-url("../assets/icons/appearance.svg"); label: "Appearance"; first-line: "Appearance"; selected: root.settings-tab == 3; accent: root.theme-button-accent-color; activated => { root.settings-tab = 3; } }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                         }
                     }
@@ -630,9 +629,22 @@ export component AppWindow inherits Window {
                                 spacing: 13px;
                                 SectionTitle { title: "Input and shortcuts"; subtitle: "Choose where audio comes from and how recording starts."; }
                                 Text { text: "Microphone"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                ComboBox { model: root.microphone-options; current-value <=> root.selected-microphone; enabled: !root.use-default-microphone; }
-                                Text { text: "Windows default: " + root.default-microphone-text; color: #738e7e; font-size: 10px; wrap: word-wrap; }
+                                ComboBox {
+                                    model: root.microphone-options;
+                                    current-value <=> root.selected-microphone;
+                                    selected(value) => {
+                                        root.selected-microphone = value;
+                                        root.use-default-microphone = false;
+                                    }
+                                }
                                 CheckBox { text: "Follow the Windows default microphone"; checked <=> root.use-default-microphone; }
+                                CheckBox { text: "Keep microphone active for instant start"; checked <=> root.keep-microphone-ready; }
+                                Text {
+                                    text: "Windows will show the microphone as in use while Echo is running. Echo keeps only the latest 0.5 seconds in memory and sends nothing until transcription starts.";
+                                    color: #738e7e;
+                                    font-size: 10px;
+                                    wrap: word-wrap;
+                                }
 
                                 Rectangle { height: 1px; background: #1c3a2a; }
                                 Text { text: "Global recording hotkey"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
@@ -649,6 +661,15 @@ export component AppWindow inherits Window {
                                 Rectangle { height: 1px; background: #1c3a2a; }
                                 SectionTitle { title: "Startup"; subtitle: "Keep speech capture available after signing in."; }
                                 CheckBox { text: "Start Echo when I sign in to Windows"; checked <=> root.start-with-windows; }
+
+                                Rectangle { height: 1px; background: #1c3a2a; }
+                                SectionTitle { title: "Updates"; subtitle: "Echo verifies update manifests and installers before installation."; }
+                                CheckBox { text: "Automatically check for updates"; checked <=> root.update-checks-enabled; enabled: root.updater-configured; }
+                                HorizontalBox {
+                                    spacing: 10px;
+                                    Button { text: root.update-state == 1 ? "Checking…" : "Check now"; enabled: root.updater-configured && root.update-state != 1 && root.update-state != 3; clicked => { root.check-for-updates(); } }
+                                    Text { text: root.updater-configured ? "Current version " + root.app-version : "Updates are disabled in this development build."; color: #738e7e; font-size: 10px; vertical-alignment: center; }
+                                }
                             }
                         }
 
@@ -689,6 +710,9 @@ export component AppWindow inherits Window {
                                     spacing: 10px;
                                     Rectangle { height: 1px; background: #1c3a2a; }
                                     SectionTitle { title: "Local CPU — Sherpa ONNX"; subtitle: "Private, offline transcription using Parakeet and Silero VAD."; }
+                                    Text { text: "Speech model"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                    ComboBox { model: root.local-model-options; current-value <=> root.local-model-text; }
+                                    Text { text: root.local-model-text == "Parakeet TDT 0.6B v3 — 600M parameters, 25 languages, INT8" ? "Download option: 0.6B-parameter transducer, multilingual (25 languages), INT8 CPU model." : "Current default: 0.6B-parameter transducer, English, INT8 CPU model."; color: #71917d; font-size: 10px; wrap: word-wrap; }
                                     Rectangle {
                                         height: 58px; border-radius: 8px; background: #0b2418; border-width: 1px; border-color: #245038;
                                         Text { x: 12px; y: 9px; text: "Runs entirely on this computer"; color: #b9edca; font-size: 12px; font-weight: 700; }
@@ -697,21 +721,22 @@ export component AppWindow inherits Window {
                                     LabeledSlider { label: "CPU threads"; hint: "More threads can reduce latency but increase CPU use."; minimum: 1; maximum: root.local-max-cpu-threads; step: 1; value <=> root.local-cpu-threads; }
                                     LabeledSlider { label: "Speech sensitivity"; hint: "Lower values detect quieter speech and more background noise."; minimum: 0.1; maximum: 0.9; value <=> root.local-vad-threshold; }
                                     CheckBox { text: "Re-decode the full session when recording stops"; checked <=> root.local-redecode-full-session; }
-                                    Button { text: root.local-advanced-visible ? "Hide advanced settings" : "Show advanced settings"; clicked => { root.local-advanced-visible = !root.local-advanced-visible; } }
-                                    if root.local-advanced-visible : VerticalBox {
+                                    Rectangle { height: 1px; background: #1c3a2a; }
+                                    SectionTitle { title: "Advanced"; subtitle: "Fine-tune speech detection and live transcript updates."; }
+                                    VerticalBox {
                                         spacing: 5px;
-                                        LabeledSlider { label: "End-of-speech pause (ms)"; hint: "Silence required before a phrase becomes stable."; minimum: 100; maximum: 3000; value <=> root.local-silence-ms; }
-                                        LabeledSlider { label: "Pre-roll (ms)"; hint: "Audio retained before speech is detected."; minimum: 0; maximum: 1000; value <=> root.local-pre-roll-ms; }
-                                        LabeledSlider { label: "Post-roll (ms)"; hint: "Audio retained after speech ends."; minimum: 0; maximum: 1000; value <=> root.local-post-roll-ms; }
-                                        LabeledSlider { label: "Minimum speech (ms)"; hint: "Shorter sounds are ignored."; minimum: 50; maximum: 2000; value <=> root.local-min-speech-ms; }
-                                        LabeledSlider { label: "Maximum phrase (seconds)"; hint: "Long speech is split without stopping recording."; minimum: 5; maximum: 120; value <=> root.local-max-segment-seconds; }
-                                        LabeledSlider { label: "Provisional refresh (ms)"; hint: "Short intervals update sooner and consume more CPU."; minimum: 250; maximum: 5000; value <=> root.local-partial-interval-ms; }
+                                        LabeledSlider { label: "End-of-speech pause (seconds)"; hint: "Wait 1 to 10 seconds before splitting at a pause."; minimum: 1000; maximum: 10000; step: 1000; display-divisor: 1000; value <=> root.local-silence-ms; }
+                                        LabeledSlider { label: "Pre-roll (ms)"; hint: "Audio retained before speech is detected."; minimum: 0; maximum: 1000; step: 1; value <=> root.local-pre-roll-ms; }
+                                        LabeledSlider { label: "Post-roll (ms)"; hint: "Audio retained after speech ends."; minimum: 0; maximum: 1000; step: 1; value <=> root.local-post-roll-ms; }
+                                        LabeledSlider { label: "Minimum speech (ms)"; hint: "Shorter sounds are ignored."; minimum: 50; maximum: 2000; step: 1; value <=> root.local-min-speech-ms; }
+                                        LabeledSlider { label: "Maximum phrase (seconds)"; hint: "Long speech is split without stopping recording."; minimum: 5; maximum: 120; step: 1; value <=> root.local-max-segment-seconds; }
+                                        LabeledSlider { label: "Provisional refresh (ms)"; hint: "Short intervals update sooner and consume more CPU."; minimum: 250; maximum: 5000; step: 1; value <=> root.local-partial-interval-ms; }
                                         Button {
                                             text: "Reset local defaults";
                                             clicked => {
                                                 root.local-cpu-threads = Math.round(Math.max(1, Math.min(4, root.local-max-cpu-threads / 2)));
                                                 root.local-vad-threshold = 0.5;
-                                                root.local-silence-ms = 600;
+                                                root.local-silence-ms = 1000;
                                                 root.local-pre-roll-ms = 250;
                                                 root.local-post-roll-ms = 150;
                                                 root.local-min-speech-ms = 200;
@@ -804,7 +829,46 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.local-download-prompt-visible || root.local-download-progress-visible : Rectangle {
+    if root.update-panel-visible : Rectangle {
+        x: 0; y: 0; width: root.width; height: root.height; background: #000000b8;
+        TouchArea { clicked => {} }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 520px;
+            height: root.update-release-notes == "" ? 270px : 350px;
+            background: #0b2117;
+            border-color: root.update-state == 4 ? #7f3345 : #2a5a40;
+            border-width: 1px;
+            border-radius: 14px;
+            drop-shadow-blur: 18px;
+            drop-shadow-color: #00000080;
+
+            VerticalBox {
+                padding: 24px;
+                spacing: 13px;
+                Text { text: root.update-available-version == "" ? "Echo updates" : "Echo " + root.update-available-version + " is available"; color: #edfff2; font-size: 21px; font-weight: 700; }
+                Text { text: "Installed version: " + root.app-version; color: #91aa9b; font-size: 11px; }
+                Text { text: root.update-status; color: root.update-state == 4 ? #fda4af : #b7d2bf; wrap: word-wrap; font-size: 12px; }
+                if root.update-release-notes != "" : Rectangle {
+                    height: 80px; border-radius: 8px; background: #081911; border-width: 1px; border-color: #1c3a2a; clip: true;
+                    Text { x: 12px; y: 10px; width: parent.width - 24px; height: parent.height - 20px; text: root.update-release-notes; color: #a9c3b2; wrap: word-wrap; overflow: elide; font-size: 11px; }
+                }
+                if root.update-state == 3 : Rectangle {
+                    height: 8px; border-radius: 4px; background: #10271c; clip: true;
+                    Rectangle { width: parent.width * root.update-progress; height: parent.height; border-radius: 4px; background: root.theme-button-accent-color; }
+                }
+                HorizontalBox {
+                    spacing: 10px;
+                    if root.update-available-version != "" && root.update-state != 1 && root.update-state != 3 : Button { text: root.update-state == 4 ? "Retry" : "Install now"; primary: true; clicked => { root.install-update(); } }
+                    if root.update-available-version == "" && root.update-state != 1 : Button { text: "Check now"; primary: true; enabled: root.updater-configured; clicked => { root.check-for-updates(); } }
+                    Button { text: "Later"; enabled: root.update-state != 3; clicked => { root.update-panel-visible = false; } }
+                }
+            }
+        }
+    }
+
+    if (root.local-download-prompt-visible || root.local-download-progress-visible) && !root.update-panel-visible : Rectangle {
         x: 0; y: 0; width: root.width; height: root.height; background: #000000b8;
         TouchArea { clicked => {} }
         Rectangle {
@@ -825,7 +889,7 @@ export component AppWindow inherits Window {
                 Text { text: root.local-download-progress-visible ? "Installing local speech" : "Install local speech files?"; color: #edfff2; font-size: 21px; font-weight: 700; }
                 if root.local-download-prompt-visible && root.local-download-error != "" : Text { text: root.local-download-error; color: #fda4af; wrap: word-wrap; }
                 Text {
-                    text: root.local-download-progress-visible ? root.local-download-status : "Offline transcription requires about 461 MB of downloads and 665 MB of disk space. Echo will download and verify Parakeet and Silero automatically.";
+                    text: root.local-download-progress-visible ? root.local-download-status : "Selected: " + root.local-model-text + ". About 465 MB will be downloaded; Echo verifies the pinned SHA-256 before installing Parakeet and Silero.";
                     color: #a9c3b2; wrap: word-wrap; font-size: 12px;
                 }
                 if root.local-download-progress-visible : Rectangle {
@@ -841,7 +905,7 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.unsaved-settings-prompt-visible : Rectangle {
+    if root.unsaved-settings-prompt-visible && !root.update-panel-visible : Rectangle {
         x: 0; y: 0; width: root.width; height: root.height; background: #000000b8;
         TouchArea { clicked => {} }
         Rectangle {
@@ -871,7 +935,7 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.context-menu-visible && !root.local-download-prompt-visible && !root.local-download-progress-visible && !root.unsaved-settings-prompt-visible : Rectangle {
+    if root.context-menu-visible && !root.local-download-prompt-visible && !root.local-download-progress-visible && !root.unsaved-settings-prompt-visible && !root.update-panel-visible : Rectangle {
         x: 0; y: 0; width: root.width; height: root.height;
         TouchArea { clicked => { root.context-menu-visible = false; } }
         Rectangle {
@@ -879,8 +943,7 @@ export component AppWindow inherits Window {
             background: #12291d; border-radius: 7px; border-width: 1px; border-color: #31523f;
             TouchArea {
                 clicked => {
-                    if root.context-menu-is-log { root.copy-log-item(root.context-menu-index); }
-                    else { root.copy-transcript(root.context-menu-index); }
+                    root.copy-transcript(root.context-menu-index);
                     root.context-menu-visible = false;
                 }
                 Text { x: 12px; width: parent.width - 24px; height: parent.height; text: "Copy to clipboard"; color: #e2f5e8; font-size: 12px; vertical-alignment: center; }
@@ -916,14 +979,17 @@ export component TranscriptOverlayWindow inherits Window {
     icon: @image-url("../eleventhecho.png");
     no-frame: true;
     always-on-top: true;
-    width: root.window-width * 1px;
+    width: 560px;
     height: root.window-height * 1px;
     background: transparent;
 
-    in property <int> window-width: 520;
-    in property <int> window-height: 120;
+    // Width remains fixed, while the caption row grows up to six lines.
+    in property <int> window-width: 560;
+    in property <int> window-height: 106;
     in property <string> sentence-text: "";
+    in property <string> microphone-name: "Microphone";
     in property <float> overlay-opacity: 0.85;
+    in property <float> audio-level: 0.0;
     in property <color> overlay-background-color: #0d1017;
     in property <color> overlay-text-color: #ffffff;
     in property <bool> is-error: false;
@@ -939,12 +1005,78 @@ export component TranscriptOverlayWindow inherits Window {
             }
         }
         Rectangle {
-            width: parent.width; height: parent.height; border-radius: 10px; border-width: 1px;
-            border-color: root.is-error ? #fb7185 : #3a5a48;
-            background: root.is-error ? #2b0b14 : root.overlay-background-color;
-            opacity: root.overlay-opacity;
-            Text { x: 12px; y: 9px; text: root.is-system-message ? "Echo" : "Live"; color: root.is-error ? #fda4af : root.is-system-message ? #4ade80 : root.overlay-text-color; font-size: 11px; font-weight: 700; }
-            Text { x: 12px; y: 31px; width: parent.width - 24px; height: parent.height - 42px; text: root.sentence-text; color: root.is-error ? #ffe4e6 : root.is-system-message ? #86efac : root.overlay-text-color; wrap: word-wrap; overflow: elide; vertical-alignment: top; }
+            x: 4px; y: 4px; width: parent.width - 8px; height: parent.height - 8px;
+            border-radius: 14px;
+            border-width: 1px;
+            border-color: root.is-error ? #fb7185 : #356047;
+            background: (root.is-error ? #2b0b14 : root.overlay-background-color).with-alpha(root.overlay-opacity);
+
+            // Compact title row: active state and actual input device.
+            Rectangle {
+                x: 16px; y: 12px; width: 20px; height: 20px;
+                border-radius: 10px;
+                background: root.is-error ? #5a1827 : #123b27;
+                Image {
+                    x: 4px; y: 4px; width: 12px; height: 12px;
+                    source: @image-url("../assets/icons/speech.svg");
+                    colorize: root.is-error ? #fda4af : #4ade80;
+                    image-fit: contain;
+                }
+            }
+
+            Text {
+                x: 44px; y: 12px; width: 80px; height: 20px;
+                text: root.is-error ? "Issue" : root.is-system-message ? "Echo" : "Listening on";
+                color: root.is-error ? #fda4af : #4ade80;
+                font-size: 11px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Text {
+                x: 124px; y: 12px; width: parent.width - 140px; height: 20px;
+                text: root.is-error ? "Check Echo status" : root.microphone-name;
+                color: root.is-error ? #fecdd3 : #91aa9b;
+                font-size: 11px;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+
+            Rectangle {
+                x: 16px; y: 37px; width: parent.width - 32px; height: 1px;
+                background: root.is-error ? #713144 : #294636;
+            }
+
+            // Adaptive caption row. Rust provides the most recent text and
+            // caps this region at six lines.
+            Text {
+                x: 16px; y: 45px; width: parent.width - 32px; height: parent.height - 79px;
+                text: root.sentence-text;
+                color: root.is-error ? #ffe4e6 : root.is-system-message ? #a7f3d0 : root.overlay-text-color;
+                font-size: 15px;
+                font-weight: 500;
+                wrap: word-wrap;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+
+            Rectangle {
+                x: 16px; y: parent.height - 26px; width: parent.width - 32px; height: 1px;
+                background: root.is-error ? #713144 : #294636;
+            }
+
+            // Speech-responsive level row shared with the main window.
+            Rectangle {
+                x: 16px; y: parent.height - 17px; width: parent.width - 32px; height: 5px;
+                border-radius: 3px;
+                background: root.is-error ? #4b1724 : #183025;
+                Rectangle {
+                    width: parent.width * Math.max(0, Math.min(1, root.audio-level));
+                    height: parent.height;
+                    border-radius: 3px;
+                    background: root.is-error ? #fb7185 : #4ade80;
+                    animate width { duration: 60ms; }
+                }
+            }
         }
     }
 }

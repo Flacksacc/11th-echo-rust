@@ -1,9 +1,10 @@
 use crate::settings::AppSettings;
-use reqwest::Client;
+use reqwest::{redirect::Policy, Client};
 use serde_json::json;
 use std::time::Duration;
 
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+const MAX_GEMINI_RESPONSE_BYTES: usize = 64 * 1024;
 
 fn build_prompt(settings: &AppSettings, original: &str) -> String {
     let base_instruction = match settings.gemini_prompt_preset.as_str() {
@@ -69,6 +70,8 @@ pub async fn rewrite_text(
     let client = match Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
+        // Never forward the custom API-key header to a redirect target.
+        .redirect(Policy::none())
         .build()
     {
         Ok(client) => client,
@@ -92,7 +95,23 @@ pub async fn rewrite_text(
     };
 
     let status = response.status();
-    let value: serde_json::Value = match response.json().await {
+    let response_bytes = match response.bytes().await {
+        Ok(bytes) if bytes.len() <= MAX_GEMINI_RESPONSE_BYTES => bytes,
+        Ok(bytes) => {
+            crate::echo_error!(
+                "gemini",
+                "Response exceeded the {} byte limit (received at least {} bytes)",
+                MAX_GEMINI_RESPONSE_BYTES,
+                bytes.len()
+            );
+            return original.to_string();
+        }
+        Err(e) => {
+            crate::echo_error!("gemini", "Failed to read response status={}: {}", status, e);
+            return original.to_string();
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&response_bytes) {
         Ok(v) => v,
         Err(e) => {
             crate::echo_error!(

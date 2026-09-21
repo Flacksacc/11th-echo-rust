@@ -11,7 +11,10 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use url::Url;
 
-use super::{AudioChunk, TranscriptionCommand, TranscriptionEvent};
+use super::{
+    AudioChunk, TranscriptionCommand, TranscriptionEvent, MAX_PROVIDER_TEXT_FRAME_BYTES,
+    MAX_TRANSCRIPT_CHARACTERS,
+};
 
 const OPENAI_REALTIME_URL: &str = "wss://api.openai.com/v1/realtime";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -185,6 +188,16 @@ impl OpenAiRealtimeWhisperTranscriber {
                 match msg {
                     Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                         emit_read!("⬅️ [API IN] WS text frame: {} bytes", text.len());
+                        if text.len() > MAX_PROVIDER_TEXT_FRAME_BYTES {
+                            let _ = text_tx_read
+                                .send(TranscriptionEvent::Error(
+                                    "OpenAI returned an oversized transcription response."
+                                        .to_string(),
+                                ))
+                                .await;
+                            let _ = evt_tx.send(WsEvent::TerminalError);
+                            break;
+                        }
                         match parse_incoming_message(&text) {
                             ParsedIncoming::SessionReady => {
                                 emit_read!("✅ [API IN] transcription session ready");
@@ -192,11 +205,22 @@ impl OpenAiRealtimeWhisperTranscriber {
                             }
                             ParsedIncoming::PartialTranscript { item_id, delta } => {
                                 if !delta.is_empty() {
-                                    let partial = partials_by_item
-                                        .entry(item_id)
-                                        .and_modify(|existing| existing.push_str(&delta))
-                                        .or_insert(delta)
-                                        .clone();
+                                    let partial_entry =
+                                        partials_by_item.entry(item_id).or_default();
+                                    if partial_entry.chars().count() + delta.chars().count()
+                                        > MAX_TRANSCRIPT_CHARACTERS
+                                    {
+                                        let _ = text_tx_read
+                                            .send(TranscriptionEvent::Error(
+                                                "OpenAI returned an oversized partial transcript."
+                                                    .to_string(),
+                                            ))
+                                            .await;
+                                        let _ = evt_tx.send(WsEvent::TerminalError);
+                                        break;
+                                    }
+                                    partial_entry.push_str(&delta);
+                                    let partial = partial_entry.clone();
                                     emit_read!(
                                         "📝 Partial transcript: {} characters",
                                         partial.chars().count()
@@ -211,6 +235,16 @@ impl OpenAiRealtimeWhisperTranscriber {
                                 transcript,
                             } => {
                                 partials_by_item.remove(&item_id);
+                                if transcript.chars().count() > MAX_TRANSCRIPT_CHARACTERS {
+                                    let _ = text_tx_read
+                                        .send(TranscriptionEvent::Error(
+                                            "OpenAI returned an oversized final transcript."
+                                                .to_string(),
+                                        ))
+                                        .await;
+                                    let _ = evt_tx.send(WsEvent::TerminalError);
+                                    break;
+                                }
                                 emit_read!(
                                     "📝 Committed transcript: {} characters",
                                     transcript.chars().count()
@@ -346,7 +380,11 @@ impl OpenAiRealtimeWhisperTranscriber {
                             break;
                         }
                         WsEvent::ConnectionClosed => {
-                            emit!("➡️ WebSocket connection closed, ending session");
+                            let message =
+                                "OpenAI closed the connection before transcription completed."
+                                    .to_string();
+                            emit!("❌ {message}");
+                            let _ = text_tx.send(TranscriptionEvent::Error(message)).await;
                             break;
                         }
                     }

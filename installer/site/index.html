@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Download Echo, a fast Windows speech-to-text assistant with cloud and private offline transcription options.">
+  <meta name="color-scheme" content="dark">
+  <title>Echo — Speech to text for Windows</title>
+  <link rel="icon" href="./echo.png">
+  <style>
+    :root {
+      color-scheme: dark;
+      --background: #020906;
+      --panel: #071b11;
+      --panel-soft: #0b2418;
+      --border: #245038;
+      --accent: #4ade80;
+      --title: #edfff2;
+      --text: #b9d7c2;
+      --muted: #789484;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 75% 10%, rgba(74, 222, 128, .12), transparent 34rem),
+        linear-gradient(145deg, #03110a, var(--background) 62%);
+      color: var(--text);
+      font: 16px/1.6 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(920px, calc(100% - 36px));
+      margin: 0 auto;
+      padding: clamp(48px, 9vw, 108px) 0 56px;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      color: var(--title);
+      font-size: 14px;
+      font-weight: 800;
+      letter-spacing: .18em;
+    }
+    .brand img { width: 32px; height: 32px; border-radius: 8px; }
+    .hero { max-width: 760px; margin: 42px 0 44px; }
+    h1 {
+      margin: 0;
+      color: var(--title);
+      font-size: clamp(42px, 8vw, 76px);
+      line-height: 1.02;
+      letter-spacing: -.045em;
+    }
+    .lead {
+      max-width: 680px;
+      margin: 24px 0 28px;
+      font-size: clamp(18px, 2.5vw, 22px);
+      color: #ccefd6;
+    }
+    .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+    .button {
+      display: inline-flex;
+      min-height: 48px;
+      align-items: center;
+      justify-content: center;
+      padding: 0 20px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--title);
+      background: var(--panel-soft);
+      font-weight: 750;
+      text-decoration: none;
+      transition: transform .15s ease, border-color .15s ease, background .15s ease;
+    }
+    .button:hover { transform: translateY(-1px); border-color: var(--accent); }
+    .button.primary { color: #031108; background: var(--accent); border-color: var(--accent); }
+    .button[aria-disabled="true"] { opacity: .48; cursor: not-allowed; transform: none; }
+    #release-status { width: 100%; margin-top: 6px; color: var(--muted); font-size: 13px; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+    .card {
+      min-height: 168px;
+      padding: 22px;
+      border: 1px solid rgba(36, 80, 56, .8);
+      border-radius: 14px;
+      background: rgba(7, 27, 17, .78);
+      box-shadow: 0 18px 50px rgba(0, 0, 0, .16);
+    }
+    .card h2 { margin: 0 0 8px; color: var(--title); font-size: 17px; }
+    .card p { margin: 0; color: var(--muted); font-size: 14px; }
+    footer {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 44px;
+      padding-top: 20px;
+      border-top: 1px solid rgba(36, 80, 56, .55);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    footer a { color: #a7f3d0; }
+    @media (max-width: 700px) {
+      .grid { grid-template-columns: 1fr; }
+      .card { min-height: 0; }
+      .button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand"><img src="./echo.png" alt=""> ECHO</div>
+    <section class="hero">
+      <h1>Your voice,<br>ready to paste.</h1>
+      <p class="lead">Echo is a Windows speech-to-text assistant that turns your microphone into clean text wherever you are working.</p>
+      <div class="actions">
+        <a id="download" class="button primary" aria-disabled="true">Preparing download…</a>
+        <a class="button" href="https://github.com/Flacksacc/11th-echo-rust">View on GitHub</a>
+        <div id="release-status" role="status">Looking for the latest Windows release…</div>
+      </div>
+    </section>
+
+    <section class="grid" aria-label="Echo features">
+      <article class="card">
+        <h2>Works where you work</h2>
+        <p>Use a global shortcut to dictate into the currently focused Windows application.</p>
+      </article>
+      <article class="card">
+        <h2>Choose your engine</h2>
+        <p>Use a realtime cloud provider or run transcription privately on your own CPU.</p>
+      </article>
+      <article class="card">
+        <h2>Safe updates</h2>
+        <p>Echo verifies signed release metadata and the installer’s exact size and SHA-256 before installation.</p>
+      </article>
+    </section>
+
+    <footer>
+      <span>For 64-bit Windows 10 and Windows 11.</span>
+      <a href="https://github.com/Flacksacc/11th-echo-rust">Source code and documentation</a>
+    </footer>
+  </main>
+
+  <script>
+    const download = document.querySelector("#download");
+    const status = document.querySelector("#release-status");
+    const manifestUrl = new URL("./updates/stable/manifest.json", window.location.href);
+
+    fetch(manifestUrl, { cache: "no-store", headers: { "Accept": "application/json" } })
+      .then(response => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      })
+      .then(manifest => {
+        const filename = manifest?.installer?.file;
+        if (manifest?.channel !== "stable" || typeof manifest?.version !== "string" ||
+            typeof filename !== "string" || !/^Echo-[0-9A-Za-z.+-]+-Setup\.exe$/.test(filename)) {
+          throw new Error("Unexpected release manifest");
+        }
+        download.href = new URL(filename, manifestUrl).href;
+        download.download = filename;
+        download.removeAttribute("aria-disabled");
+        download.textContent = `Download Echo ${manifest.version}`;
+        status.textContent = `Latest stable release: ${manifest.version}`;
+      })
+      .catch(() => {
+        download.textContent = "Windows installer coming soon";
+        status.textContent = "The first public installer has not been published yet.";
+      });
+
+    download.addEventListener("click", event => {
+      if (download.getAttribute("aria-disabled") === "true") event.preventDefault();
+    });
+  </script>
+</body>
+</html>

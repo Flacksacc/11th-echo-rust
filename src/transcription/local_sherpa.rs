@@ -18,11 +18,62 @@ use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
 const SAMPLE_RATE: usize = 16_000;
 const FULL_SESSION_LIMIT_SAMPLES: usize = SAMPLE_RATE * 60 * 3;
-const MODEL_FOLDER: &str = "parakeet-tdt-0.6b-v2-int8";
-const MODEL_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2";
-const MODEL_ARCHIVE_SHA256: &str =
-    "157c157bc51155e03e37d2466522a3a737dd9c72bb25f36eb18912964161e1ad";
-const MODEL_ARCHIVE_SIZE: u64 = 482_468_385;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalModel {
+    #[default]
+    ParakeetTdtV2,
+    ParakeetTdtV3,
+}
+
+impl LocalModel {
+    pub fn from_id(value: &str) -> Self {
+        match value.trim() {
+            "parakeet-tdt-0.6b-v3-int8"
+            | "Parakeet TDT 0.6B v3 — 600M parameters, 25 languages, INT8" => Self::ParakeetTdtV3,
+            _ => Self::ParakeetTdtV2,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::ParakeetTdtV2 => "parakeet-tdt-0.6b-v2-int8",
+            Self::ParakeetTdtV3 => "parakeet-tdt-0.6b-v3-int8",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ParakeetTdtV2 => "Parakeet TDT 0.6B v2 — 600M parameters, English, INT8",
+            Self::ParakeetTdtV3 => "Parakeet TDT 0.6B v3 — 600M parameters, 25 languages, INT8",
+        }
+    }
+
+    fn archive_url(self) -> &'static str {
+        match self {
+            Self::ParakeetTdtV2 => "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
+            Self::ParakeetTdtV3 => "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
+        }
+    }
+
+    fn archive_sha256(self) -> &'static str {
+        match self {
+            Self::ParakeetTdtV2 => {
+                "157c157bc51155e03e37d2466522a3a737dd9c72bb25f36eb18912964161e1ad"
+            }
+            Self::ParakeetTdtV3 => {
+                "5793d0fd397c5778d2cf2126994d58e9d56b1be7c04d13c7a15bb1b4eafb16bf"
+            }
+        }
+    }
+
+    fn archive_size(self) -> u64 {
+        match self {
+            Self::ParakeetTdtV2 => 482_468_385,
+            Self::ParakeetTdtV3 => 487_170_055,
+        }
+    }
+}
 const SILERO_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -61,6 +112,7 @@ const MODEL_FILES: [(&str, u64, &str); 5] = [
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LocalSherpaConfig {
+    pub model: LocalModel,
     pub num_threads: i32,
     pub vad_threshold: f32,
     pub silence_ms: u32,
@@ -75,9 +127,10 @@ pub struct LocalSherpaConfig {
 impl Default for LocalSherpaConfig {
     fn default() -> Self {
         Self {
+            model: LocalModel::default(),
             num_threads: automatic_thread_count(),
             vad_threshold: 0.5,
-            silence_ms: 600,
+            silence_ms: 1000,
             pre_roll_ms: 250,
             post_roll_ms: 150,
             min_speech_ms: 200,
@@ -92,7 +145,8 @@ impl LocalSherpaConfig {
     pub fn normalized(mut self) -> Self {
         self.num_threads = self.num_threads.clamp(1, physical_core_count());
         self.vad_threshold = self.vad_threshold.clamp(0.1, 0.9);
-        self.silence_ms = self.silence_ms.clamp(100, 3000);
+        // Keep the on-disk unit compatible while matching the whole-second UI.
+        self.silence_ms = ((self.silence_ms.clamp(1000, 10_000) + 500) / 1000) * 1000;
         self.pre_roll_ms = self.pre_roll_ms.min(1000);
         self.post_roll_ms = self.post_roll_ms.min(1000);
         self.min_speech_ms = self.min_speech_ms.clamp(50, 2000);
@@ -125,8 +179,8 @@ struct EngineBundle {
 
 enum EngineState {
     Unloaded,
-    Loading(i32),
-    Ready(i32, Arc<EngineBundle>),
+    Loading((LocalModel, i32)),
+    Ready((LocalModel, i32), Arc<EngineBundle>),
     Failed(String),
 }
 
@@ -155,36 +209,46 @@ pub fn local_engine_status() -> LocalEngineStatus {
 }
 
 pub fn preload_local_engine(config: &LocalSherpaConfig) {
-    let threads = config.clone().normalized().num_threads;
+    let config = config.clone().normalized();
+    let key = (config.model, config.num_threads);
     let manager = manager().clone();
     {
         let mut state = manager.state.lock().unwrap();
         match &*state {
-            EngineState::Loading(key) | EngineState::Ready(key, _) if *key == threads => return,
-            _ => *state = EngineState::Loading(threads),
+            EngineState::Loading(loaded) | EngineState::Ready(loaded, _) if *loaded == key => {
+                return
+            }
+            _ => *state = EngineState::Loading(key),
         }
     }
 
-    crate::echo_info!("local_model", "Engine preload started threads={}", threads);
+    crate::echo_info!(
+        "local_model",
+        "Engine preload started model={} threads={}",
+        key.0.id(),
+        key.1
+    );
 
     std::thread::spawn(move || {
-        let loaded = load_engine(threads);
+        let loaded = load_engine(key.0, key.1);
         match &loaded {
             Ok(_) => crate::echo_info!(
                 "local_model",
-                "Engine preload completed threads={}",
-                threads
+                "Engine preload completed model={} threads={}",
+                key.0.id(),
+                key.1
             ),
             Err(err) => crate::echo_error!(
                 "local_model",
-                "Engine preload failed threads={}: {err}",
-                threads
+                "Engine preload failed model={} threads={}: {err}",
+                key.0.id(),
+                key.1
             ),
         }
         let mut state = manager.state.lock().unwrap();
-        if matches!(&*state, EngineState::Loading(key) if *key == threads) {
+        if matches!(&*state, EngineState::Loading(loaded) if *loaded == key) {
             *state = match loaded {
-                Ok(engine) => EngineState::Ready(threads, Arc::new(engine)),
+                Ok(engine) => EngineState::Ready(key, Arc::new(engine)),
                 Err(err) => EngineState::Failed(err),
             };
             manager.changed.notify_all();
@@ -209,13 +273,17 @@ fn engine() -> Result<Arc<EngineBundle>, String> {
     }
 }
 
-fn model_root() -> Result<PathBuf, String> {
+fn model_root(model: LocalModel) -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("ELEVENTH_ECHO_MODEL_DIR") {
         return Ok(PathBuf::from(path));
     }
     let downloaded = downloaded_model_root();
-    if required_models_exist(&downloaded) {
+    if required_models_exist(&downloaded, model) {
         return Ok(downloaded);
+    }
+    let backup = downloaded.with_extension("old");
+    if required_models_exist(&backup, model) {
+        return Ok(backup);
     }
     let exe = std::env::current_exe().map_err(|err| err.to_string())?;
     Ok(exe
@@ -231,26 +299,44 @@ fn downloaded_model_root() -> PathBuf {
         .join("models")
 }
 
-fn required_models_exist(root: &Path) -> bool {
-    MODEL_FILES.iter().all(|(relative, size, _)| {
-        fs::metadata(root.join(relative)).is_ok_and(|m| m.len() == *size)
-    })
+fn required_models_exist(root: &Path, model: LocalModel) -> bool {
+    let model_files_present = if model == LocalModel::ParakeetTdtV2 {
+        MODEL_FILES[..4].iter().all(|(relative, size, _)| {
+            fs::metadata(root.join(relative)).is_ok_and(|m| m.len() == *size)
+        })
+    } else {
+        [
+            "encoder.int8.onnx",
+            "decoder.int8.onnx",
+            "joiner.int8.onnx",
+            "tokens.txt",
+        ]
+        .iter()
+        .all(|name| root.join(model.id()).join(name).is_file())
+    };
+    model_files_present
+        && fs::metadata(root.join("silero-vad/silero_vad.onnx"))
+            .is_ok_and(|file| file.len() == MODEL_FILES[4].1)
 }
 
-pub fn local_models_available() -> bool {
+pub fn local_models_available(config: &LocalSherpaConfig) -> bool {
+    let model = config.model;
     if let Some(path) = std::env::var_os("ELEVENTH_ECHO_MODEL_DIR") {
-        return required_models_exist(&PathBuf::from(path));
+        return required_models_exist(&PathBuf::from(path), model);
     }
-    if required_models_exist(&downloaded_model_root()) {
+    if required_models_exist(&downloaded_model_root(), model) {
+        return true;
+    }
+    if required_models_exist(&downloaded_model_root().with_extension("old"), model) {
         return true;
     }
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|parent| parent.join("models")))
-        .is_some_and(|root| required_models_exist(&root))
+        .is_some_and(|root| required_models_exist(&root, model))
 }
 
-pub async fn download_local_models<F>(progress: F) -> Result<(), String>
+pub async fn download_local_models<F>(model: LocalModel, progress: F) -> Result<(), String>
 where
     F: Fn(f32, String) + Send + Sync + 'static,
 {
@@ -277,10 +363,10 @@ where
         let archive = work.join("parakeet.tar.bz2");
         download_verified(
             DownloadSpec {
-                url: MODEL_ARCHIVE_URL,
+                url: model.archive_url(),
                 destination: &archive,
-                expected_hash: MODEL_ARCHIVE_SHA256,
-                expected_size: MODEL_ARCHIVE_SIZE,
+                expected_hash: model.archive_sha256(),
+                expected_size: model.archive_size(),
                 progress_start: 0.0,
                 progress_span: 0.78,
                 label: "Downloading Parakeet model",
@@ -294,7 +380,12 @@ where
         let archive_for_extract = archive.clone();
         let staging_for_extract = staging_models.clone();
         tokio::task::spawn_blocking(move || {
-            extract_parakeet(&archive_for_extract, &staging_for_extract, extract_progress)
+            extract_parakeet(
+                model,
+                &archive_for_extract,
+                &staging_for_extract,
+                extract_progress,
+            )
         })
         .await
         .map_err(|err| err.to_string())??;
@@ -319,8 +410,8 @@ where
         .await?;
 
         (progress)(0.98, "Verifying local speech files".into());
-        verify_hashes_uncached(&staging_models)?;
-        install_downloaded_models(&staging_models)?;
+        verify_hashes_uncached(&staging_models, model)?;
+        install_downloaded_models(&staging_models, model)?;
         (progress)(1.0, "Local speech model installed".into());
         Ok(())
     }
@@ -531,6 +622,7 @@ impl DownloadSize {
 }
 
 fn extract_parakeet(
+    model: LocalModel,
     archive_path: &Path,
     staging_models: &Path,
     progress: Arc<dyn Fn(f32, String) + Send + Sync>,
@@ -538,7 +630,7 @@ fn extract_parakeet(
     let source = fs::File::open(archive_path).map_err(|err| err.to_string())?;
     let decoder = bzip2::read::BzDecoder::new(source);
     let mut archive = tar::Archive::new(decoder);
-    let destination = staging_models.join(MODEL_FOLDER);
+    let destination = staging_models.join(model.id());
     fs::create_dir_all(&destination).map_err(|err| err.to_string())?;
     let wanted = [
         "encoder.int8.onnx",
@@ -572,7 +664,14 @@ fn extract_parakeet(
     Ok(())
 }
 
-fn verify_hashes_uncached(root: &Path) -> Result<(), String> {
+fn verify_hashes_uncached(root: &Path, model: LocalModel) -> Result<(), String> {
+    if model == LocalModel::ParakeetTdtV3 {
+        // The archive itself was SHA-256 verified before extraction. Require the complete
+        // transducer layout here so a malformed archive cannot be installed.
+        return required_models_exist(root, model)
+            .then_some(())
+            .ok_or_else(|| "Downloaded Parakeet v3 package is incomplete".to_string());
+    }
     for (relative, expected_size, expected_hash) in MODEL_FILES {
         let path = root.join(relative);
         let metadata = fs::metadata(&path).map_err(|err| err.to_string())?;
@@ -602,29 +701,32 @@ fn verify_hashes_uncached(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn install_downloaded_models(staging_models: &Path) -> Result<(), String> {
+fn install_downloaded_models(staging_models: &Path, model: LocalModel) -> Result<(), String> {
     let destination = downloaded_model_root();
-    let backup = destination.with_extension("old");
+    fs::create_dir_all(&destination).map_err(|err| err.to_string())?;
+    let source = staging_models.join(model.id());
+    let target = destination.join(model.id());
+    let backup = destination.join(format!("{}.old", model.id()));
     if backup.exists() {
         fs::remove_dir_all(&backup).map_err(|err| err.to_string())?;
     }
-    if destination.exists() {
-        fs::rename(&destination, &backup).map_err(|err| err.to_string())?;
+    if target.exists() {
+        fs::rename(&target, &backup).map_err(|err| err.to_string())?;
     }
-    match fs::rename(staging_models, &destination) {
-        Ok(()) => {
-            if backup.exists() {
-                let _ = fs::remove_dir_all(backup);
-            }
-            Ok(())
+    if let Err(err) = fs::rename(&source, &target) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &target);
         }
-        Err(err) => {
-            if backup.exists() {
-                let _ = fs::rename(backup, destination);
-            }
-            Err(err.to_string())
-        }
+        return Err(format!("Could not activate downloaded local model: {err}"));
     }
+    let vad_target = destination.join("silero-vad");
+    if !vad_target.exists() {
+        fs::rename(staging_models.join("silero-vad"), vad_target).map_err(|err| err.to_string())?;
+    }
+    if backup.exists() {
+        let _ = fs::remove_dir_all(backup);
+    }
+    Ok(())
 }
 
 fn required_file(path: &Path) -> Result<String, String> {
@@ -636,16 +738,16 @@ fn required_file(path: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("Model path is not valid UTF-8: {}", path.display()))
 }
 
-fn load_engine(threads: i32) -> Result<EngineBundle, String> {
-    let root = model_root()?;
+fn load_engine(model_id: LocalModel, threads: i32) -> Result<EngineBundle, String> {
+    let root = model_root(model_id)?;
     crate::echo_info!(
         "local_model",
         "Loading Sherpa ONNX engine threads={} model_root={}",
         threads,
         root.display()
     );
-    verify_model_package(&root)?;
-    let model = root.join(MODEL_FOLDER);
+    verify_model_package(&root, model_id)?;
+    let model = root.join(model_id.id());
     let encoder = required_file(&model.join("encoder.int8.onnx"))?;
     let decoder = required_file(&model.join("decoder.int8.onnx"))?;
     let joiner = required_file(&model.join("joiner.int8.onnx"))?;
@@ -673,7 +775,12 @@ fn load_engine(threads: i32) -> Result<EngineBundle, String> {
     })
 }
 
-fn verify_model_package(root: &Path) -> Result<(), String> {
+fn verify_model_package(root: &Path, model_id: LocalModel) -> Result<(), String> {
+    if model_id == LocalModel::ParakeetTdtV3 {
+        return required_models_exist(root, model_id)
+            .then_some(())
+            .ok_or_else(|| "Required Parakeet v3 speech model files are missing. Use the Local CPU download prompt to repair local speech.".to_string());
+    }
     let mut signature = String::from("parakeet-v2-int8+silerovad-v1\n");
     for (relative, expected_size, _) in MODEL_FILES {
         let path = root.join(relative);
@@ -789,17 +896,30 @@ impl LocalSherpaTranscriber {
         let mut full_audio = Vec::<f32>::new();
         let mut full_audio_overflow = false;
         let mut last_partial = Instant::now();
+        let mut stop_requested = false;
 
         let stop_reason = loop {
             tokio::select! {
                 biased;
-                command = command_rx.recv() => match command {
+                command = command_rx.recv(), if !stop_requested => match command {
                     Some(TranscriptionCommand::Start) => accepting = true,
-                    Some(TranscriptionCommand::Stop) => break "stop_command",
+                    Some(TranscriptionCommand::Stop) => {
+                        // The audio forwarder drains capture before dropping its
+                        // sender. Keep consuming until that closure so the final
+                        // decode includes the tail of the utterance.
+                        stop_requested = true;
+                        accepting = true;
+                    }
                     None => break "control_channel_closed",
                 },
                 audio = audio_rx.recv(), if accepting => {
-                    let Some(audio) = audio else { break "audio_channel_closed"; };
+                    let Some(audio) = audio else {
+                        break if stop_requested {
+                            "stop_command"
+                        } else {
+                            "audio_channel_closed"
+                        };
+                    };
                     let samples: Vec<f32> = audio.into_iter().map(|sample| sample as f32 / i16::MAX as f32).collect();
                     if !full_audio_overflow {
                         if full_audio.len() + samples.len() <= FULL_SESSION_LIMIT_SAMPLES {
@@ -988,7 +1108,7 @@ fn join_transcript(stable: &[String], partial: &str) -> String {
 mod tests {
     use super::{
         automatic_thread_count, decode, join_transcript, load_engine, manager,
-        validate_content_length, DownloadSize, EngineState, LocalSherpaConfig,
+        validate_content_length, DownloadSize, EngineState, LocalModel, LocalSherpaConfig,
         LocalSherpaTranscriber,
     };
     use crate::transcription::{TranscriptionCommand, TranscriptionEvent};
@@ -998,10 +1118,21 @@ mod tests {
     #[test]
     fn defaults_are_safe() {
         let config = LocalSherpaConfig::default();
+        assert_eq!(config.model, LocalModel::ParakeetTdtV2);
         assert!((1..=4).contains(&config.num_threads));
-        assert_eq!(config.silence_ms, 600);
+        assert_eq!(config.silence_ms, 1000);
         assert_eq!(config.partial_interval_ms, 1000);
         assert!(!config.redecode_full_session);
+    }
+
+    #[test]
+    fn local_model_selection_accepts_v3_and_legacy_config_defaults_to_v2() {
+        assert_eq!(
+            LocalModel::from_id("parakeet-tdt-0.6b-v3-int8"),
+            LocalModel::ParakeetTdtV3
+        );
+        let legacy: LocalSherpaConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.model, LocalModel::ParakeetTdtV2);
     }
 
     #[test]
@@ -1014,9 +1145,46 @@ mod tests {
         }
         .normalized();
         assert_eq!(config.vad_threshold, 0.9);
-        assert_eq!(config.silence_ms, 100);
+        assert_eq!(config.silence_ms, 1000);
         assert_eq!(config.partial_interval_ms, 5000);
         assert!(automatic_thread_count() >= 1);
+    }
+
+    #[test]
+    fn normalization_preserves_long_pauses_after_settings_round_trip() {
+        for silence_ms in [1000, 3000, 5000, 10_000] {
+            let config = LocalSherpaConfig {
+                silence_ms,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&config).unwrap();
+            let loaded: LocalSherpaConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(loaded.normalized().silence_ms, silence_ms);
+        }
+        let config = LocalSherpaConfig {
+            silence_ms: u32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(config.normalized().silence_ms, 10_000);
+    }
+
+    #[test]
+    fn legacy_pause_values_round_to_whole_seconds_after_settings_round_trip() {
+        for (previous_ms, expected_ms) in [
+            (100, 1000),
+            (600, 1000),
+            (1499, 1000),
+            (1500, 2000),
+            (9500, 10_000),
+        ] {
+            let json = format!(r#"{{"silence_ms":{previous_ms}}}"#);
+            let loaded: LocalSherpaConfig = serde_json::from_str(&json).unwrap();
+            let normalized = loaded.normalized();
+            assert_eq!(normalized.silence_ms, expected_ms);
+            let saved = serde_json::to_string(&normalized).unwrap();
+            let reloaded: LocalSherpaConfig = serde_json::from_str(&saved).unwrap();
+            assert_eq!(reloaded.normalized(), normalized);
+        }
     }
 
     #[test]
@@ -1055,7 +1223,7 @@ mod tests {
             .join("assets")
             .join("models");
         std::env::set_var("ELEVENTH_ECHO_MODEL_DIR", &root);
-        let engine = load_engine(2).expect("load local engine");
+        let engine = load_engine(LocalModel::ParakeetTdtV2, 2).expect("load local engine");
         let wave_path = root
             .join("parakeet-tdt-0.6b-v2-int8")
             .join("test_wavs")
@@ -1068,15 +1236,16 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires installer model assets"]
-    async fn audio_channel_closure_still_commits_the_local_transcript() {
+    async fn stop_drains_queued_audio_before_committing_the_local_transcript() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("installer")
             .join("assets")
             .join("models");
         std::env::set_var("ELEVENTH_ECHO_MODEL_DIR", &root);
         let threads = 2;
-        let engine = load_engine(threads).expect("load local engine");
-        *manager().state.lock().unwrap() = EngineState::Ready(threads, Arc::new(engine));
+        let engine = load_engine(LocalModel::ParakeetTdtV2, threads).expect("load local engine");
+        *manager().state.lock().unwrap() =
+            EngineState::Ready((LocalModel::ParakeetTdtV2, threads), Arc::new(engine));
 
         let wave_path = root
             .join("parakeet-tdt-0.6b-v2-int8")
@@ -1108,6 +1277,7 @@ mod tests {
         for chunk in samples.chunks(16_000) {
             audio_tx.send(chunk.to_vec()).await.unwrap();
         }
+        command_tx.send(TranscriptionCommand::Stop).unwrap();
         drop(audio_tx);
 
         let committed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -1131,10 +1301,13 @@ mod tests {
     async fn runtime_download_installs_verified_models() {
         let root = super::downloaded_model_root();
         let existed = root.exists();
-        super::download_local_models(|_, _| {})
+        super::download_local_models(LocalModel::ParakeetTdtV2, |_, _| {})
             .await
             .expect("download and install models");
-        assert!(super::required_models_exist(&root));
+        assert!(super::required_models_exist(
+            &root,
+            LocalModel::ParakeetTdtV2
+        ));
         if !existed {
             std::fs::remove_dir_all(root).expect("remove downloaded test models");
         }

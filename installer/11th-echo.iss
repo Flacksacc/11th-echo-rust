@@ -1,6 +1,6 @@
 #define AppName "Echo"
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.1.4"
 #endif
 #define AppPublisher "Echo contributors"
 #define AppExeName "echo.exe"
@@ -10,12 +10,18 @@ AppId={{BCE66B5C-943D-43D6-B3B3-1A04B7DE82AB}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
+AppMutex={code:GetAppMutex}
+MinVersion=10.0
 DefaultDirName={localappdata}\Programs\Echo
 DefaultGroupName=Echo
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=output
 OutputBaseFilename=Echo-{#AppVersion}-Setup
+VersionInfoVersion={#AppVersion}
+VersionInfoProductName={#AppName}
+VersionInfoDescription=Echo speech-to-text assistant installer
+VersionInfoCompany={#AppPublisher}
 SetupIconFile=..\eleventhecho.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 Compression=lzma2/max
@@ -48,6 +54,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Launch Echo"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExeName}"; Flags: nowait skipifnotsilent; Check: IsUpdateInstall
 
 [InstallDelete]
 Type: files; Name: "{app}\eleventh_echo_rust.exe"
@@ -57,6 +64,29 @@ Type: files; Name: "{autodesktop}\11th Echo.lnk"
 [Code]
 var
   HadLegacyStartup: Boolean;
+
+function IsUpdateInstall(): Boolean;
+var
+  Index: Integer;
+begin
+  Result := False;
+  for Index := 1 to ParamCount do
+  begin
+    if CompareText(ParamStr(Index), '/UPDATE') = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+function GetAppMutex(Param: String): String;
+begin
+  if IsUpdateInstall() then
+    Result := ''
+  else
+    Result := 'Local\Echo-9D197E31-8816-4CB5-8753-3FD8664A9556';
+end;
 
 function InitializeSetup(): Boolean;
 begin
@@ -92,9 +122,10 @@ begin
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '11th Echo');
 
     if (not UninstallSilent) and
-       DirExists(ExpandConstant('{localappdata}\11th_echo\models')) and
-       (MsgBox('Remove the downloaded local speech model files too?',
+       DirExists(ExpandConstant('{localappdata}\11th_echo')) and
+       (MsgBox(
+         'Remove Echo settings, transcript history, diagnostic logs, and downloaded speech models too?',
          mbConfirmation, MB_YESNO) = IDYES) then
-      DelTree(ExpandConstant('{localappdata}\11th_echo\models'), True, True, True);
+      DelTree(ExpandConstant('{localappdata}\11th_echo'), True, True, True);
   end;
 end;

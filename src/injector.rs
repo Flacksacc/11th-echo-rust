@@ -101,14 +101,65 @@ fn wait_for_modifiers_to_clear() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
-/// Inject UTF-16 text directly into whichever Windows control currently has
-/// focus. No start-time destination or clipboard is used.
+fn injection_safe_text(text: &str) -> String {
+    text.chars()
+        .filter_map(|character| {
+            if character == '\0' {
+                None
+            } else if character.is_control() {
+                Some(' ')
+            } else {
+                Some(character)
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+pub struct InjectionTarget {
+    foreground_window: isize,
+    focused_control: isize,
+}
+
 #[cfg(windows)]
-pub fn inject_text(text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let utf16 = text
-        .encode_utf16()
-        .filter(|code_unit| *code_unit != 0)
-        .collect::<Vec<_>>();
+pub fn capture_injection_target() -> Option<InjectionTarget> {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.0 == 0 {
+        return None;
+    }
+    let foreground_thread_id = unsafe { GetWindowThreadProcessId(foreground, None) };
+    let mut gui_info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    let focused_control = if foreground_thread_id != 0
+        && unsafe { GetGUIThreadInfo(foreground_thread_id, &mut gui_info) }.is_ok()
+    {
+        gui_info.hwndFocus.0
+    } else {
+        0
+    };
+    Some(InjectionTarget {
+        foreground_window: foreground.0,
+        focused_control,
+    })
+}
+
+#[cfg(not(windows))]
+pub fn capture_injection_target() -> Option<InjectionTarget> {
+    None
+}
+
+/// Inject UTF-16 text into the Windows application that was focused when the
+/// recording started. Changing applications while finalization is pending
+/// cancels direct input so private text cannot land in an unintended window.
+#[cfg(windows)]
+pub fn inject_text(
+    text: &str,
+    expected_target: Option<InjectionTarget>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let safe_text = injection_safe_text(text);
+    let utf16 = safe_text.encode_utf16().collect::<Vec<_>>();
     if utf16.is_empty() {
         return Ok(());
     }
@@ -122,6 +173,18 @@ pub fn inject_text(text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
             utf16.len()
         );
         return Err("No Windows application currently has focus".into());
+    }
+    if expected_target.is_some_and(|expected| expected.foreground_window != foreground.0) {
+        crate::echo_warn!(
+            "injector",
+            "Direct input cancelled because focus changed expected_hwnd=0x{:X} actual_hwnd=0x{:X}",
+            expected_target.map_or(0, |target| target.foreground_window) as usize,
+            foreground.0 as usize
+        );
+        return Err(
+            "The focused application changed while Echo was finalizing; the transcript was kept in History instead"
+                .into(),
+        );
     }
 
     let mut foreground_process_id = 0u32;
@@ -138,6 +201,20 @@ pub fn inject_text(text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         Default::default()
     };
+    if expected_target.is_some_and(|expected| {
+        expected.focused_control != 0 && expected.focused_control != focused_control.0
+    }) {
+        crate::echo_warn!(
+            "injector",
+            "Direct input cancelled because the focused control changed expected_focus=0x{:X} actual_focus=0x{:X}",
+            expected_target.map_or(0, |target| target.focused_control) as usize,
+            focused_control.0 as usize
+        );
+        return Err(
+            "The focused text field changed while Echo was finalizing; the transcript was kept in History instead"
+                .into(),
+        );
+    }
     let mut class_buffer = [0u16; 128];
     let class_length = if focused_control.0 != 0 {
         unsafe { GetClassNameW(focused_control, &mut class_buffer) }
@@ -214,7 +291,10 @@ pub fn inject_text(text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
 }
 
 #[cfg(not(windows))]
-pub fn inject_text(text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub fn inject_text(
+    text: &str,
+    _expected_target: Option<InjectionTarget>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     crate::echo_info!(
         "injector",
         "Direct input is a no-op on this platform characters={}",
@@ -225,15 +305,23 @@ pub fn inject_text(text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
 
 #[cfg(test)]
 mod tests {
-    use super::inject_text;
+    use super::{inject_text, injection_safe_text};
 
     #[test]
     fn inject_empty_text_is_ok() {
-        assert!(inject_text("").is_ok());
+        assert!(inject_text("", None).is_ok());
     }
 
     #[test]
     fn inject_null_only_text_is_ok() {
-        assert!(inject_text("\0").is_ok());
+        assert!(inject_text("\0", None).is_ok());
+    }
+
+    #[test]
+    fn injection_text_cannot_submit_or_navigate_controls() {
+        assert_eq!(
+            injection_safe_text("one\r\ntwo\tthree\u{85}"),
+            "one  two three "
+        );
     }
 }

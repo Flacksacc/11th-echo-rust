@@ -2,3 +2,5 @@
 /installer/output
 /installer/cache
 /installer/assets
+/installer/update-config.local.json
+/installer/update-config.json

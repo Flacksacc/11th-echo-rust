@@ -13,6 +13,7 @@ mod settings;
 mod startup;
 mod state;
 mod transcription;
+mod updater;
 
 use arboard::Clipboard;
 use chrono::Local;
@@ -33,7 +34,138 @@ use std::thread;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
-const FINALIZATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+fn begin_update_check(
+    ui: slint::Weak<AppWindow>,
+    config: updater::UpdateConfig,
+    available: Arc<Mutex<Option<updater::UpdateInfo>>>,
+    busy: Arc<AtomicBool>,
+    manual: bool,
+) {
+    if busy.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let update_ui = ui.clone();
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_update_state(1);
+        ui.set_update_status("Checking for updates…".into());
+        if manual {
+            ui.set_update_panel_visible(true);
+        }
+    });
+    thread::spawn(move || {
+        let result = Runtime::new()
+            .map_err(|err| format!("Could not start the update check: {err}"))
+            .and_then(|runtime| {
+                let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                    .map_err(|err| format!("Invalid application version: {err}"))?;
+                runtime.block_on(updater::check_for_update(&config, &current))
+            });
+        busy.store(false, Ordering::SeqCst);
+        let _ = update_ui.upgrade_in_event_loop(move |ui| match result {
+            Ok(Some(info)) => {
+                ui.set_update_available_version(info.manifest.version.to_string().into());
+                ui.set_update_release_notes(
+                    info.manifest
+                        .release_notes
+                        .clone()
+                        .unwrap_or_default()
+                        .into(),
+                );
+                ui.set_update_status(
+                    format!(
+                        "Version {} is ready to download and install.",
+                        info.manifest.version
+                    )
+                    .into(),
+                );
+                ui.set_update_state(2);
+                *available.lock().unwrap() = Some(info);
+            }
+            Ok(None) => {
+                *available.lock().unwrap() = None;
+                ui.set_update_available_version("".into());
+                ui.set_update_release_notes("".into());
+                ui.set_update_status("Echo is up to date.".into());
+                ui.set_update_state(0);
+            }
+            Err(err) => {
+                echo_warn!("updater", "Update check failed: {err}");
+                ui.set_update_status(format!("Could not check for updates: {err}").into());
+                ui.set_update_state(4);
+            }
+        });
+    });
+}
+
+fn begin_update_install(
+    ui: slint::Weak<AppWindow>,
+    available: Arc<Mutex<Option<updater::UpdateInfo>>>,
+    busy: Arc<AtomicBool>,
+) {
+    if busy.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let Some(info) = available.lock().unwrap().clone() else {
+        busy.store(false, Ordering::SeqCst);
+        let _ = ui.upgrade_in_event_loop(|ui| {
+            ui.set_update_status("Check for updates before installing.".into());
+            ui.set_update_state(4);
+        });
+        return;
+    };
+    let progress_ui = ui.clone();
+    let completion_ui = ui.clone();
+    let _ = ui.upgrade_in_event_loop(|ui| {
+        ui.set_update_state(3);
+        ui.set_update_progress(0.0);
+        ui.set_update_status("Downloading and verifying the installer…".into());
+    });
+    thread::spawn(move || {
+        let last_percent = Arc::new(AtomicU64::new(u64::MAX));
+        let progress_counter = last_percent.clone();
+        let result = Runtime::new()
+            .map_err(|err| format!("Could not start the update download: {err}"))
+            .and_then(|runtime| {
+                runtime.block_on(updater::download_update(&info, move |fraction| {
+                    let percent = (fraction.clamp(0.0, 1.0) * 100.0).floor() as u64;
+                    if progress_counter.swap(percent, Ordering::SeqCst) != percent {
+                        let _ = progress_ui.upgrade_in_event_loop(move |ui| {
+                            ui.set_update_progress(fraction.clamp(0.0, 1.0));
+                            ui.set_update_status(format!("Downloading update… {percent}%").into());
+                        });
+                    }
+                }))
+            })
+            .and_then(|path| updater::launch_installer(&path));
+        match result {
+            Ok(()) => {
+                let _ = completion_ui.upgrade_in_event_loop(|ui| {
+                    ui.set_update_progress(1.0);
+                    ui.set_update_status(
+                        "Installer started. Echo will restart after updating.".into(),
+                    );
+                    let _ = slint::quit_event_loop();
+                });
+            }
+            Err(err) => {
+                busy.store(false, Ordering::SeqCst);
+                echo_error!("updater", "Update installation failed: {err}");
+                let _ = completion_ui.upgrade_in_event_loop(move |ui| {
+                    ui.set_update_status(format!("Update failed: {err}").into());
+                    ui.set_update_state(4);
+                });
+            }
+        }
+    });
+}
+
+const FINALIZATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+const CAPTURE_POST_ROLL: std::time::Duration = std::time::Duration::from_millis(300);
+const OVERLAY_WIDTH: i32 = 560;
+const OVERLAY_HEIGHT: i32 = 106;
+const OVERLAY_MAX_LINES: usize = 6;
+const OVERLAY_CHARACTERS_PER_LINE: usize = 62;
+const OVERLAY_CAPTION_CHARACTERS: usize = OVERLAY_MAX_LINES * OVERLAY_CHARACTERS_PER_LINE;
 
 #[cfg(target_os = "windows")]
 use global_hotkey::{
@@ -46,9 +178,18 @@ use tray_icon::{
     MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
 };
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, POINT, RECT, WAIT_OBJECT_0,
+};
 #[cfg(target_os = "windows")]
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::Graphics::Gdi::{
+    CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromPoint, SetWindowRgn, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, SetEvent, WaitForSingleObject,
+};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_F1, VK_F10, VK_F11, VK_F12, VK_F2, VK_F3, VK_F4,
@@ -56,9 +197,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetSystemMetrics, GetWindowLongPtrW, GetWindowThreadProcessId,
-    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE, SM_CYSCREEN, SW_RESTORE,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    AllowSetForegroundWindow, FindWindowW, GetForegroundWindow, GetSystemMetrics,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic, SetForegroundWindow,
+    SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE, SM_CYSCREEN, SW_RESTORE, SW_SHOW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW,
 };
 
 slint::include_modules!();
@@ -68,7 +210,9 @@ enum AppCommand {
     ToggleRecording,
     StartRecording,
     StopRecording,
-    LocalEngineLoaded(Result<(), String>),
+    ReconfigureWarmCapture,
+    CapturePostRollElapsed(u64),
+    CaptureFlushed(u64, Result<audio::CaptureFlushStats, String>),
     FinalizationTimedOut(u64),
 }
 
@@ -77,7 +221,9 @@ fn app_command_name(command: &AppCommand) -> &'static str {
         AppCommand::ToggleRecording => "toggle_recording",
         AppCommand::StartRecording => "start_recording",
         AppCommand::StopRecording => "stop_recording",
-        AppCommand::LocalEngineLoaded(_) => "local_engine_loaded",
+        AppCommand::ReconfigureWarmCapture => "reconfigure_warm_capture",
+        AppCommand::CapturePostRollElapsed(_) => "capture_post_roll_elapsed",
+        AppCommand::CaptureFlushed(_, _) => "capture_flushed",
         AppCommand::FinalizationTimedOut(_) => "finalization_timed_out",
     }
 }
@@ -85,7 +231,8 @@ fn app_command_name(command: &AppCommand) -> &'static str {
 struct Session {
     epoch: u64,
     state: Arc<Mutex<RecordingState>>,
-    audio_stream: Option<cpal::Stream>,
+    audio_capture: Option<audio::AudioCapture>,
+    warm_capture_attached: bool,
     audio_forward_stop_tx: Option<mpsc::UnboundedSender<()>>,
     network_stop_tx: Option<mpsc::UnboundedSender<transcription::TranscriptionCommand>>,
     transcript_pipeline: Arc<Mutex<TranscriptPipeline>>,
@@ -95,17 +242,17 @@ struct Session {
 
 impl Session {
     fn request_stop(&mut self) {
-        // Queue the provider's finalization command before closing its audio
-        // stream. Providers still finalize on audio closure as a fallback.
+        // Capture shutdown and its resampler flush complete before this is
+        // called. The provider drains its audio receiver before committing.
         if let Some(tx) = self.network_stop_tx.as_ref() {
             let _ = tx.send(transcription::TranscriptionCommand::Stop);
         }
+    }
+
+    fn abort_tasks(&mut self) {
         if let Some(tx) = self.audio_forward_stop_tx.take() {
             let _ = tx.send(());
         }
-    }
-
-    fn abort_tasks(&self) {
         for handle in &self.task_abort_handles {
             handle.abort();
         }
@@ -165,6 +312,53 @@ async fn forward_audio_until_stopped(
     }
 }
 
+fn preferred_microphone(settings: &AppSettings) -> Option<String> {
+    if settings.use_default_microphone {
+        None
+    } else {
+        Some(settings.selected_microphone.clone())
+    }
+}
+
+async fn reconfigure_warm_capture(
+    warm_capture: &mut Option<audio::WarmAudioCapture>,
+    settings: &AppSettings,
+    level_sender: mpsc::Sender<f32>,
+) -> Result<(), String> {
+    if let Some(existing) = warm_capture.take() {
+        let device_name = existing.device_name().to_string();
+        match existing.shutdown().await {
+            Ok(stats) => echo_info!(
+                "audio",
+                "Warm microphone stopped device={} pending_input_samples={} flushed_output_samples={}",
+                device_name,
+                stats.pending_input_samples,
+                stats.flushed_output_samples
+            ),
+            Err(err) => echo_warn!(
+                "audio",
+                "Warm microphone shutdown failed device={}: {}",
+                device_name,
+                err
+            ),
+        }
+    }
+
+    if !settings.keep_microphone_ready {
+        return Ok(());
+    }
+
+    let capture = audio::start_warm_audio_capture(level_sender, preferred_microphone(settings))
+        .map_err(|err| err.to_string())?;
+    echo_info!(
+        "audio",
+        "Warm microphone ready device={} pre_roll_ms=500",
+        capture.device_name()
+    );
+    *warm_capture = Some(capture);
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 struct SingleInstanceGuard(HANDLE);
 
@@ -196,22 +390,86 @@ fn acquire_single_instance() -> Result<Option<SingleInstanceGuard>, windows::cor
 }
 
 #[cfg(target_os = "windows")]
-fn show_existing_instance() {
+struct InstanceActivationEvent(HANDLE);
+
+#[cfg(target_os = "windows")]
+impl InstanceActivationEvent {
+    fn new() -> Result<Self, windows::core::Error> {
+        // Auto-reset coalesces repeated launches. Create this before acquiring
+        // the mutex so requests made during UI initialization remain pending.
+        unsafe {
+            CreateEventW(
+                None,
+                false,
+                false,
+                windows::core::w!("Local\\Echo-9D197E31-8816-4CB5-8753-3FD8664A9556-Activate"),
+            )
+            .map(Self)
+        }
+    }
+
+    fn take_request(&self) -> bool {
+        unsafe { WaitForSingleObject(self.0, 0) == WAIT_OBJECT_0 }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for InstanceActivationEvent {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_existing_instance(activation: &InstanceActivationEvent) {
+    unsafe {
+        let mut hwnd = FindWindowW(None, windows::core::w!("Echo"));
+        if hwnd.0 == 0 {
+            // A tray-only startup may not have created the main HWND yet.
+            // The initialized overlay belongs to the same resident process.
+            hwnd = FindWindowW(None, windows::core::w!("Echo Live"));
+        }
+        if hwnd.0 != 0 {
+            let mut process_id = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+            if process_id != 0 {
+                // The user-launched process can pass its foreground permission
+                // to the resident process before asking its UI thread to show.
+                if let Err(err) = AllowSetForegroundWindow(process_id) {
+                    echo_warn!("instance", "Could not grant foreground permission: {err}");
+                }
+            }
+        }
+        if let Err(err) = SetEvent(activation.0) {
+            echo_warn!("instance", "Could not request window activation: {err}");
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_main_window(ui: &AppWindow) {
+    if let Err(err) = ui.show() {
+        echo_warn!("instance", "Could not show main window: {err}");
+        return;
+    }
     unsafe {
         let hwnd = FindWindowW(None, windows::core::w!("Echo"));
         if hwnd.0 != 0 {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+            // Preserve maximized windows; only minimized windows need restoring.
+            let command = if IsIconic(hwnd).as_bool() {
+                SW_RESTORE
+            } else {
+                SW_SHOW
+            };
+            let _ = ShowWindow(hwnd, command);
             let activated = SetForegroundWindow(hwnd).as_bool();
-            echo_info!(
-                "instance",
-                "Existing window activation attempted hwnd=0x{:X} activated={}",
-                hwnd.0 as usize,
-                activated
-            );
+            echo_info!("instance", "Main window foreground activation={activated}");
         } else {
             echo_warn!(
                 "instance",
-                "Existing instance mutex was found but its main window was unavailable"
+                "Main window was unavailable for foreground activation"
             );
         }
     }
@@ -428,12 +686,28 @@ fn parse_theme_color(s: &str, default: Color) -> Color {
 }
 
 fn overlay_size_for_text(text: &str) -> (i32, i32) {
-    let chars = text.chars().count().max(1);
-    let width = 520;
-    let chars_per_line = 58usize;
-    let lines = chars.div_ceil(chars_per_line).clamp(1, 8) as i32;
-    let height = (70 + (lines * 30)).clamp(110, 260);
-    (width, height)
+    let characters = text.trim().chars().count().max(1);
+    let lines = characters
+        .div_ceil(OVERLAY_CHARACTERS_PER_LINE)
+        .clamp(1, OVERLAY_MAX_LINES) as i32;
+    (OVERLAY_WIDTH, 86 + lines * 20)
+}
+
+fn overlay_caption_text(text: &str) -> String {
+    let trimmed = text.trim();
+    let character_count = trimmed.chars().count();
+    if character_count <= OVERLAY_CAPTION_CHARACTERS {
+        return trimmed.to_string();
+    }
+
+    let mut tail = trimmed
+        .chars()
+        .skip(character_count - OVERLAY_CAPTION_CHARACTERS)
+        .collect::<String>();
+    if let Some(first_space) = tail.find(char::is_whitespace) {
+        tail.drain(..=first_space);
+    }
+    format!("…{}", tail.trim_start())
 }
 
 fn live_transcript_text(committed: &str, partial: &str) -> String {
@@ -451,30 +725,127 @@ fn live_transcript_text(committed: &str, partial: &str) -> String {
     format!("{} {}", committed, partial)
 }
 
-fn reset_overlay_to_listening(overlay: &TranscriptOverlayWindow) {
-    overlay.set_sentence_text("Listening...".into());
-    overlay.set_window_width(520);
-    overlay.set_window_height(120);
-    overlay.set_is_error(false);
-    overlay.set_is_system_message(false);
-    overlay.set_is_visible(true);
-    let _ = overlay.show();
+fn set_overlay_height(overlay: &TranscriptOverlayWindow, height: i32) {
+    let next_height = height.clamp(OVERLAY_HEIGHT, 86 + OVERLAY_MAX_LINES as i32 * 20);
+    let previous_height = overlay.get_window_height();
+    if previous_height == next_height {
+        return;
+    }
+
     #[cfg(target_os = "windows")]
-    if let Err(err) = configure_overlay_as_non_activating(overlay) {
-        echo_warn!(
-            "overlay",
-            "Could not apply non-activating overlay style: {err}"
+    let previous_position = overlay.window().position();
+    overlay.set_window_height(next_height);
+    #[cfg(target_os = "windows")]
+    {
+        let scale = overlay.window().scale_factor();
+        let previous_physical_height = (previous_height as f32 * scale).round() as i32;
+        let next_physical_height = (next_height as f32 * scale).round() as i32;
+        let proposed = slint::PhysicalPosition::new(
+            previous_position.x,
+            previous_position.y + previous_physical_height - next_physical_height,
         );
+        overlay.window().set_position(clamp_overlay_position(
+            proposed,
+            (OVERLAY_WIDTH as f32 * scale).round() as i32,
+            next_physical_height,
+        ));
+
+        let overlay_after_resize = overlay.as_weak();
+        slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+            if let Some(overlay) = overlay_after_resize.upgrade() {
+                if let Err(err) = apply_overlay_rounded_region(&overlay) {
+                    echo_warn!("overlay", "Could not update rounded window region: {err}");
+                }
+            }
+        });
     }
 }
 
+fn reset_overlay_to_listening(overlay: &TranscriptOverlayWindow, microphone_name: &str) {
+    overlay.set_sentence_text("Listening...".into());
+    overlay.set_microphone_name(microphone_name.into());
+    overlay.set_window_width(OVERLAY_WIDTH);
+    set_overlay_height(overlay, OVERLAY_HEIGHT);
+    overlay.set_is_error(false);
+    overlay.set_is_system_message(false);
+    overlay.set_is_visible(true);
+    show_overlay_without_activation(overlay);
+}
+
+/// Display the prepared live overlay through Slint's supported window API.
 #[cfg(target_os = "windows")]
-fn configure_overlay_as_non_activating(
-    _overlay: &TranscriptOverlayWindow,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn show_overlay_without_activation(overlay: &TranscriptOverlayWindow) {
+    let foreground = unsafe { GetForegroundWindow() };
+    let scale = overlay.window().scale_factor();
+    overlay.window().set_position(clamp_overlay_position(
+        overlay.window().position(),
+        (OVERLAY_WIDTH as f32 * scale).round() as i32,
+        (overlay.get_window_height() as f32 * scale).round() as i32,
+    ));
+    if let Err(err) = configure_overlay_as_non_activating(overlay) {
+        echo_warn!("overlay", "Could not refresh non-activating style: {err}");
+    }
+    let _ = overlay.show();
+    overlay.window().request_redraw();
+
+    let overlay_after_show = overlay.as_weak();
+    slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+        if let Some(overlay) = overlay_after_show.upgrade() {
+            if let Err(err) = apply_overlay_rounded_region(&overlay) {
+                echo_warn!("overlay", "Could not apply rounded window region: {err}");
+            }
+        }
+        if foreground.0 != 0 {
+            unsafe {
+                let _ = SetForegroundWindow(foreground);
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_overlay_without_activation(overlay: &TranscriptOverlayWindow) {
+    let _ = overlay.show();
+    overlay.window().request_redraw();
+}
+
+fn hide_overlay_window(overlay: &TranscriptOverlayWindow) {
+    let _ = overlay.hide();
+}
+
+#[cfg(target_os = "windows")]
+fn clamp_overlay_position(
+    position: slint::PhysicalPosition,
+    width: i32,
+    height: i32,
+) -> slint::PhysicalPosition {
     unsafe {
-        // Looking up the HWND directly avoids depending on optional raw-window-
-        // handle support in the selected Slint renderer.
+        let monitor = MonitorFromPoint(
+            POINT {
+                x: position.x + width / 2,
+                y: position.y + height / 2,
+            },
+            MONITOR_DEFAULTTONEAREST,
+        );
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            let max_x = (info.rcWork.right - width).max(info.rcWork.left);
+            let max_y = (info.rcWork.bottom - height).max(info.rcWork.top);
+            return slint::PhysicalPosition::new(
+                position.x.clamp(info.rcWork.left, max_x),
+                position.y.clamp(info.rcWork.top, max_y),
+            );
+        }
+    }
+    position
+}
+
+#[cfg(target_os = "windows")]
+fn overlay_hwnd() -> Result<HWND, Box<dyn std::error::Error>> {
+    unsafe {
         let hwnd = FindWindowW(None, windows::core::w!("Echo Live"));
         if hwnd.0 == 0 {
             return Err("Windows could not find the Echo live overlay".into());
@@ -485,6 +856,45 @@ fn configure_overlay_as_non_activating(
         {
             return Err("The Echo live overlay belongs to another process".into());
         }
+        Ok(hwnd)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_overlay_rounded_region(
+    _overlay: &TranscriptOverlayWindow,
+) -> Result<(), Box<dyn std::error::Error>> {
+    unsafe {
+        let hwnd = overlay_hwnd()?;
+        let mut rect = RECT::default();
+        GetWindowRect(hwnd, &mut rect)?;
+        let region = CreateRoundRectRgn(
+            0,
+            0,
+            rect.right - rect.left + 1,
+            rect.bottom - rect.top + 1,
+            28,
+            28,
+        );
+        if region.0 == 0 {
+            return Err("Windows could not create the rounded overlay region".into());
+        }
+        if SetWindowRgn(hwnd, region, true) == 0 {
+            let _ = DeleteObject(region);
+            return Err("Windows could not apply the rounded overlay region".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn configure_overlay_as_non_activating(
+    _overlay: &TranscriptOverlayWindow,
+) -> Result<(), Box<dyn std::error::Error>> {
+    unsafe {
+        // Looking up the HWND directly avoids depending on optional raw-window-
+        // handle support in the selected Slint renderer.
+        let hwnd = overlay_hwnd()?;
         let existing_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         let overlay_style =
             existing_style | WS_EX_NOACTIVATE.0 as isize | WS_EX_TOOLWINDOW.0 as isize;
@@ -496,7 +906,7 @@ fn configure_overlay_as_non_activating(
 #[cfg(target_os = "windows")]
 fn default_overlay_position() -> slint::PhysicalPosition {
     let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    let overlay_h = 120;
+    let overlay_h = OVERLAY_HEIGHT;
     let margin = 24;
     slint::PhysicalPosition::new(margin, (screen_h - overlay_h - margin).max(0))
 }
@@ -535,11 +945,89 @@ fn select_ui_backend() -> Result<(), slint::PlatformError> {
     if std::env::var_os("SLINT_BACKEND").is_none() {
         return slint::BackendSelector::new()
             .backend_name("winit".into())
-            .renderer_name("software".into())
+            // Transparent frameless windows need a complete composited frame.
+            // Slint's winit backend falls back to the compiled software
+            // renderer if FemtoVG cannot initialize on this machine.
+            .renderer_name("femtovg".into())
             .select();
     }
 
     Ok(())
+}
+
+fn selected_microphone_for_snapshot(
+    snapshot: &audio::InputDeviceSnapshot,
+    current_selection: &str,
+    follow_windows_default: bool,
+) -> String {
+    if !follow_windows_default {
+        return current_selection.to_string();
+    }
+
+    snapshot
+        .default_device
+        .as_ref()
+        .or_else(|| snapshot.devices.first())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn synchronize_microphone_editor(
+    ui: &AppWindow,
+    snapshot: &audio::InputDeviceSnapshot,
+    replace_options: bool,
+) {
+    let current_selection = ui.get_selected_microphone().to_string();
+    let next_selection = selected_microphone_for_snapshot(
+        snapshot,
+        &current_selection,
+        ui.get_use_default_microphone(),
+    );
+
+    if replace_options {
+        ui.set_microphone_options(ModelRc::new(VecModel::from(
+            snapshot
+                .devices
+                .iter()
+                .cloned()
+                .map(SharedString::from)
+                .collect::<Vec<_>>(),
+        )));
+    }
+
+    if ui.get_selected_microphone().as_str() != next_selection.as_str() {
+        ui.set_selected_microphone(next_selection.into());
+    }
+}
+
+fn monitor_microphones(
+    ui: slint::Weak<AppWindow>,
+    initial_snapshot: audio::InputDeviceSnapshot,
+    command_tx: mpsc::UnboundedSender<AppCommand>,
+) {
+    thread::spawn(move || {
+        let mut previous_snapshot = initial_snapshot;
+        loop {
+            thread::sleep(std::time::Duration::from_millis(500));
+            let snapshot = audio::input_device_snapshot();
+            let replace_options = snapshot.devices != previous_snapshot.devices;
+            let devices_changed =
+                replace_options || snapshot.default_device != previous_snapshot.default_device;
+            previous_snapshot = snapshot.clone();
+
+            if ui
+                .upgrade_in_event_loop(move |ui| {
+                    synchronize_microphone_editor(&ui, &snapshot, replace_options);
+                })
+                .is_err()
+            {
+                break;
+            }
+            if devices_changed {
+                let _ = command_tx.send(AppCommand::ReconfigureWarmCapture);
+            }
+        }
+    });
 }
 
 fn settings_snapshot_from_ui(ui: &AppWindow, base: &AppSettings) -> AppSettings {
@@ -582,9 +1070,12 @@ fn settings_snapshot_from_ui(ui: &AppWindow, base: &AppSettings) -> AppSettings 
     next.gemini_custom_prompt = ui.get_gemini_custom_prompt().to_string();
     next.selected_microphone = ui.get_selected_microphone().to_string();
     next.use_default_microphone = ui.get_use_default_microphone();
+    next.keep_microphone_ready = ui.get_keep_microphone_ready();
     next.hotkey_text = ui.get_hotkey_text().to_string();
     next.start_with_windows = ui.get_start_with_windows();
+    next.update_checks_enabled = ui.get_update_checks_enabled();
     next.local_sherpa = transcription::LocalSherpaConfig {
+        model: transcription::LocalModel::from_id(&ui.get_local_model_text()),
         num_threads: ui.get_local_cpu_threads().round() as i32,
         vad_threshold: ui.get_local_vad_threshold(),
         silence_ms: ui.get_local_silence_ms().round() as u32,
@@ -619,6 +1110,7 @@ fn populate_settings_editor(ui: &AppWindow, settings: &AppSettings) {
     ui.set_openai_api_key_text(settings.openai_api_key.clone().into());
     ui.set_openai_model_text(settings.openai_model.clone().into());
     ui.set_openai_language_code_text(settings.openai_language_code.clone().into());
+    ui.set_local_model_text(settings.local_sherpa.model.label().into());
     ui.set_local_cpu_threads(settings.local_sherpa.num_threads as f32);
     ui.set_local_vad_threshold(settings.local_sherpa.vad_threshold);
     ui.set_local_silence_ms(settings.local_sherpa.silence_ms as f32);
@@ -635,8 +1127,10 @@ fn populate_settings_editor(ui: &AppWindow, settings: &AppSettings) {
     ui.set_gemini_custom_prompt(settings.gemini_custom_prompt.clone().into());
     ui.set_selected_microphone(settings.selected_microphone.clone().into());
     ui.set_use_default_microphone(settings.use_default_microphone);
+    ui.set_keep_microphone_ready(settings.keep_microphone_ready);
     ui.set_hotkey_text(settings.hotkey_text.clone().into());
     ui.set_start_with_windows(settings.start_with_windows);
+    ui.set_update_checks_enabled(settings.update_checks_enabled);
     ui.set_overlay_opacity(settings.overlay_opacity);
     ui.set_theme_background_top_color(parse_theme_color(
         &settings.theme_background_top_color,
@@ -704,6 +1198,9 @@ fn settings_editor_is_dirty(ui: &AppWindow, saved: &AppSettings) -> bool {
     normalized_saved.overlay_text_color =
         parse_theme_color(&saved.overlay_text_color, ui.get_overlay_text_color()).to_string();
     normalized_saved.normalize_transcription_settings();
+    if draft.use_default_microphone && normalized_saved.use_default_microphone {
+        normalized_saved.selected_microphone = draft.selected_microphone.clone();
+    }
     draft != normalized_saved
 }
 
@@ -740,6 +1237,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|err| format!("unavailable:{err}"))
     );
     #[cfg(target_os = "windows")]
+    let activation_event = InstanceActivationEvent::new()?;
+    #[cfg(target_os = "windows")]
     let _single_instance_guard = match acquire_single_instance()? {
         Some(guard) => {
             echo_info!("instance", "Single-instance mutex acquired");
@@ -750,27 +1249,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "instance",
                 "Echo is already running; activating the existing window"
             );
-            show_existing_instance();
+            show_existing_instance(&activation_event);
             return Ok(());
         }
     };
     select_ui_backend()?;
 
-    let microphones = audio::list_input_devices();
-    let default_microphone =
-        audio::default_input_device_name().unwrap_or_else(|| "Unavailable".to_string());
+    let microphone_snapshot = audio::input_device_snapshot();
     let mut initial_settings = load_settings();
     #[cfg(target_os = "windows")]
     match startup::is_enabled() {
         Ok(enabled) => initial_settings.start_with_windows = enabled,
         Err(err) => echo_warn!("startup", "Failed to read Windows startup setting: {err}"),
     }
-    if initial_settings.selected_microphone.trim().is_empty() {
-        initial_settings.selected_microphone = if !default_microphone.is_empty() {
-            default_microphone.clone()
-        } else {
-            microphones.first().cloned().unwrap_or_default()
-        };
+    if initial_settings.use_default_microphone
+        || initial_settings.selected_microphone.trim().is_empty()
+    {
+        initial_settings.selected_microphone = selected_microphone_for_snapshot(
+            &microphone_snapshot,
+            &initial_settings.selected_microphone,
+            true,
+        );
     }
     if initial_settings.hotkey_text.trim().is_empty() {
         initial_settings.hotkey_text = "Ctrl+Space".to_string();
@@ -785,9 +1284,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         initial_settings.gemini_enabled,
         !initial_settings.elevenlabs_api_key.trim().is_empty(),
         !initial_settings.openai_api_key.trim().is_empty(),
-        transcription::local_models_available()
+        transcription::local_models_available(&initial_settings.local_sherpa)
     );
-    save_settings(&initial_settings);
     let selected_microphone = initial_settings.selected_microphone.clone();
     let settings = Arc::new(Mutex::new(initial_settings.clone()));
     let initial_transcript_history = load_transcript_history();
@@ -802,7 +1300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(
         transcription::TranscriptionProvider::from_id(&initial_settings.transcription_provider),
         transcription::TranscriptionProvider::LocalSherpaOnnx
-    ) && transcription::local_models_available()
+    ) && transcription::local_models_available(&initial_settings.local_sherpa)
     {
         transcription::preload_local_engine(&initial_settings.local_sherpa);
     }
@@ -884,6 +1382,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SharedString::from(transcription::LOCAL_SHERPA_PROVIDER_LABEL),
     ])));
     ui.set_transcription_provider_text(initial_provider.label().into());
+    ui.set_local_model_options(ModelRc::new(VecModel::from(vec![
+        SharedString::from(transcription::LocalModel::ParakeetTdtV2.label()),
+        SharedString::from(transcription::LocalModel::ParakeetTdtV3.label()),
+    ])));
     ui.set_api_key_text(initial_settings.elevenlabs_api_key.clone().into());
     ui.set_elevenlabs_model_text(initial_settings.elevenlabs_model.clone().into());
     ui.set_elevenlabs_language_code_text(initial_settings.elevenlabs_language_code.clone().into());
@@ -891,6 +1393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_openai_api_key_text(initial_settings.openai_api_key.clone().into());
     ui.set_openai_model_text(initial_settings.openai_model.clone().into());
     ui.set_openai_language_code_text(initial_settings.openai_language_code.clone().into());
+    ui.set_local_model_text(initial_settings.local_sherpa.model.label().into());
     ui.set_local_cpu_threads(initial_settings.local_sherpa.num_threads as f32);
     ui.set_local_max_cpu_threads(transcription::physical_core_count() as f32);
     ui.set_local_vad_threshold(initial_settings.local_sherpa.vad_threshold);
@@ -910,7 +1413,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(
         initial_provider,
         transcription::TranscriptionProvider::LocalSherpaOnnx
-    ) && transcription::local_models_available()
+    ) && transcription::local_models_available(&initial_settings.local_sherpa)
     {
         let preload_ui = ui.as_weak();
         thread::spawn(move || {
@@ -928,17 +1431,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     ui.set_gemini_api_key_text(initial_settings.gemini_api_key.clone().into());
-    ui.set_selected_microphone(selected_microphone.clone().into());
-    ui.set_use_default_microphone(initial_settings.use_default_microphone);
-    ui.set_start_with_windows(initial_settings.start_with_windows);
-    ui.set_default_microphone_text(default_microphone.clone().into());
     ui.set_microphone_options(ModelRc::new(VecModel::from(
-        microphones
+        microphone_snapshot
+            .devices
             .iter()
             .cloned()
             .map(SharedString::from)
             .collect::<Vec<SharedString>>(),
     )));
+    ui.set_selected_microphone(selected_microphone.clone().into());
+    ui.set_use_default_microphone(initial_settings.use_default_microphone);
+    ui.set_keep_microphone_ready(initial_settings.keep_microphone_ready);
+    ui.set_start_with_windows(initial_settings.start_with_windows);
+    ui.set_update_checks_enabled(initial_settings.update_checks_enabled);
+    ui.set_app_version(env!("CARGO_PKG_VERSION").into());
+    let update_config = match updater::compiled_config() {
+        Ok(config) => config,
+        Err(err) => {
+            echo_error!("updater", "Invalid compiled update configuration: {err}");
+            ui.set_update_status(format!("Updates are unavailable: {err}").into());
+            ui.set_update_state(4);
+            None
+        }
+    };
+    ui.set_updater_configured(update_config.is_some());
+    if update_config.is_none() && ui.get_update_state() != 4 {
+        ui.set_update_status("Updates are disabled in this development build.".into());
+    }
+    let available_update = Arc::new(Mutex::new(None::<updater::UpdateInfo>));
+    let updater_busy = Arc::new(AtomicBool::new(false));
+
+    let check_ui = ui.as_weak();
+    let check_config = update_config.clone();
+    let check_available = available_update.clone();
+    let check_busy = updater_busy.clone();
+    ui.on_check_for_updates(move || {
+        if let Some(config) = check_config.clone() {
+            begin_update_check(
+                check_ui.clone(),
+                config,
+                check_available.clone(),
+                check_busy.clone(),
+                true,
+            );
+        } else if let Some(ui) = check_ui.upgrade() {
+            ui.set_update_panel_visible(true);
+            ui.set_update_state(4);
+            ui.set_update_status("This build does not have an update feed configured.".into());
+        }
+    });
+
+    let install_ui = ui.as_weak();
+    let install_available = available_update.clone();
+    let install_busy = updater_busy.clone();
+    ui.on_install_update(move || {
+        begin_update_install(
+            install_ui.clone(),
+            install_available.clone(),
+            install_busy.clone(),
+        );
+    });
+
+    if let Some(config) = update_config.clone() {
+        let periodic_ui = ui.as_weak();
+        let periodic_settings = settings.clone();
+        let periodic_available = available_update.clone();
+        let periodic_busy = updater_busy.clone();
+        thread::spawn(move || loop {
+            if periodic_settings.lock().unwrap().update_checks_enabled {
+                begin_update_check(
+                    periodic_ui.clone(),
+                    config.clone(),
+                    periodic_available.clone(),
+                    periodic_busy.clone(),
+                    false,
+                );
+            }
+            thread::sleep(std::time::Duration::from_secs(6 * 60 * 60));
+        });
+    }
+    monitor_microphones(ui.as_weak(), microphone_snapshot, cmd_tx.clone());
 
     let gemini_preset_options: Vec<SharedString> = vec![
         "Minimal corrections".into(),
@@ -983,7 +1555,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|entry| SharedString::from(entry.display_text()))
             .collect::<Vec<_>>(),
     )));
-    ui.set_log_items(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+    let initial_activity = diagnostics::session_snapshot();
+    let initial_activity_revision = initial_activity.revision;
+    ui.set_activity_log_text(initial_activity.text.into());
 
     // When the user closes the main window, hide it but keep the Slint
     // event loop alive so the app can continue running from the tray.
@@ -991,12 +1565,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings_for_close = settings.clone();
     ui.window().on_close_requested(move || {
         if let Some(ui) = ui_weak_for_close.upgrade() {
-            let modal_active =
-                ui.get_local_download_prompt_visible() || ui.get_local_download_progress_visible();
+            let modal_active = ui.get_local_download_prompt_visible()
+                || ui.get_local_download_progress_visible()
+                || ui.get_update_panel_visible();
             if modal_active {
-                ui.set_status_text(
-                    "Finish or dismiss the local model dialog before closing".into(),
-                );
+                ui.set_status_text("Finish or dismiss the open dialog before closing".into());
                 return CloseRequestResponse::KeepWindowShown;
             }
             let dirty = if ui.get_active_tab() == 3 {
@@ -1028,8 +1601,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let transcript_overlay = TranscriptOverlayWindow::new()?;
     transcript_overlay.set_sentence_text("".into());
-    transcript_overlay.set_window_width(520);
-    transcript_overlay.set_window_height(120);
+    transcript_overlay.set_microphone_name(selected_microphone.clone().into());
+    transcript_overlay.set_window_width(OVERLAY_WIDTH);
+    transcript_overlay.set_window_height(OVERLAY_HEIGHT);
     transcript_overlay.set_overlay_opacity(initial_settings.overlay_opacity);
     transcript_overlay.set_overlay_background_color(parse_theme_color(
         &initial_settings.overlay_background_color,
@@ -1070,10 +1644,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(overlay) = overlay_weak_for_drag.upgrade() {
             let current = overlay.window().position();
             let scale = overlay.window().scale_factor();
-            let new_position = slint::PhysicalPosition::new(
+            let proposed_position = slint::PhysicalPosition::new(
                 current.x + (dx as f32 * scale) as i32,
                 current.y + (dy as f32 * scale) as i32,
             );
+            #[cfg(target_os = "windows")]
+            let new_position = clamp_overlay_position(
+                proposed_position,
+                (OVERLAY_WIDTH as f32 * scale).round() as i32,
+                (overlay.get_window_height() as f32 * scale).round() as i32,
+            );
+            #[cfg(not(target_os = "windows"))]
+            let new_position = proposed_position;
             overlay.window().set_position(new_position);
 
             let snapshot = {
@@ -1091,23 +1673,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings_for_runtime = settings.clone();
     let cmd_tx_for_runtime = cmd_tx.clone();
 
-    let log_raw_for_clipboard: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
     ui.on_copy_transcript({
         let raw = transcript_raw_for_clipboard.clone();
-        move |index| {
-            if let Ok(hist) = raw.lock() {
-                if let Some(text) = hist.get(index as usize) {
-                    if let Ok(mut cb) = Clipboard::new() {
-                        let _ = cb.set_text(text.clone());
-                    }
-                }
-            }
-        }
-    });
-
-    ui.on_copy_log_item({
-        let raw = log_raw_for_clipboard.clone();
         move |index| {
             if let Ok(hist) = raw.lock() {
                 if let Some(text) = hist.get(index as usize) {
@@ -1128,16 +1695,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             echo_info!("runtime", "Tokio runtime active");
 
             let mut active_session: Option<Session> = None;
-            let mut local_start_armed = false;
+            let mut warm_capture: Option<audio::WarmAudioCapture> = None;
+            let mut warm_reconfigure_pending = false;
             let (finalize_tx, mut finalize_rx) = mpsc::unbounded_channel::<(u64, bool)>();
             let overlay_visible = Arc::new(AtomicBool::new(false));
             let session_epoch = Arc::new(AtomicU64::new(0));
+
+            let startup_settings = settings_for_runtime.lock().unwrap().clone();
+            if let Err(err) = reconfigure_warm_capture(
+                &mut warm_capture,
+                &startup_settings,
+                level_tx.clone(),
+            )
+            .await
+            {
+                echo_warn!("audio", "Warm microphone startup failed: {}", err);
+                let _ = ui_handle_for_tokio.upgrade_in_event_loop(move |ui| {
+                    ui.set_status_text(
+                        "Warm microphone unavailable; instant capture will retry".into(),
+                    );
+                });
+            }
 
             loop {
                 tokio::select! {
                     Some(level) = level_rx.recv() => {
                         let _ = ui_handle_for_tokio.upgrade_in_event_loop(move |ui| {
                             ui.set_audio_level(level);
+                        });
+                        let _ = overlay_handle_for_tokio.upgrade_in_event_loop(move |overlay| {
+                            overlay.set_audio_level(level);
                         });
                     }
                     Some((finalized_epoch, preserve_status)) = finalize_rx.recv() => {
@@ -1156,6 +1743,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             continue;
                         }
+                        if let Some(session) = active_session.as_mut() {
+                            if session.warm_capture_attached {
+                                if let Some(capture) = warm_capture.as_ref() {
+                                    if let Err(err) = capture.detach(session.epoch).await {
+                                        echo_warn!("audio", "Warm microphone detach during finalization failed epoch={}: {}", session.epoch, err);
+                                    }
+                                }
+                                session.warm_capture_attached = false;
+                            }
+                        }
                         if let Some(mut session) = active_session.take() {
                             session.cancel_finalization_watchdog();
                             if let Ok(mut state) = session.state.lock() {
@@ -1166,6 +1763,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "Finalization complete epoch={} session closed",
                                 finalized_epoch
                             );
+                        }
+                        if warm_reconfigure_pending {
+                            warm_reconfigure_pending = false;
+                            let current_settings = settings_for_runtime.lock().unwrap().clone();
+                            if let Err(err) = reconfigure_warm_capture(
+                                &mut warm_capture,
+                                &current_settings,
+                                level_tx.clone(),
+                            )
+                            .await
+                            {
+                                echo_warn!("audio", "Deferred warm microphone reconfiguration failed: {}", err);
+                            }
                         }
                         overlay_visible.store(false, Ordering::SeqCst);
                         let _ = ui_handle_for_tokio.upgrade_in_event_loop(move |ui| {
@@ -1179,60 +1789,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                         let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
                             overlay.set_sentence_text("".into());
-                            overlay.set_window_width(520);
-                            overlay.set_window_height(120);
+                            overlay.set_audio_level(0.0);
+                            overlay.set_window_width(OVERLAY_WIDTH);
+                            set_overlay_height(&overlay, OVERLAY_HEIGHT);
                             overlay.set_is_error(false);
                             overlay.set_is_system_message(false);
                             overlay.set_is_visible(false);
-                            let _ = overlay.hide();
+                            hide_overlay_window(&overlay);
                         });
                     }
                     Some(cmd) = cmd_rx.recv() => {
                     echo_info!(
                         "command",
-                        "Received command={} active_epoch={} local_start_armed={}",
+                        "Received command={} active_epoch={}",
                         app_command_name(&cmd),
-                        active_session.as_ref().map_or(0, |session| session.epoch),
-                        local_start_armed
+                        active_session.as_ref().map_or(0, |session| session.epoch)
                     );
                     let cmd = match cmd {
-                        AppCommand::LocalEngineLoaded(result) => {
-                            if !local_start_armed {
-                                continue;
-                            }
-                            match result {
-                                Ok(()) => {
-                                    echo_info!("local_model", "Background model load completed");
-                                    local_start_armed = false;
-                                    AppCommand::StartRecording
-                                }
-                                Err(err) => {
-                                    echo_error!(
-                                        "local_model",
-                                        "Background model load failed: {err}"
-                                    );
-                                    local_start_armed = false;
-                                    let message = format!("Local model error:\n{err}");
-                                    let prompt_error = format!("The local model could not load: {err}");
-                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(move |ui| {
-                                        ui.set_status_text("Local model failed to load".into());
-                                        ui.set_has_error(true);
-                                        ui.set_local_download_error(prompt_error.into());
-                                        request_local_model_prompt(&ui);
-                                        ui.set_active_tab(3);
-                                        let _ = ui.show();
-                                    });
-                                    let _ = overlay_handle_for_tokio.upgrade_in_event_loop(move |overlay| {
-                                        overlay.set_sentence_text(message.into());
-                                        overlay.set_is_error(true);
-                                        overlay.set_is_system_message(true);
-                                        overlay.set_is_visible(true);
-                                        let _ = overlay.show();
-                                    });
-                                    continue;
-                                }
-                            }
-                        }
                         AppCommand::ToggleRecording => {
                             match active_session.as_ref() {
                                 Some(session) => {
@@ -1246,18 +1819,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         );
                                         continue;
                                     }
-                                }
-                                None if local_start_armed => {
-                                    local_start_armed = false;
-                                    overlay_visible.store(false, Ordering::SeqCst);
-                                    let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
-                                        overlay.set_is_visible(false);
-                                        let _ = overlay.hide();
-                                    });
-                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
-                                        ui.set_status_text("Local model loading in background".into());
-                                    });
-                                    continue;
                                 }
                                 None => AppCommand::StartRecording,
                             }
@@ -1279,7 +1840,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 });
                                 continue;
                             }
-
                             let current_settings = settings_for_runtime.lock().unwrap().clone();
                             let provider = transcription::TranscriptionProvider::from_id(
                                 &current_settings.transcription_provider,
@@ -1298,8 +1858,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
 
-                            if matches!(provider, transcription::TranscriptionProvider::LocalSherpaOnnx) {
-                                if !transcription::local_models_available() {
+                            if matches!(
+                                provider,
+                                transcription::TranscriptionProvider::LocalSherpaOnnx
+                            ) && !transcription::local_models_available(&current_settings.local_sherpa)
+                            {
                                     echo_warn!(
                                         "local_model",
                                         "Start rejected because required local model files are unavailable"
@@ -1313,72 +1876,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let _ = ui.show();
                                     });
                                     continue;
-                                }
-                                match transcription::local_engine_status() {
-                                    transcription::LocalEngineStatus::Ready => {}
-                                    _ => {
-                                        echo_info!(
-                                            "local_model",
-                                            "Local model preload requested before recording"
-                                        );
-                                        transcription::preload_local_engine(&current_settings.local_sherpa);
-                                        local_start_armed = true;
-                                        overlay_visible.store(true, Ordering::SeqCst);
-                                        let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
-                                            ui.set_status_text("Loading local speech model...".into());
-                                            ui.set_has_error(false);
-                                        });
-                                        let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
-                                            overlay.set_sentence_text("Local speech model is still loading...".into());
-                                            overlay.set_window_width(520);
-                                            overlay.set_window_height(120);
-                                            overlay.set_is_error(true);
-                                            overlay.set_is_system_message(true);
-                                            overlay.set_is_visible(true);
-                                            let _ = overlay.show();
-                                        });
-                                        let ready_tx = cmd_tx_for_runtime.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            let result = transcription::wait_for_local_engine();
-                                            let _ = ready_tx.send(AppCommand::LocalEngineLoaded(result));
-                                        });
-                                        continue;
-                                    }
-                                }
                             }
 
                             let current_session_epoch =
                                 session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
 
-                            let preferred_device = if current_settings.use_default_microphone {
-                                None
-                            } else {
-                                Some(current_settings.selected_microphone.clone())
-                            };
-
-                            echo_info!(
-                                "session",
-                                "Starting epoch={} provider={} use_default_microphone={} gemini_enabled={}",
-                                current_session_epoch,
-                                provider.id(),
-                                current_settings.use_default_microphone,
-                                current_settings.gemini_enabled
-                            );
-                            let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
-                                ui.set_status_text("Connecting...".into());
-                                ui.set_has_error(false);
-                                ui.set_is_finalizing(false);
-                                ui.set_transcript("".into());
-                            });
-                            overlay_visible.store(true, Ordering::SeqCst);
-                            let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
-                                reset_overlay_to_listening(&overlay);
-                            });
+                            let preferred_device = preferred_microphone(&current_settings);
 
                             let state = Arc::new(Mutex::new(RecordingState::BufferingPreConnect));
                             let transcript_pipeline = Arc::new(Mutex::new(TranscriptPipeline::new()));
-                            let log_display: Arc<Mutex<Vec<SharedString>>> = Arc::new(Mutex::new(Vec::new()));
-                            let log_raw: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
                             let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>(50);
                             let (network_stop_tx, network_stop_rx) =
                                 mpsc::unbounded_channel::<transcription::TranscriptionCommand>();
@@ -1388,16 +1894,132 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 mpsc::unbounded_channel::<String>();
                             let audio_level_tx = level_tx.clone();
 
-                            let stream_result =
-                                audio::start_audio_capture(audio_tx, audio_level_tx, preferred_device);
+                            if current_settings.keep_microphone_ready && warm_capture.is_none() {
+                                if let Err(err) = reconfigure_warm_capture(
+                                    &mut warm_capture,
+                                    &current_settings,
+                                    level_tx.clone(),
+                                )
+                                .await
+                                {
+                                    echo_warn!(
+                                        "audio",
+                                        "Warm microphone retry failed before epoch={}: {}",
+                                        current_session_epoch,
+                                        err
+                                    );
+                                }
+                            }
 
-                            match stream_result {
-                                Ok(stream) => {
+                            let capture_result: Result<
+                                (Option<audio::AudioCapture>, bool, String),
+                                String,
+                            > = if current_settings.keep_microphone_ready {
+                                if let Some(capture) = warm_capture.as_ref() {
+                                    match capture.attach(current_session_epoch, audio_tx.clone()).await {
+                                        Ok(pre_roll_samples) => {
+                                            echo_info!(
+                                                "audio",
+                                                "Warm microphone attached epoch={} pre_roll_samples={}",
+                                                current_session_epoch,
+                                                pre_roll_samples
+                                            );
+                                            Ok((None, true, capture.device_name().to_string()))
+                                        }
+                                        Err(err) => {
+                                            warm_reconfigure_pending = true;
+                                            echo_warn!(
+                                                "audio",
+                                                "Warm microphone attach failed epoch={}; falling back to on-demand capture: {}",
+                                                current_session_epoch,
+                                                err
+                                            );
+                                            audio::start_audio_capture(
+                                                audio_tx,
+                                                audio_level_tx,
+                                                preferred_device,
+                                            )
+                                            .map(|capture| {
+                                                let name = capture.device_name().to_string();
+                                                (Some(capture), false, name)
+                                            })
+                                            .map_err(|err| err.to_string())
+                                        }
+                                    }
+                                } else {
+                                    audio::start_audio_capture(
+                                        audio_tx,
+                                        audio_level_tx,
+                                        preferred_device,
+                                    )
+                                    .map(|capture| {
+                                        let name = capture.device_name().to_string();
+                                        (Some(capture), false, name)
+                                    })
+                                    .map_err(|err| err.to_string())
+                                }
+                            } else {
+                                audio::start_audio_capture(
+                                    audio_tx,
+                                    audio_level_tx,
+                                    preferred_device,
+                                )
+                                .map(|capture| {
+                                    let name = capture.device_name().to_string();
+                                    (Some(capture), false, name)
+                                })
+                                .map_err(|err| err.to_string())
+                            };
+
+                            match capture_result {
+                                Ok((capture, warm_capture_attached, microphone_name)) => {
+                                    let injection_target = injector::capture_injection_target();
                                     echo_info!(
                                         "audio",
-                                        "Capture stream started epoch={}",
-                                        current_session_epoch
+                                        "Capture path ready epoch={} warm={} before provider and overlay initialization",
+                                        current_session_epoch,
+                                        warm_capture_attached,
                                     );
+                                    echo_info!(
+                                        "session",
+                                        "Starting epoch={} provider={} use_default_microphone={} gemini_enabled={}",
+                                        current_session_epoch,
+                                        provider.id(),
+                                        current_settings.use_default_microphone,
+                                        current_settings.gemini_enabled
+                                    );
+                                    if matches!(
+                                        provider,
+                                        transcription::TranscriptionProvider::LocalSherpaOnnx
+                                    ) && !matches!(
+                                        transcription::local_engine_status(),
+                                        transcription::LocalEngineStatus::Ready
+                                    ) {
+                                        echo_info!(
+                                            "local_model",
+                                            "Local model preload requested after capture started"
+                                        );
+                                        transcription::preload_local_engine(
+                                            &current_settings.local_sherpa,
+                                        );
+                                    }
+
+                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
+                                        ui.set_status_text("Connecting...".into());
+                                        ui.set_has_error(false);
+                                        ui.set_is_finalizing(false);
+                                        ui.set_transcript("".into());
+                                    });
+                                    overlay_visible.store(true, Ordering::SeqCst);
+                                    let _ = overlay_handle_for_tokio.upgrade_in_event_loop(
+                                        move |overlay| {
+                                            reset_overlay_to_listening(
+                                                &overlay,
+                                                &microphone_name,
+                                            );
+                                        },
+                                    );
+
                                     let client = transcription::TranscriberClient::from_config(
                                         current_settings.transcription_config(),
                                     );
@@ -1408,15 +2030,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let transcript_history_revision_for_text =
                                         transcript_history_revision_for_runtime.clone();
                                     let transcript_raw_for_cb = transcript_raw_for_runtime.clone();
-                                    let log_display_for_text = log_display.clone();
-                                    let log_raw_for_text = log_raw.clone();
-                                    let log_raw_for_cb = log_raw_for_clipboard.clone();
                                     let log_line_tx_for_text = log_line_tx.clone();
                                     let settings_for_text = settings_for_runtime.clone();
                                     let finalize_tx_for_transcript = finalize_tx.clone();
                                     let ui_handle_for_network = ui_handle_for_tokio.clone();
                                     let ui_handle_for_transcript = ui_handle_for_tokio.clone();
-                                    let ui_handle_for_log = ui_handle_for_tokio.clone();
                                     let overlay_handle_for_transcript = overlay_handle_for_tokio.clone();
                                     let overlay_visible_for_transcript = overlay_visible.clone();
                                     let session_epoch_for_transcript = session_epoch.clone();
@@ -1493,61 +2111,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     });
 
                                     let log_task = tokio::spawn(async move {
-                                        let mut refresh =
-                                            tokio::time::interval(std::time::Duration::from_millis(100));
-                                        refresh.set_missed_tick_behavior(
-                                            tokio::time::MissedTickBehavior::Delay,
-                                        );
-                                        let mut dirty = false;
-
-                                        loop {
-                                            tokio::select! {
-                                                maybe_line = log_line_rx.recv() => {
-                                                    let Some(line) = maybe_line else {
-                                                        break;
-                                                    };
-                                                    diagnostics::record(
-                                                        "INFO",
-                                                        "provider_event",
-                                                        format_args!(
-                                                            "epoch={} {}",
-                                                            current_session_epoch,
-                                                            line
-                                                        ),
-                                                    );
-                                                    let ts = Local::now().format("%H:%M:%S");
-                                                    let display_line: SharedString =
-                                                        format!("[{}] {}", ts, line).into();
-                                                    let raw_line = line;
-                                                    {
-                                                        let mut disp = log_display_for_text.lock().unwrap();
-                                                        let mut raw = log_raw_for_text.lock().unwrap();
-                                                        disp.push(display_line);
-                                                        raw.push(raw_line);
-                                                        if disp.len() > 300 {
-                                                            let excess = disp.len() - 300;
-                                                            disp.drain(0..excess);
-                                                            raw.drain(0..excess);
-                                                        }
-                                                        *log_raw_for_cb.lock().unwrap() = raw.clone();
-                                                    }
-                                                    dirty = true;
-                                                }
-                                                _ = refresh.tick(), if dirty => {
-                                                    let items = log_display_for_text.lock().unwrap().clone();
-                                                    let _ = ui_handle_for_log.upgrade_in_event_loop(move |ui| {
-                                                        ui.set_log_items(ModelRc::new(VecModel::from(items)));
-                                                    });
-                                                    dirty = false;
-                                                }
-                                            }
-                                        }
-
-                                        if dirty {
-                                            let items = log_display_for_text.lock().unwrap().clone();
-                                            let _ = ui_handle_for_log.upgrade_in_event_loop(move |ui| {
-                                                ui.set_log_items(ModelRc::new(VecModel::from(items)));
-                                            });
+                                        while let Some(line) = log_line_rx.recv().await {
+                                            diagnostics::record(
+                                                "INFO",
+                                                "provider_event",
+                                                format_args!(
+                                                    "epoch={} {}",
+                                                    current_session_epoch,
+                                                    line
+                                                ),
+                                            );
                                         }
                                     });
 
@@ -1654,10 +2227,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                                 overlay.set_is_system_message(true);
                                                                 overlay.set_sentence_text(pending_text.into());
                                                                 overlay.set_window_width(w);
-                                                                overlay.set_window_height(h);
+                                                                set_overlay_height(&overlay, h);
                                                                 overlay.set_is_visible(true);
                                                                 overlay_visible_setter.store(true, Ordering::SeqCst);
-                                                                let _ = overlay.show();
+                                                                show_overlay_without_activation(&overlay);
                                                             });
                                                         gemini::rewrite_text(&gkey, &gmodel, &gpreset, &gcustom, &base_text).await
                                                     } else {
@@ -1749,7 +2322,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                                 final_payload.chars().count()
                                                             );
                                                             let to_inject = format!("{} ", final_payload);
-                                                            match injector::inject_text(&to_inject) {
+                                                            match injector::inject_text(
+                                                                &to_inject,
+                                                                injection_target,
+                                                            ) {
                                                                 Ok(()) => {
                                                                     echo_info!(
                                                                         "injection",
@@ -1815,7 +2391,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 }
                                             };
 
-                                            let aggregated_for_overlay = display_text.clone();
+                                            let aggregated_for_overlay =
+                                                overlay_caption_text(&display_text);
                                             let hide_overlay = (was_committed && stop_requested_for_msg) || is_error;
                                             let text_for_ui = if was_committed || is_error {
                                                 display_text.clone()
@@ -1853,13 +2430,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     overlay.set_is_error(is_error);
                                                     if hide_overlay {
                                                         overlay.set_sentence_text("".into());
-                                                        overlay.set_window_width(520);
-                                                        overlay.set_window_height(120);
+                                                        overlay.set_window_width(OVERLAY_WIDTH);
+                                                        set_overlay_height(&overlay, OVERLAY_HEIGHT);
                                                         overlay.set_is_error(false);
                                                         overlay.set_is_system_message(false);
                                                         overlay.set_is_visible(false);
                                                         overlay_visible_setter.store(false, Ordering::SeqCst);
-                                                        let _ = overlay.hide();
+                                                        hide_overlay_window(&overlay);
                                                     } else {
                                                         let (w, h) =
                                                             overlay_size_for_text(
@@ -1870,10 +2447,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                             aggregated_for_overlay.into(),
                                                         );
                                                         overlay.set_window_width(w);
-                                                        overlay.set_window_height(h);
+                                                        set_overlay_height(&overlay, h);
                                                         overlay.set_is_visible(true);
                                                         overlay_visible_setter.store(true, Ordering::SeqCst);
-                                                        let _ = overlay.show();
+                                                        show_overlay_without_activation(&overlay);
                                                     }
                                                 });
 
@@ -1893,7 +2470,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     active_session = Some(Session {
                                         epoch: current_session_epoch,
                                         state,
-                                        audio_stream: Some(stream),
+                                        audio_capture: capture,
+                                        warm_capture_attached,
                                         audio_forward_stop_tx: Some(audio_forward_stop_tx),
                                         network_stop_tx: Some(network_stop_tx),
                                         transcript_pipeline,
@@ -1926,13 +2504,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     });
                                     let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
                                         overlay.set_sentence_text("".into());
-                                        overlay.set_window_width(520);
-                                        overlay.set_window_height(120);
+                                        overlay.set_window_width(OVERLAY_WIDTH);
+                                        set_overlay_height(&overlay, OVERLAY_HEIGHT);
                                         overlay.set_is_system_message(false);
                                         overlay.set_is_visible(false);
-                                        let _ = overlay.hide();
+                                        hide_overlay_window(&overlay);
                                     });
                                     }
+                                    }
+                                    }
+                                    AppCommand::ReconfigureWarmCapture => {
+                                    if active_session.is_some() {
+                                        warm_reconfigure_pending = true;
+                                        echo_info!(
+                                            "audio",
+                                            "Warm microphone reconfiguration deferred until the active session finishes"
+                                        );
+                                        continue;
+                                    }
+                                    let current_settings = settings_for_runtime.lock().unwrap().clone();
+                                    if let Err(err) = reconfigure_warm_capture(
+                                        &mut warm_capture,
+                                        &current_settings,
+                                        level_tx.clone(),
+                                    )
+                                    .await
+                                    {
+                                        echo_warn!("audio", "Warm microphone reconfiguration failed: {}", err);
+                                        let _ = ui_handle_for_tokio.upgrade_in_event_loop(move |ui| {
+                                            ui.set_status_text(
+                                                "Warm microphone unavailable; using normal startup".into(),
+                                            );
+                                        });
                                     }
                                     }
                                     AppCommand::StopRecording => {
@@ -1967,14 +2570,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         ui.set_is_finalizing(true);
                                     });
 
-                                    // Close capture, then explicitly close and drain the
-                                    // forwarding receiver before asking the provider to commit.
-                                    session.audio_stream.take();
                                     if let Ok(mut pipeline) = session.transcript_pipeline.lock() {
                                     pipeline.request_stop();
                                     }
-                                    session.request_stop();
                                     let timed_out_epoch = session.epoch;
+                                    let post_roll_tx = cmd_tx_for_runtime.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(CAPTURE_POST_ROLL).await;
+                                        let _ = post_roll_tx.send(
+                                            AppCommand::CapturePostRollElapsed(timed_out_epoch)
+                                        );
+                                    });
                                     let timeout_tx = cmd_tx_for_runtime.clone();
                                     let watchdog = tokio::spawn(async move {
                                         tokio::time::sleep(FINALIZATION_TIMEOUT).await;
@@ -1989,7 +2595,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     }
                                     AppCommand::ToggleRecording => unreachable!(),
-                                    AppCommand::LocalEngineLoaded(_) => unreachable!(),
+                                    AppCommand::CapturePostRollElapsed(capture_epoch) => {
+                                    let Some(session) = active_session.as_mut() else {
+                                        continue;
+                                    };
+                                    if session.epoch != capture_epoch {
+                                        continue;
+                                    }
+                                    if session.warm_capture_attached {
+                                        echo_info!(
+                                            "audio",
+                                            "Post-roll complete epoch={} post_roll_ms={}; detaching warm capture",
+                                            capture_epoch,
+                                            CAPTURE_POST_ROLL.as_millis()
+                                        );
+                                        let result = if let Some(capture) = warm_capture.as_ref() {
+                                            capture.detach(capture_epoch).await
+                                        } else {
+                                            Err("Warm microphone became unavailable during recording".to_string())
+                                        };
+                                        session.warm_capture_attached = false;
+                                        if let Err(err) = result {
+                                            echo_warn!(
+                                                "audio",
+                                                "Warm microphone detach failed epoch={}: {}",
+                                                capture_epoch,
+                                                err
+                                            );
+                                        }
+                                        session.request_stop();
+                                        continue;
+                                    }
+                                    let Some(capture) = session.audio_capture.take() else {
+                                        echo_error!(
+                                            "audio",
+                                            "Session epoch={} has no capture source during post-roll",
+                                            capture_epoch
+                                        );
+                                        session.request_stop();
+                                        continue;
+                                    };
+                                    echo_info!(
+                                        "audio",
+                                        "Post-roll complete epoch={} post_roll_ms={}; stopping capture",
+                                        capture_epoch,
+                                        CAPTURE_POST_ROLL.as_millis()
+                                    );
+                                    let worker = capture.begin_shutdown();
+                                    let flushed_tx = cmd_tx_for_runtime.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            worker.join().map_err(|_| {
+                                                "Audio conversion worker panicked during shutdown"
+                                                    .to_string()
+                                            })
+                                        })
+                                        .await
+                                        .map_err(|err| err.to_string())
+                                        .and_then(|result| result);
+                                        let _ = flushed_tx.send(
+                                            AppCommand::CaptureFlushed(capture_epoch, result)
+                                        );
+                                    });
+                                    }
+                                    AppCommand::CaptureFlushed(capture_epoch, result) => {
+                                    let Some(session) = active_session.as_mut() else {
+                                        continue;
+                                    };
+                                    if session.epoch != capture_epoch {
+                                        continue;
+                                    }
+                                    match result {
+                                        Ok(stats) => echo_info!(
+                                            "audio",
+                                            "Capture flush complete epoch={} pending_input_samples={} flushed_output_samples={}",
+                                            capture_epoch,
+                                            stats.pending_input_samples,
+                                            stats.flushed_output_samples
+                                        ),
+                                        Err(err) => echo_error!(
+                                            "audio",
+                                            "Capture flush failed epoch={}: {}",
+                                            capture_epoch,
+                                            err
+                                        ),
+                                    }
+                                    session.request_stop();
+                                    }
                                     AppCommand::FinalizationTimedOut(timed_out_epoch) => {
                                     let timed_out = active_session
                                         .as_ref()
@@ -2004,6 +2696,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         timed_out_epoch
                                     );
                                     session_epoch.fetch_add(1, Ordering::SeqCst);
+                                    if let Some(session) = active_session.as_mut() {
+                                        if session.warm_capture_attached {
+                                            if let Some(capture) = warm_capture.as_ref() {
+                                                let _ = capture.detach(session.epoch).await;
+                                            }
+                                            session.warm_capture_attached = false;
+                                        }
+                                    }
                                     if let Some(mut session) = active_session.take() {
                                         session.cancel_finalization_watchdog();
                                         session.abort_tasks();
@@ -2019,7 +2719,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
                                         overlay.set_sentence_text("".into());
                                         overlay.set_is_visible(false);
-                                        let _ = overlay.hide();
+                                        hide_overlay_window(&overlay);
                                     });
                                     }
                                     }
@@ -2052,6 +2752,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if ui.get_local_download_prompt_visible()
                 || ui.get_local_download_progress_visible()
                 || ui.get_unsaved_settings_prompt_visible()
+                || ui.get_update_panel_visible()
             {
                 return;
             }
@@ -2080,6 +2781,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hotkey_id_for_apply = hotkey_id_state.clone();
     #[cfg(target_os = "windows")]
     let hotkey_text_for_apply = hotkey_text.clone();
+    let warm_capture_reconfigure_tx = cmd_tx.clone();
     ui.on_apply_settings(move || {
         let (
             elevenlabs_api_key,
@@ -2097,6 +2799,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gemini_custom,
             selected_mic,
             use_default_mic,
+            keep_microphone_ready,
             start_with_windows,
             local_cpu_threads,
             local_vad_threshold,
@@ -2107,6 +2810,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             local_max_segment_seconds,
             local_partial_interval_ms,
             local_redecode_full_session,
+            local_model,
         ) = if let Some(ui) = ui_weak_for_apply.upgrade() {
             (
                 ui.get_api_key_text().to_string(),
@@ -2124,6 +2828,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui.get_gemini_custom_prompt().to_string(),
                 ui.get_selected_microphone().to_string(),
                 ui.get_use_default_microphone(),
+                ui.get_keep_microphone_ready(),
                 ui.get_start_with_windows(),
                 ui.get_local_cpu_threads().round() as i32,
                 ui.get_local_vad_threshold(),
@@ -2134,6 +2839,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui.get_local_max_segment_seconds().round() as u32,
                 ui.get_local_partial_interval_ms().round() as u32,
                 ui.get_local_redecode_full_session(),
+                transcription::LocalModel::from_id(&ui.get_local_model_text()),
             )
         } else {
             (
@@ -2153,6 +2859,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 String::new(),
                 true,
                 false,
+                false,
                 transcription::physical_core_count().clamp(1, 4),
                 0.5,
                 600,
@@ -2162,6 +2869,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 30,
                 1000,
                 false,
+                transcription::LocalModel::default(),
             )
         };
 
@@ -2215,8 +2923,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             next.gemini_custom_prompt = gemini_custom;
             next.selected_microphone = selected_mic;
             next.use_default_microphone = use_default_mic;
+            next.keep_microphone_ready = keep_microphone_ready;
             next.start_with_windows = start_with_windows;
             next.local_sherpa = transcription::LocalSherpaConfig {
+                model: local_model,
                 num_threads: local_cpu_threads,
                 vad_threshold: local_vad_threshold,
                 silence_ms: local_silence_ms,
@@ -2232,6 +2942,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         if let Some(ui) = ui_weak_for_apply.upgrade() {
             snapshot.hotkey_text = ui.get_hotkey_text().to_string();
+            snapshot.update_checks_enabled = ui.get_update_checks_enabled();
             snapshot.overlay_opacity = ui.get_overlay_opacity();
             snapshot.theme_background_top_color = ui.get_theme_background_top_color().to_string();
             snapshot.theme_background_bottom_color =
@@ -2306,11 +3017,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(mut current) = settings_for_ui.lock() {
                 *current = snapshot.clone();
             }
+            let _ = warm_capture_reconfigure_tx.send(AppCommand::ReconfigureWarmCapture);
             let local_selected = matches!(
                 transcription::TranscriptionProvider::from_id(&snapshot.transcription_provider),
                 transcription::TranscriptionProvider::LocalSherpaOnnx
             );
-            if local_selected && transcription::local_models_available() {
+            if local_selected && transcription::local_models_available(&snapshot.local_sherpa) {
                 transcription::preload_local_engine(&snapshot.local_sherpa);
                 let repair_ui = ui_weak_for_settings.clone();
                 thread::spawn(move || {
@@ -2391,7 +3103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if matches!(
                 transcription::TranscriptionProvider::from_id(&saved.transcription_provider),
                 transcription::TranscriptionProvider::LocalSherpaOnnx
-            ) && transcription::local_models_available()
+            ) && transcription::local_models_available(&saved.local_sherpa)
             {
                 transcription::preload_local_engine(&saved.local_sherpa);
             }
@@ -2433,6 +3145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         thread::spawn(move || {
             let runtime = Runtime::new().unwrap();
             let result = runtime.block_on(transcription::download_local_models(
+                local_config.model,
                 move |fraction, status| {
                     let _ = progress_ui.upgrade_in_event_loop(move |ui| {
                         ui.set_local_download_progress(fraction);
@@ -2527,16 +3240,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transcript_raw_for_clear = transcript_raw_for_clipboard.clone();
     ui.on_clear_transcript(move || {
         echo_info!("history", "User requested transcript history clear");
+        if !save_transcript_history(&[]) {
+            echo_error!("history", "Failed to clear persisted transcript history");
+            if let Some(ui) = ui_weak_for_clear.upgrade() {
+                ui.set_has_error(true);
+                ui.set_status_text(
+                    "Could not clear transcript history; the existing history was kept".into(),
+                );
+            }
+            return;
+        }
         {
             let mut history = transcript_history_for_clear.lock().unwrap();
             history.clear();
-            if !save_transcript_history(&history) {
-                echo_error!("history", "Failed to clear persisted transcript history");
-            }
             transcript_raw_for_clear.lock().unwrap().clear();
             transcript_history_revision_for_clear.fetch_add(1, Ordering::SeqCst);
         }
         if let Some(ui) = ui_weak_for_clear.upgrade() {
+            ui.set_has_error(false);
+            ui.set_status_text("Transcript history cleared".into());
             ui.set_transcript("".into());
             ui.set_transcript_history(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
         }
@@ -2558,12 +3280,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     let hotkey_capture_latched_for_timer = hotkey_capture_latched.clone();
 
+    let activity_revision_seen = Rc::new(Cell::new(initial_activity_revision));
+
+    let activity_revision_for_timer = activity_revision_seen.clone();
+    let ui_weak_for_activity_timer = ui.as_weak();
+    let activity_timer = slint::Timer::default();
+    activity_timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(250),
+        move || {
+            let Some(ui) = ui_weak_for_activity_timer.upgrade() else {
+                return;
+            };
+            if ui.get_active_tab() != 2 {
+                return;
+            }
+            let revision = diagnostics::session_revision();
+            if revision == activity_revision_for_timer.get() {
+                return;
+            }
+            let snapshot = diagnostics::session_snapshot();
+            activity_revision_for_timer.set(snapshot.revision);
+            ui.set_activity_log_text(snapshot.text.into());
+        },
+    );
+
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
         std::time::Duration::from_millis(50),
         move || {
             if let Some(ui) = ui_handle_for_timer.upgrade() {
+                #[cfg(target_os = "windows")]
+                if activation_event.take_request() {
+                    show_main_window(&ui);
+                }
                 let saved = settings_for_timer.lock().unwrap().clone();
                 ui.set_settings_dirty(settings_editor_is_dirty(&ui, &saved));
 
@@ -2597,7 +3348,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         transcription::TranscriptionProvider::from_id(&selected_provider),
                         transcription::TranscriptionProvider::LocalSherpaOnnx
                     )
-                    && !transcription::local_models_available()
+                    && !transcription::local_models_available(
+                        &settings.lock().unwrap().local_sherpa,
+                    )
                     && !local_offer_for_timer.get()
                     && !ui.get_unsaved_settings_prompt_visible()
                     && !ui.get_local_download_prompt_visible()
@@ -2664,7 +3417,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if button == MouseButton::Left && button_state == MouseButtonState::Up {
                                 echo_info!("tray", "Tray icon activated");
                                 ui.invoke_request_navigation(0);
-                                let _ = ui.show();
+                                show_main_window(&ui);
                             }
                         }
                     }
@@ -2692,7 +3445,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else if event.id == settings_item_id {
                             echo_info!("tray", "Settings menu item selected");
                             ui.set_active_tab(3);
-                            ui.show().unwrap();
+                            show_main_window(&ui);
                         }
                     }
                 }
@@ -2726,17 +3479,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "Could not initialize non-activating overlay style: {err}"
                             );
                         }
-                        let _ = overlay.hide();
+                        hide_overlay_window(&overlay);
                     }
                     if !started_by_windows {
                         if let Some(ui) = ui_for_native_init.upgrade() {
-                            let _ = ui.show();
+                            show_main_window(&ui);
                         }
                     }
                 });
             } else if !started_by_windows {
                 if let Some(ui) = ui_for_native_init.upgrade() {
-                    let _ = ui.show();
+                    show_main_window(&ui);
                 }
             }
         });
@@ -2749,9 +3502,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
-    use super::{forward_audio_until_stopped, parse_hotkey};
+    use super::{
+        forward_audio_until_stopped, overlay_caption_text, overlay_size_for_text, parse_hotkey,
+        selected_microphone_for_snapshot, OVERLAY_CAPTION_CHARACTERS, OVERLAY_HEIGHT,
+        OVERLAY_MAX_LINES,
+    };
+    use crate::audio::InputDeviceSnapshot;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn instance_activation_waits_for_ui_and_is_consumed_once() {
+        // Use an unnamed event so this test cannot activate a running Echo.
+        let event = super::InstanceActivationEvent(unsafe {
+            super::CreateEventW(None, false, false, None).unwrap()
+        });
+        assert!(!event.take_request());
+        unsafe { super::SetEvent(event.0).unwrap() };
+        assert!(event.take_request());
+        assert!(!event.take_request());
+    }
+
+    #[test]
+    fn following_windows_uses_the_latest_default_microphone() {
+        let initial = InputDeviceSnapshot {
+            devices: vec!["Desk Mic".to_string(), "Headset".to_string()],
+            default_device: Some("Desk Mic".to_string()),
+        };
+        let changed = InputDeviceSnapshot {
+            devices: initial.devices.clone(),
+            default_device: Some("Headset".to_string()),
+        };
+
+        assert_eq!(
+            selected_microphone_for_snapshot(&initial, "Old Mic", true),
+            "Desk Mic"
+        );
+        assert_eq!(
+            selected_microphone_for_snapshot(&changed, "Desk Mic", true),
+            "Headset"
+        );
+    }
+
+    #[test]
+    fn manual_microphone_selection_is_not_replaced_by_windows() {
+        let snapshot = InputDeviceSnapshot {
+            devices: vec!["Desk Mic".to_string(), "Headset".to_string()],
+            default_device: Some("Headset".to_string()),
+        };
+
+        assert_eq!(
+            selected_microphone_for_snapshot(&snapshot, "Desk Mic", false),
+            "Desk Mic"
+        );
+    }
 
     #[test]
     fn parse_hotkey_accepts_common_combos() {
@@ -2771,6 +3575,35 @@ mod tests {
     fn parse_hotkey_rejects_unknown_key_token() {
         let err = parse_hotkey("Ctrl+Tab").unwrap_err();
         assert!(err.contains("Unsupported key token"));
+    }
+
+    #[test]
+    fn overlay_keeps_short_captions_intact() {
+        assert_eq!(overlay_caption_text("  hello world  "), "hello world");
+    }
+
+    #[test]
+    fn overlay_shows_the_latest_words_within_the_six_line_limit() {
+        let transcript = (0..80)
+            .map(|index| format!("word{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let caption = overlay_caption_text(&transcript);
+
+        assert!(caption.starts_with('…'));
+        assert!(caption.ends_with("word79"));
+        assert!(caption.chars().count() <= OVERLAY_CAPTION_CHARACTERS + 1);
+    }
+
+    #[test]
+    fn overlay_height_grows_to_six_lines_and_stops() {
+        assert_eq!(overlay_size_for_text("short").1, OVERLAY_HEIGHT);
+
+        let long_caption = "x".repeat(OVERLAY_CAPTION_CHARACTERS * 2);
+        assert_eq!(
+            overlay_size_for_text(&long_caption).1,
+            86 + OVERLAY_MAX_LINES as i32 * 20
+        );
     }
 
     #[tokio::test]

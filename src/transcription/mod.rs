@@ -8,7 +8,7 @@ mod openai_realtime_whisper;
 pub use elevenlabs_realtime::ElevenLabsRealtimeTranscriber;
 pub use local_sherpa::{
     download_local_models, local_engine_status, local_models_available, physical_core_count,
-    preload_local_engine, wait_for_local_engine, LocalEngineStatus, LocalSherpaConfig,
+    preload_local_engine, wait_for_local_engine, LocalEngineStatus, LocalModel, LocalSherpaConfig,
     LocalSherpaTranscriber,
 };
 pub use openai_realtime_whisper::OpenAiRealtimeWhisperTranscriber;
@@ -22,6 +22,8 @@ pub const LOCAL_SHERPA_PROVIDER_LABEL: &str = "Local CPU - Parakeet";
 pub const DEFAULT_ELEVENLABS_REALTIME_MODEL_ID: &str = "scribe_v2_realtime";
 pub const DEFAULT_OPENAI_REALTIME_WHISPER_MODEL_ID: &str = "gpt-realtime-whisper";
 pub const DEFAULT_LANGUAGE_CODE: &str = "en";
+pub const MAX_TRANSCRIPT_CHARACTERS: usize = 100_000;
+pub const MAX_PROVIDER_TEXT_FRAME_BYTES: usize = 256 * 1024;
 
 pub type AudioChunk = Vec<i16>;
 
@@ -64,7 +66,7 @@ impl TranscriptionProvider {
         match self {
             Self::ElevenLabsRealtime => DEFAULT_ELEVENLABS_REALTIME_MODEL_ID,
             Self::OpenAiRealtimeWhisper => DEFAULT_OPENAI_REALTIME_WHISPER_MODEL_ID,
-            Self::LocalSherpaOnnx => "parakeet-tdt-0.6b-v2-int8",
+            Self::LocalSherpaOnnx => LocalModel::default().id(),
         }
     }
 }

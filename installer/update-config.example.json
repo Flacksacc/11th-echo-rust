@@ -1,0 +1,9 @@
+{
+  "feed_url": "https://updates.example.invalid/stable/manifest.json",
+  "public_key_path": "C:\\secure\\echo-update.pub",
+  "secret_key_path": "C:\\secure\\echo-update.key",
+  "release_notes_path": "",
+  "authenticode_required": false,
+  "publish_host": "your-ssh-host-alias",
+  "publish_path": "/var/www/your-site/echo/updates/stable"
+}

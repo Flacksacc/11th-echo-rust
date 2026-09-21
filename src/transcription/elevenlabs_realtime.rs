@@ -11,7 +11,10 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use url::Url;
 
-use super::{AudioChunk, TranscriptionCommand, TranscriptionEvent};
+use super::{
+    AudioChunk, TranscriptionCommand, TranscriptionEvent, MAX_PROVIDER_TEXT_FRAME_BYTES,
+    MAX_TRANSCRIPT_CHARACTERS,
+};
 
 const ELEVENLABS_WSS_URL: &str = "wss://api.elevenlabs.io/v1/speech-to-text/realtime";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -282,6 +285,14 @@ impl ElevenLabsRealtimeTranscriber {
                     match message {
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
                             emit!("⬅️ [API IN] WS text frame: {} bytes", text.len());
+                            if text.len() > MAX_PROVIDER_TEXT_FRAME_BYTES {
+                                let message =
+                                    "ElevenLabs returned an oversized transcription response."
+                                        .to_string();
+                                let _ =
+                                    text_tx.send(TranscriptionEvent::Error(message)).await;
+                                break;
+                            }
                             match parse_incoming_message(&text) {
                                 ParsedIncoming::SessionStarted => {
                                     session_ready = true;
@@ -316,12 +327,27 @@ impl ElevenLabsRealtimeTranscriber {
                                     }
                                 }
                                 ParsedIncoming::PartialTranscript(content) => {
-                                    if !content.is_empty() {
+                                    if content.chars().count() > MAX_TRANSCRIPT_CHARACTERS {
+                                        let message =
+                                            "ElevenLabs returned an oversized partial transcript."
+                                                .to_string();
+                                        let _ =
+                                            text_tx.send(TranscriptionEvent::Error(message)).await;
+                                        break;
+                                    } else if !content.is_empty() {
                                         emit!("📝 Partial transcript: {} characters", content.chars().count());
                                         let _ = text_tx.send(TranscriptionEvent::Partial(content)).await;
                                     }
                                 }
                                 ParsedIncoming::CommittedTranscript(content) => {
+                                    if content.chars().count() > MAX_TRANSCRIPT_CHARACTERS {
+                                        let message =
+                                            "ElevenLabs returned an oversized final transcript."
+                                                .to_string();
+                                        let _ =
+                                            text_tx.send(TranscriptionEvent::Error(message)).await;
+                                        break;
+                                    }
                                     emit!("📝 Committed transcript: {} characters", content.chars().count());
                                     let _ = text_tx.send(TranscriptionEvent::Committed(content)).await;
                                     if awaiting_final_commit {
@@ -342,6 +368,12 @@ impl ElevenLabsRealtimeTranscriber {
                         }
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
                             emit!("🔌 WebSocket Closed");
+                            let _ = text_tx
+                                .send(TranscriptionEvent::Error(
+                                    "ElevenLabs closed the connection before transcription completed."
+                                        .to_string(),
+                                ))
+                                .await;
                             break;
                         }
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => {
@@ -359,6 +391,11 @@ impl ElevenLabsRealtimeTranscriber {
                         }
                         Some(Err(e)) => {
                             emit!("❌ WebSocket Error: {}", e);
+                            let _ = text_tx
+                                .send(TranscriptionEvent::Error(format!(
+                                    "ElevenLabs connection failed: {e}"
+                                )))
+                                .await;
                             break;
                         }
                         Some(Ok(_)) => {}

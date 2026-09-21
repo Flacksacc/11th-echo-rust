@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "echo"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1555,9 +1555,11 @@ dependencies = [
  "global-hotkey",
  "http",
  "log",
+ "minisign-verify",
  "num_cpus",
  "reqwest",
  "rubato",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -3667,6 +3669,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "minisign-verify"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5466,6 +5474,10 @@ name = "semver"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "serde"

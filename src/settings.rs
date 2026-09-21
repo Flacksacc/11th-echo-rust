@@ -245,9 +245,13 @@ pub struct AppSettings {
     pub transcription_no_verbatim: bool,
     pub selected_microphone: String,
     pub use_default_microphone: bool,
+    #[serde(default)]
+    pub keep_microphone_ready: bool,
     pub hotkey_text: String,
     #[serde(default)]
     pub start_with_windows: bool,
+    #[serde(default = "default_update_checks_enabled")]
+    pub update_checks_enabled: bool,
     #[serde(default)]
     pub local_sherpa: LocalSherpaConfig,
     pub overlay_opacity: f32,
@@ -287,8 +291,10 @@ impl Default for AppSettings {
             transcription_no_verbatim: true,
             selected_microphone: String::new(),
             use_default_microphone: true,
+            keep_microphone_ready: false,
             hotkey_text: "Ctrl+Space".to_string(),
             start_with_windows: false,
+            update_checks_enabled: true,
             local_sherpa: LocalSherpaConfig::default(),
             overlay_opacity: 0.85,
             theme_background_top_color: "#02140b".to_string(), // deep forest green
@@ -308,6 +314,10 @@ impl Default for AppSettings {
             gemini_custom_prompt: String::new(),
         }
     }
+}
+
+fn default_update_checks_enabled() -> bool {
+    true
 }
 
 impl AppSettings {
@@ -514,6 +524,14 @@ fn save_transcript_history_to_path(path: &Path, entries: &[TranscriptHistoryEntr
         crate::echo_error!("history", "Failed to serialize transcript history");
         return false;
     };
+    if json.len() as u64 > MAX_TRANSCRIPT_HISTORY_FILE_BYTES {
+        crate::echo_error!(
+            "history",
+            "Transcript history exceeds the {} byte persistence limit",
+            MAX_TRANSCRIPT_HISTORY_FILE_BYTES
+        );
+        return false;
+    }
     let temp_path = temporary_settings_path(path);
     let write_result = (|| -> Result<(), String> {
         let mut file = File::create(&temp_path).map_err(|err| err.to_string())?;
@@ -603,7 +621,7 @@ mod tests {
     use super::{
         load_settings_from_path, load_transcript_history_from_path, save_settings_to_path,
         save_transcript_history_to_path, AppSettings, TranscriptHistoryEntry,
-        MAX_TRANSCRIPT_HISTORY,
+        MAX_TRANSCRIPT_HISTORY, MAX_TRANSCRIPT_HISTORY_FILE_BYTES,
     };
     use crate::transcription::{LocalSherpaConfig, TranscriptionProvider};
     use std::fs;
@@ -636,8 +654,10 @@ mod tests {
             transcription_no_verbatim: true,
             selected_microphone: "Mic A".to_string(),
             use_default_microphone: false,
+            keep_microphone_ready: true,
             hotkey_text: "Ctrl+Shift+F8".to_string(),
             start_with_windows: false,
+            update_checks_enabled: true,
             local_sherpa: LocalSherpaConfig::default(),
             overlay_opacity: 0.9,
             theme_background_top_color: "#222222".to_string(),
@@ -691,8 +711,20 @@ mod tests {
             loaded.use_default_microphone,
             expected.use_default_microphone
         );
+        assert_eq!(loaded.keep_microphone_ready, expected.keep_microphone_ready);
         assert_eq!(loaded.hotkey_text, expected.hotkey_text);
         assert_eq!(loaded.start_with_windows, expected.start_with_windows);
+    }
+
+    #[test]
+    fn existing_settings_use_safe_defaults_for_new_options() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("update_checks_enabled");
+        object.remove("keep_microphone_ready");
+        let loaded: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(loaded.update_checks_enabled);
+        assert!(!loaded.keep_microphone_ready);
     }
 
     #[test]
@@ -712,6 +744,18 @@ mod tests {
         assert_eq!(loaded.len(), MAX_TRANSCRIPT_HISTORY);
         assert_eq!(loaded.first().unwrap().text, "Transcript 0");
         assert_eq!(loaded.last().unwrap().text, "Transcript 499");
+    }
+
+    #[test]
+    fn oversized_transcript_history_is_not_persisted() {
+        let path = unique_path();
+        let entries = vec![TranscriptHistoryEntry {
+            timestamp: "2026-07-30 12:00:00".to_string(),
+            text: "x".repeat(MAX_TRANSCRIPT_HISTORY_FILE_BYTES as usize),
+        }];
+
+        assert!(!save_transcript_history_to_path(&path, &entries));
+        assert!(!path.exists());
     }
 
     #[test]
@@ -771,6 +815,7 @@ mod tests {
         assert!(loaded.transcription_no_verbatim);
         assert!(loaded.selected_microphone.is_empty());
         assert!(loaded.use_default_microphone);
+        assert!(!loaded.keep_microphone_ready);
         assert_eq!(loaded.hotkey_text, "Ctrl+Space");
         assert!(!loaded.start_with_windows);
         assert!((loaded.overlay_opacity - 0.85).abs() < f32::EPSILON);
