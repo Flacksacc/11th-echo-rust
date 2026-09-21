@@ -34,6 +34,11 @@ the following command builds, verifies, and publishes the release over SSH:
 .\installer\build-and-publish.ps1
 ```
 
+For an interactive publish that opens a console for the Minisign password, run
+`installer\publish-interactive.cmd`. It writes its non-secret completion state
+to `target\echo-publish-status.json`; the password is never saved or passed in
+a command argument.
+
 See [Automatic updates](docs/automatic-updates.md) for key management and server
 layout. The installer is per-user, needs no administrator access, and offers
 shortcuts and startup-at-sign-in options. If you later obtain an Authenticode
