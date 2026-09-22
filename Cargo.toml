@@ -1,6 +1,6 @@
 [package]
 name = "echo"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 
 [dependencies]
@@ -43,6 +43,8 @@ chrono = "0.4.44"
 num_cpus = "1.16"
 sha2 = "0.10"
 sherpa-onnx = "=1.13.4"
+text2num = "=2.8.0"
+regex = "1"
 
 # System Integration
 [target.'cfg(windows)'.dependencies]

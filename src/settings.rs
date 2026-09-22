@@ -61,6 +61,62 @@ pub struct TranscriptHistoryEntry {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PostProcessingSettings {
+    pub enabled: bool,
+    #[serde(default = "default_post_format_numbers")]
+    pub format_numbers: bool,
+    pub prefer_digits: bool,
+    pub whole_numbers: bool,
+    pub ordinals: bool,
+    pub decimals_quantities: bool,
+    pub money: bool,
+    pub measurements: bool,
+    pub dates: bool,
+    pub times: bool,
+    pub telephone_alphanumeric: bool,
+    pub urls_emails: bool,
+    pub punctuation: bool,
+    pub capitalization: bool,
+    pub commas: bool,
+    pub periods: bool,
+    pub question_marks: bool,
+    pub protected_phrases: Vec<String>,
+    /// `spoken => written` entries, kept simple for a portable settings file.
+    pub custom_replacements: Vec<String>,
+}
+
+impl Default for PostProcessingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            format_numbers: true,
+            prefer_digits: true,
+            whole_numbers: true,
+            ordinals: true,
+            decimals_quantities: true,
+            money: true,
+            measurements: true,
+            dates: true,
+            times: true,
+            telephone_alphanumeric: true,
+            urls_emails: true,
+            punctuation: true,
+            capitalization: true,
+            commas: true,
+            periods: true,
+            question_marks: true,
+            protected_phrases: Vec::new(),
+            custom_replacements: Vec::new(),
+        }
+    }
+}
+
+fn default_post_format_numbers() -> bool {
+    true
+}
+
 impl TranscriptHistoryEntry {
     pub fn display_text(&self) -> String {
         format!("[{}] {}", self.timestamp, self.text)
@@ -272,6 +328,8 @@ pub struct AppSettings {
     pub gemini_model: String,
     pub gemini_prompt_preset: String,
     pub gemini_custom_prompt: String,
+    #[serde(default)]
+    pub post_processing: PostProcessingSettings,
 }
 
 impl Default for AppSettings {
@@ -312,6 +370,7 @@ impl Default for AppSettings {
             gemini_model: "gemini-3.1-flash-lite-preview".to_string(),
             gemini_prompt_preset: "Minimal corrections".to_string(),
             gemini_custom_prompt: String::new(),
+            post_processing: PostProcessingSettings::default(),
         }
     }
 }
@@ -620,8 +679,8 @@ pub fn save_settings_to_path(path: &Path, settings: &AppSettings) -> bool {
 mod tests {
     use super::{
         load_settings_from_path, load_transcript_history_from_path, save_settings_to_path,
-        save_transcript_history_to_path, AppSettings, TranscriptHistoryEntry,
-        MAX_TRANSCRIPT_HISTORY, MAX_TRANSCRIPT_HISTORY_FILE_BYTES,
+        save_transcript_history_to_path, AppSettings, PostProcessingSettings,
+        TranscriptHistoryEntry, MAX_TRANSCRIPT_HISTORY, MAX_TRANSCRIPT_HISTORY_FILE_BYTES,
     };
     use crate::transcription::{LocalSherpaConfig, TranscriptionProvider};
     use std::fs;
@@ -675,6 +734,7 @@ mod tests {
             gemini_model: "gemini-3.1-flash-lite-preview".to_string(),
             gemini_prompt_preset: "Minimal corrections".to_string(),
             gemini_custom_prompt: "Custom instructions".to_string(),
+            post_processing: PostProcessingSettings::default(),
         };
         save_settings_to_path(&path, &expected);
         let loaded = load_settings_from_path(&path);
@@ -725,6 +785,36 @@ mod tests {
         let loaded: AppSettings = serde_json::from_value(value).unwrap();
         assert!(loaded.update_checks_enabled);
         assert!(!loaded.keep_microphone_ready);
+    }
+
+    #[test]
+    fn post_processing_migrates_and_roundtrips_every_category() {
+        let old: PostProcessingSettings = serde_json::from_str(
+            r#"{"enabled":false,"money":false,"protected_phrases":["GPT-4"]}"#,
+        )
+        .unwrap();
+        assert!(!old.enabled);
+        assert!(!old.money);
+        assert!(old.punctuation);
+        assert!(old.urls_emails);
+        let mut value = serde_json::to_value(PostProcessingSettings::default()).unwrap();
+        for field in value.as_object_mut().unwrap().values_mut() {
+            if field.is_boolean() {
+                *field = serde_json::Value::Bool(false);
+            }
+        }
+        let expected: PostProcessingSettings = serde_json::from_value(value).unwrap();
+        let actual: PostProcessingSettings =
+            serde_json::from_str(&serde_json::to_string(&expected).unwrap()).unwrap();
+        assert_eq!(actual, expected);
+        let app = AppSettings {
+            post_processing: expected.clone(),
+            ..Default::default()
+        };
+        let path = unique_path();
+        assert!(save_settings_to_path(&path, &app));
+        assert_eq!(load_settings_from_path(&path).post_processing, expected);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

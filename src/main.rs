@@ -9,6 +9,7 @@ mod gemini;
 mod hotkey;
 mod injector;
 mod pipeline;
+mod post_processing;
 mod settings;
 mod startup;
 mod state;
@@ -238,6 +239,7 @@ struct Session {
     transcript_pipeline: Arc<Mutex<TranscriptPipeline>>,
     task_abort_handles: Vec<tokio::task::AbortHandle>,
     finalization_watchdog: Option<tokio::task::AbortHandle>,
+    _formatting_activity: post_processing::ActivityGuard,
 }
 
 impl Session {
@@ -1068,6 +1070,27 @@ fn settings_snapshot_from_ui(ui: &AppWindow, base: &AppSettings) -> AppSettings 
     next.gemini_model = ui.get_gemini_model_text().to_string();
     next.gemini_prompt_preset = ui.get_selected_gemini_preset().to_string();
     next.gemini_custom_prompt = ui.get_gemini_custom_prompt().to_string();
+    next.post_processing.enabled = ui.get_post_processing_enabled();
+    next.post_processing.format_numbers = ui.get_post_format_numbers();
+    next.post_processing.prefer_digits = ui.get_post_prefer_digits();
+    next.post_processing.whole_numbers = ui.get_post_whole_numbers();
+    next.post_processing.ordinals = ui.get_post_ordinals();
+    next.post_processing.decimals_quantities = ui.get_post_decimals();
+    next.post_processing.money = ui.get_post_money();
+    next.post_processing.measurements = ui.get_post_measurements();
+    next.post_processing.dates = ui.get_post_dates();
+    next.post_processing.times = ui.get_post_times();
+    next.post_processing.telephone_alphanumeric = ui.get_post_identifiers();
+    next.post_processing.urls_emails = ui.get_post_addresses();
+    next.post_processing.punctuation = ui.get_post_punctuation();
+    next.post_processing.capitalization = ui.get_post_capitalization();
+    next.post_processing.commas = ui.get_post_commas();
+    next.post_processing.periods = ui.get_post_periods();
+    next.post_processing.question_marks = ui.get_post_question_marks();
+    next.post_processing.protected_phrases =
+        post_processing_lines(ui.get_post_protected_phrases_text().as_ref());
+    next.post_processing.custom_replacements =
+        post_processing_lines(ui.get_post_custom_replacements_text().as_ref());
     next.selected_microphone = ui.get_selected_microphone().to_string();
     next.use_default_microphone = ui.get_use_default_microphone();
     next.keep_microphone_ready = ui.get_keep_microphone_ready();
@@ -1100,6 +1123,15 @@ fn settings_snapshot_from_ui(ui: &AppWindow, base: &AppSettings) -> AppSettings 
     next
 }
 
+fn post_processing_lines(value: &str) -> Vec<String> {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn populate_settings_editor(ui: &AppWindow, settings: &AppSettings) {
     let provider = transcription::TranscriptionProvider::from_id(&settings.transcription_provider);
     ui.set_transcription_provider_text(provider.label().into());
@@ -1125,6 +1157,33 @@ fn populate_settings_editor(ui: &AppWindow, settings: &AppSettings) {
     ui.set_gemini_model_text(settings.gemini_model.clone().into());
     ui.set_selected_gemini_preset(settings.gemini_prompt_preset.clone().into());
     ui.set_gemini_custom_prompt(settings.gemini_custom_prompt.clone().into());
+    ui.set_post_processing_enabled(settings.post_processing.enabled);
+    ui.set_post_format_numbers(settings.post_processing.format_numbers);
+    ui.set_post_prefer_digits(settings.post_processing.prefer_digits);
+    ui.set_post_whole_numbers(settings.post_processing.whole_numbers);
+    ui.set_post_ordinals(settings.post_processing.ordinals);
+    ui.set_post_decimals(settings.post_processing.decimals_quantities);
+    ui.set_post_money(settings.post_processing.money);
+    ui.set_post_measurements(settings.post_processing.measurements);
+    ui.set_post_dates(settings.post_processing.dates);
+    ui.set_post_times(settings.post_processing.times);
+    ui.set_post_identifiers(settings.post_processing.telephone_alphanumeric);
+    ui.set_post_addresses(settings.post_processing.urls_emails);
+    ui.set_post_punctuation(settings.post_processing.punctuation);
+    ui.set_post_capitalization(settings.post_processing.capitalization);
+    ui.set_post_commas(settings.post_processing.commas);
+    ui.set_post_periods(settings.post_processing.periods);
+    ui.set_post_question_marks(settings.post_processing.question_marks);
+    ui.set_post_protected_phrases_text(
+        settings.post_processing.protected_phrases.join("\n").into(),
+    );
+    ui.set_post_custom_replacements_text(
+        settings
+            .post_processing
+            .custom_replacements
+            .join("\n")
+            .into(),
+    );
     ui.set_selected_microphone(settings.selected_microphone.clone().into());
     ui.set_use_default_microphone(settings.use_default_microphone);
     ui.set_keep_microphone_ready(settings.keep_microphone_ready);
@@ -1523,6 +1582,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_gemini_custom_prompt(initial_settings.gemini_custom_prompt.clone().into());
     ui.set_gemini_model_text(initial_settings.gemini_model.clone().into());
     ui.set_use_gemini_modifier(initial_settings.gemini_enabled);
+    ui.set_post_processing_enabled(initial_settings.post_processing.enabled);
+    ui.set_post_format_numbers(initial_settings.post_processing.format_numbers);
+    ui.set_post_prefer_digits(initial_settings.post_processing.prefer_digits);
+    ui.set_post_whole_numbers(initial_settings.post_processing.whole_numbers);
+    ui.set_post_ordinals(initial_settings.post_processing.ordinals);
+    ui.set_post_decimals(initial_settings.post_processing.decimals_quantities);
+    ui.set_post_money(initial_settings.post_processing.money);
+    ui.set_post_measurements(initial_settings.post_processing.measurements);
+    ui.set_post_dates(initial_settings.post_processing.dates);
+    ui.set_post_times(initial_settings.post_processing.times);
+    ui.set_post_identifiers(initial_settings.post_processing.telephone_alphanumeric);
+    ui.set_post_addresses(initial_settings.post_processing.urls_emails);
+    ui.set_post_punctuation(initial_settings.post_processing.punctuation);
+    ui.set_post_capitalization(initial_settings.post_processing.capitalization);
+    ui.set_post_commas(initial_settings.post_processing.commas);
+    ui.set_post_periods(initial_settings.post_processing.periods);
+    ui.set_post_question_marks(initial_settings.post_processing.question_marks);
+    ui.set_post_protected_phrases_text(
+        initial_settings
+            .post_processing
+            .protected_phrases
+            .join("\n")
+            .into(),
+    );
+    ui.set_post_custom_replacements_text(
+        initial_settings
+            .post_processing
+            .custom_replacements
+            .join("\n")
+            .into(),
+    );
 
     ui.set_overlay_opacity(initial_settings.overlay_opacity);
     ui.set_theme_background_top_color(parse_theme_color(
@@ -1567,6 +1657,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ui) = ui_weak_for_close.upgrade() {
             let modal_active = ui.get_local_download_prompt_visible()
                 || ui.get_local_download_progress_visible()
+                || ui.get_post_model_download_prompt_visible()
+                || ui.get_post_model_installing()
                 || ui.get_update_panel_visible();
             if modal_active {
                 ui.set_status_text("Finish or dismiss the open dialog before closing".into());
@@ -1840,6 +1932,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 });
                                 continue;
                             }
+                            let Some(formatting_activity) = post_processing::ActivityGuard::acquire() else {
+                                let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
+                                    ui.set_status_text("Finish model installation before recording.".into());
+                                });
+                                continue;
+                            };
                             let current_settings = settings_for_runtime.lock().unwrap().clone();
                             let provider = transcription::TranscriptionProvider::from_id(
                                 &current_settings.transcription_provider,
@@ -2126,6 +2224,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                     let transcript_task = tokio::spawn(async move {
                                         let mut latest_partial = String::new();
+                                        let mut had_error = false;
                                         while let Some(msg) = text_rx.recv().await {
                                             let (event_kind, event_characters) = match &msg {
                                                 transcription::TranscriptionEvent::Partial(text) => {
@@ -2190,184 +2289,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     // Clear partial now that we've used it for empty-commit fallback.
                                                     latest_partial.clear();
 
-                                                    // Snapshot Gemini settings while holding the lock briefly.
-                                                    let (gemini_on, gkey, gmodel, gpreset, gcustom) = {
-                                                        let s = settings_for_text.lock().unwrap();
-                                                        (
-                                                            s.gemini_enabled,
-                                                            s.gemini_api_key.clone(),
-                                                            s.gemini_model.clone(),
-                                                            s.gemini_prompt_preset.clone(),
-                                                            s.gemini_custom_prompt.clone(),
-                                                        )
-                                                    };
-                                                    // Lock is dropped here before any await.
-
-                                                    let final_text = if gemini_on {
-                                                        echo_info!(
-                                                            "gemini",
-                                                            "Rewrite started epoch={} input_characters={}",
-                                                            current_session_epoch,
-                                                            base_text.chars().count()
-                                                        );
-                                                        let pending_text = "Gemini has the text and is modifying it.";
-                                                        let (w, h) = overlay_size_for_text(pending_text);
-                                                        let overlay_visible_setter =
-                                                            overlay_visible_for_transcript.clone();
-                                                        let session_epoch_for_overlay =
-                                                            session_epoch_for_transcript.clone();
-                                                        let _ = overlay_handle_for_transcript
-                                                            .upgrade_in_event_loop(move |overlay| {
-                                                                if session_epoch_for_overlay.load(Ordering::SeqCst)
-                                                                    != current_session_epoch
-                                                                {
-                                                                    return;
-                                                                }
-                                                                overlay.set_is_error(false);
-                                                                overlay.set_is_system_message(true);
-                                                                overlay.set_sentence_text(pending_text.into());
-                                                                overlay.set_window_width(w);
-                                                                set_overlay_height(&overlay, h);
-                                                                overlay.set_is_visible(true);
-                                                                overlay_visible_setter.store(true, Ordering::SeqCst);
-                                                                show_overlay_without_activation(&overlay);
-                                                            });
-                                                        gemini::rewrite_text(&gkey, &gmodel, &gpreset, &gcustom, &base_text).await
-                                                    } else {
-                                                        base_text
-                                                    };
-
-                                                    if session_epoch_for_transcript.load(Ordering::SeqCst)
-                                                        != current_session_epoch
-                                                    {
-                                                        echo_warn!(
-                                                            "gemini",
-                                                            "Discarding stale completed rewrite epoch={}",
-                                                            current_session_epoch
-                                                        );
-                                                        continue;
-                                                    }
-
-                                                    let final_text = final_text.trim().trim_start_matches('-').trim().to_string();
-                                                    stop_requested_for_msg = {
-                                                        let pipeline = transcript_pipeline_for_text.lock().unwrap();
-                                                        pipeline.stop_requested()
-                                                    };
-                                                    echo_info!(
-                                                        "transcript",
-                                                        "Commit processed epoch={} characters={} stop_requested={}",
-                                                        current_session_epoch,
-                                                        final_text.chars().count(),
-                                                        stop_requested_for_msg
-                                                    );
-
                                                     let aggregated = {
                                                         let mut pipeline = transcript_pipeline_for_text.lock().unwrap();
-                                                        if final_text.is_empty() {
-                                                            pipeline.committed_text().to_string()
-                                                        } else {
-                                                            pipeline.push_fragment(&final_text)
-                                                        }
+                                                        stop_requested_for_msg = pipeline.stop_requested();
+                                                        pipeline.push_fragment(&base_text)
                                                     };
-                                                    if !final_text.is_empty() {
-                                                        let entry = TranscriptHistoryEntry {
-                                                            timestamp: Local::now()
-                                                                .format("%Y-%m-%d %H:%M:%S")
-                                                                .to_string(),
-                                                            text: final_text.clone(),
-                                                        };
-                                                        let (history_snapshot, revision) = {
-                                                            let mut history = transcript_history_for_text.lock().unwrap();
-                                                            history.insert(0, entry);
-                                                            history.truncate(MAX_TRANSCRIPT_HISTORY);
-                                                            if !save_transcript_history(&history) {
-                                                                echo_error!(
-                                                                    "history",
-                                                                    "Failed to persist transcript history epoch={}",
-                                                                    current_session_epoch
-                                                                );
-                                                            }
-                                                            *transcript_raw_for_cb.lock().unwrap() = history
-                                                                .iter()
-                                                                .map(|entry| entry.text.clone())
-                                                                .collect();
-                                                            let revision = transcript_history_revision_for_text
-                                                                .fetch_add(1, Ordering::SeqCst)
-                                                                + 1;
-                                                            (history.clone(), revision)
-                                                        };
-                                                        let items = history_snapshot
-                                                            .iter()
-                                                            .map(|entry| SharedString::from(entry.display_text()))
-                                                            .collect::<Vec<_>>();
-                                                        let revision_for_ui =
-                                                            transcript_history_revision_for_text.clone();
-                                                        let _ = ui_handle_for_transcript.upgrade_in_event_loop(move |ui| {
-                                                            if revision_for_ui.load(Ordering::SeqCst) == revision {
-                                                                ui.set_transcript_history(ModelRc::new(VecModel::from(items)));
-                                                            }
-                                                        });
-                                                        let _ = log_line_tx_for_text.send(format!(
-                                                            "Transcript committed ({} characters)",
-                                                            final_text.chars().count()
-                                                        ));
-                                                    }
-                                                    if stop_requested_for_msg {
-                                                        let final_payload = aggregated.trim().to_string();
-                                                        if !final_payload.is_empty() {
-                                                            echo_info!(
-                                                                "injection",
-                                                                "Posting requested epoch={} characters={}",
-                                                                current_session_epoch,
-                                                                final_payload.chars().count()
-                                                            );
-                                                            let to_inject = format!("{} ", final_payload);
-                                                            match injector::inject_text(
-                                                                &to_inject,
-                                                                injection_target,
-                                                            ) {
-                                                                Ok(()) => {
-                                                                    echo_info!(
-                                                                        "injection",
-                                                                        "Posting completed epoch={}",
-                                                                        current_session_epoch
-                                                                    );
-                                                                    preserve_status_for_transcript
-                                                                        .store(true, Ordering::SeqCst);
-                                                                    let _ = log_line_tx_for_text.send(
-                                                                        "Windows accepted the direct transcript input"
-                                                                            .into(),
-                                                                    );
-                                                                    let _ = ui_handle_for_transcript
-                                                                        .upgrade_in_event_loop(|ui| {
-                                                                            ui.set_status_text(
-                                                                                "Transcript sent to focused window"
-                                                                                    .into(),
-                                                                            );
-                                                                            ui.set_has_error(false);
-                                                                        });
-                                                                }
-                                                                Err(e) => {
-                                                                    echo_error!(
-                                                                        "injection",
-                                                                        "Posting failed epoch={}: {}",
-                                                                        current_session_epoch,
-                                                                        e
-                                                                    );
-                                                                    preserve_status_for_transcript
-                                                                        .store(true, Ordering::SeqCst);
-                                                                    let _ = log_line_tx_for_text.send(format!(
-                                                                        "Direct transcript input failed: {e}"
-                                                                    ));
-                                                                    let _ = ui_handle_for_transcript.upgrade_in_event_loop(|ui| {
-                                                                        ui.set_status_text("Injection error - check focused window and permissions".into());
-                                                                        ui.set_has_error(true);
-                                                                        ui.set_is_recording(false);
-                                                                    });
-                                                                }
-                                                            }
-                                                        }
-                                                    }
                                                     was_committed = true;
                                                     aggregated
                                                 }
@@ -2380,6 +2306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     );
                                                     latest_partial.clear();
                                                     is_error = true;
+                                                    had_error = true;
                                                     preserve_status_for_transcript.store(true, Ordering::SeqCst);
                                                     let friendly = format!("Error from speech service:\n{}", err_json);
                                                     let _ = ui_handle_for_transcript.upgrade_in_event_loop(|ui| {
@@ -2455,6 +2382,146 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 });
 
                                         }
+
+                                        let (base_text, stopped) = {
+                                            let mut pipeline = transcript_pipeline_for_text.lock().unwrap();
+                                            if !latest_partial.trim().is_empty() && pipeline.stop_requested() {
+                                                pipeline.push_fragment(&latest_partial);
+                                            }
+                                            (pipeline.committed_text().to_string(), pipeline.stop_requested())
+                                        };
+                                        if stopped && !had_error && !base_text.trim().is_empty()
+                                            && session_epoch_for_transcript.load(Ordering::SeqCst) == current_session_epoch
+                                        {
+                                            let snapshot = settings_for_text.lock().unwrap().clone();
+                                            let rewritten = if snapshot.gemini_enabled {
+                                                gemini::rewrite_text(&snapshot.gemini_api_key, &snapshot.gemini_model,
+                                                    &snapshot.gemini_prompt_preset, &snapshot.gemini_custom_prompt, &base_text).await
+                                            } else { base_text };
+                                            let raw_fallback = rewritten.clone();
+                                            let pp = settings_for_text.lock().unwrap().post_processing.clone();
+                                            let worker_settings = pp.clone();
+                                            let result = tokio::task::spawn_blocking(move || post_processing::process(&rewritten, &worker_settings)).await;
+                                            let mut processed = result.unwrap_or_else(|_| post_processing::ProcessedText {
+                                                text: raw_fallback.clone(), warning: Some("Formatting worker failed; original text retained.".into())
+                                            });
+                                            if session_epoch_for_transcript.load(Ordering::SeqCst) != current_session_epoch { return; }
+                                            if settings_for_text.lock().unwrap().post_processing != pp {
+                                                processed = post_processing::ProcessedText { text: raw_fallback,
+                                                    warning: Some("Settings changed while formatting; original text retained.".into()) };
+                                            }
+                                            let final_text = processed.text.trim().to_string();
+                                                    if !final_text.is_empty() {
+                                                        let entry = TranscriptHistoryEntry {
+                                                            timestamp: Local::now()
+                                                                .format("%Y-%m-%d %H:%M:%S")
+                                                                .to_string(),
+                                                            text: final_text.clone(),
+                                                        };
+                                                        let (history_snapshot, revision) = {
+                                                            let mut history = transcript_history_for_text.lock().unwrap();
+                                                            history.insert(0, entry);
+                                                            history.truncate(MAX_TRANSCRIPT_HISTORY);
+                                                            if !save_transcript_history(&history) {
+                                                                echo_error!(
+                                                                    "history",
+                                                                    "Failed to persist transcript history epoch={}",
+                                                                    current_session_epoch
+                                                                );
+                                                            }
+                                                            *transcript_raw_for_cb.lock().unwrap() = history
+                                                                .iter()
+                                                                .map(|entry| entry.text.clone())
+                                                                .collect();
+                                                            let revision = transcript_history_revision_for_text
+                                                                .fetch_add(1, Ordering::SeqCst)
+                                                                + 1;
+                                                            (history.clone(), revision)
+                                                        };
+                                                        let items = history_snapshot
+                                                            .iter()
+                                                            .map(|entry| SharedString::from(entry.display_text()))
+                                                            .collect::<Vec<_>>();
+                                                        let revision_for_ui =
+                                                            transcript_history_revision_for_text.clone();
+                                                        let _ = ui_handle_for_transcript.upgrade_in_event_loop(move |ui| {
+                                                            if revision_for_ui.load(Ordering::SeqCst) == revision {
+                                                                ui.set_transcript_history(ModelRc::new(VecModel::from(items)));
+                                                            }
+                                                        });
+                                                        let _ = log_line_tx_for_text.send(format!(
+                                                            "Transcript committed ({} characters)",
+                                                            final_text.chars().count()
+                                                        ));
+                                                    }
+
+                                                    {
+                                                        let final_payload = final_text.clone();
+                                                        if !final_payload.is_empty() {
+                                                            echo_info!(
+                                                                "injection",
+                                                                "Posting requested epoch={} characters={}",
+                                                                current_session_epoch,
+                                                                final_payload.chars().count()
+                                                            );
+                                                            let to_inject = format!("{} ", final_payload);
+                                                            if session_epoch_for_transcript.load(Ordering::SeqCst) != current_session_epoch { return; }
+                                                            match injector::inject_text(
+                                                                &to_inject,
+                                                                injection_target,
+                                                            ) {
+                                                                Ok(()) => {
+                                                                    echo_info!(
+                                                                        "injection",
+                                                                        "Posting completed epoch={}",
+                                                                        current_session_epoch
+                                                                    );
+                                                                    preserve_status_for_transcript
+                                                                        .store(true, Ordering::SeqCst);
+                                                                    let _ = log_line_tx_for_text.send(
+                                                                        "Windows accepted the direct transcript input"
+                                                                            .into(),
+                                                                    );
+                                                                    let _ = ui_handle_for_transcript
+                                                                        .upgrade_in_event_loop(|ui| {
+                                                                            ui.set_status_text(
+                                                                                "Transcript sent to focused window"
+                                                                                    .into(),
+                                                                            );
+                                                                            ui.set_has_error(false);
+                                                                        });
+                                                                }
+                                                                Err(e) => {
+                                                                    echo_error!(
+                                                                        "injection",
+                                                                        "Posting failed epoch={}: {}",
+                                                                        current_session_epoch,
+                                                                        e
+                                                                    );
+                                                                    preserve_status_for_transcript
+                                                                        .store(true, Ordering::SeqCst);
+                                                                    let _ = log_line_tx_for_text.send(format!(
+                                                                        "Direct transcript input failed: {e}"
+                                                                    ));
+                                                                    let _ = ui_handle_for_transcript.upgrade_in_event_loop(|ui| {
+                                                                        ui.set_status_text("Injection error - check focused window and permissions".into());
+                                                                        ui.set_has_error(true);
+                                                                        ui.set_is_recording(false);
+                                                                    });
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+
+                                            if let Some(warning) = processed.warning {
+                                                preserve_status_for_transcript.store(true, Ordering::SeqCst);
+                                                let _ = ui_handle_for_transcript.upgrade_in_event_loop(move |ui| {
+                                                    ui.set_post_model_status(warning.clone().into());
+                                                    ui.set_status_text(format!("Post-processing: {warning}").into());
+                                                    ui.set_has_error(true);
+                                                });
+                                            }
+                                        }
                                         echo_info!(
                                             "transcript",
                                             "Event channel closed epoch={} preserve_status={}",
@@ -2482,6 +2549,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             transcript_task.abort_handle(),
                                         ],
                                         finalization_watchdog: None,
+                                        _formatting_activity: formatting_activity,
                                     });
                                     if let Some(session) = active_session.as_ref() {
                                         if let Some(tx) = session.network_stop_tx.as_ref() {
@@ -2783,6 +2851,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hotkey_text_for_apply = hotkey_text.clone();
     let warm_capture_reconfigure_tx = cmd_tx.clone();
     ui.on_apply_settings(move || {
+        let Some(editor) = ui_weak_for_apply.upgrade() else { return; };
+        let draft = settings_snapshot_from_ui(&editor, &settings_for_ui.lock().unwrap());
+        if let Err(error) = post_processing::validate(&draft.post_processing) {
+            pending_navigation_for_apply.set(None);
+            editor.set_status_text(format!("Post-processing settings: {error}").into());
+            editor.set_post_model_status(format!("Settings not saved: {error}").into());
+            editor.set_has_error(true);
+            editor.set_settings_dirty(true);
+            editor.set_active_tab(3);
+            editor.set_settings_tab(3);
+            return;
+        }
         let (
             elevenlabs_api_key,
             elevenlabs_model,
@@ -2941,6 +3021,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             next
         };
         if let Some(ui) = ui_weak_for_apply.upgrade() {
+            snapshot.post_processing = draft.post_processing;
             snapshot.hotkey_text = ui.get_hotkey_text().to_string();
             snapshot.update_checks_enabled = ui.get_update_checks_enabled();
             snapshot.overlay_opacity = ui.get_overlay_opacity();
@@ -3202,6 +3283,109 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let has_punctuation_model = post_processing::punctuation_model_available();
+    ui.set_post_model_ready(has_punctuation_model);
+    ui.set_post_model_status(
+        if has_punctuation_model {
+            "Checking offline punctuation model…"
+        } else {
+            "Offline punctuation model not installed"
+        }
+        .into(),
+    );
+    if initial_settings.post_processing.enabled
+        && initial_settings.post_processing.punctuation
+        && !has_punctuation_model
+    {
+        ui.set_post_model_download_prompt_visible(true);
+    }
+    if has_punctuation_model {
+        let ready_ui = ui.as_weak();
+        thread::spawn(move || {
+            let result = post_processing::preload();
+            let _ = ready_ui.upgrade_in_event_loop(move |ui| {
+                ui.set_post_model_ready(result.is_ok());
+                match result {
+                    Ok(()) => ui.set_post_model_status("Offline punctuation model ready".into()),
+                    Err(error) => {
+                        ui.set_post_model_status(error.into());
+                        if ui.get_post_processing_enabled() && ui.get_post_punctuation() {
+                            ui.set_post_model_download_prompt_visible(true);
+                            let _ = ui.show();
+                        }
+                    }
+                }
+            });
+        });
+    }
+    let enable_ui = ui.as_weak();
+    ui.on_post_processing_changed(move || {
+        if let Some(ui) = enable_ui.upgrade() {
+            if ui.get_post_processing_enabled()
+                && ui.get_post_punctuation()
+                && !ui.get_post_model_ready()
+            {
+                ui.set_post_model_download_prompt_visible(true);
+            }
+        }
+    });
+    let post_download_ui = ui.as_weak();
+    ui.on_download_post_processing_model(move || {
+        let Some(ui) = post_download_ui.upgrade() else {
+            return;
+        };
+        let Some(activity) = post_processing::ActivityGuard::acquire() else {
+            ui.set_post_model_status(
+                "Stop transcription and wait for it to finish before installing.".into(),
+            );
+            return;
+        };
+        ui.set_post_model_download_prompt_visible(true);
+        ui.set_post_model_installing(true);
+        ui.set_post_model_ready(false);
+        ui.set_post_model_progress(0.0);
+        ui.set_post_model_status("Preparing punctuation model installation…".into());
+        let progress_ui = post_download_ui.clone();
+        let completion_ui = post_download_ui.clone();
+        thread::spawn(move || {
+            let _activity = activity;
+            let result = Runtime::new()
+                .map_err(|err| err.to_string())
+                .and_then(|runtime| {
+                    runtime.block_on(post_processing::download_punctuation_model(
+                        move |fraction, status| {
+                            let _ = progress_ui.upgrade_in_event_loop(move |ui| {
+                                ui.set_post_model_progress(fraction);
+                                ui.set_post_model_status(status.into());
+                            });
+                        },
+                    ))
+                });
+            let _ = completion_ui.upgrade_in_event_loop(move |ui| {
+                ui.set_post_model_installing(false);
+                ui.set_post_model_download_prompt_visible(true);
+                ui.set_post_model_ready(result.is_ok());
+                match result {
+                    Ok(()) => {
+                        ui.set_post_model_progress(1.0);
+                        ui.set_post_model_status("Installed, tested, and ready to use.".into());
+                    }
+                    Err(err) => ui.set_post_model_status(
+                        format!("Installation failed: {err} You can retry.").into(),
+                    ),
+                }
+            });
+        });
+    });
+    let post_decline_ui = ui.as_weak();
+    ui.on_decline_post_processing_model_download(move || {
+        if let Some(ui) = post_decline_ui.upgrade() {
+            if !ui.get_post_model_ready() {
+                ui.set_post_model_status("Installation postponed. Written rules work; original punctuation will be retained.".into());
+            }
+        }
+    });
+
     let ui_weak_for_hotkey = ui.as_weak();
     #[cfg(target_os = "windows")]
     let hotkey_capture_window_for_start = hotkey_capture_window.as_weak();
@@ -3455,7 +3639,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let started_by_windows =
         cfg!(target_os = "windows") && std::env::args_os().skip(1).any(|arg| arg == "--startup");
-    if !started_by_windows {
+    if !started_by_windows || ui.get_post_model_download_prompt_visible() {
         ui.show()?;
     }
 
@@ -3510,6 +3694,122 @@ mod tests {
     use crate::audio::InputDeviceSnapshot;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[test]
+    #[ignore = "opens an isolated settings window; no recording, network, or user settings writes"]
+    fn post_processing_settings_ui_smoke() {
+        use slint::ComponentHandle;
+        let ui = super::AppWindow::new().unwrap();
+        let mut settings = super::AppSettings::default();
+        let mut pp = serde_json::to_value(&settings.post_processing).unwrap();
+        for field in pp.as_object_mut().unwrap().values_mut() {
+            if field.is_boolean() {
+                *field = serde_json::Value::Bool(false);
+            }
+        }
+        settings.post_processing = serde_json::from_value(pp).unwrap();
+        settings.post_processing.protected_phrases = vec!["GPT-4".into()];
+        settings.post_processing.custom_replacements = vec!["echo app => Echo".into()];
+        super::populate_settings_editor(&ui, &settings);
+        assert_eq!(
+            super::settings_snapshot_from_ui(&ui, &settings).post_processing,
+            settings.post_processing
+        );
+        settings.post_processing = Default::default();
+        super::populate_settings_editor(&ui, &settings);
+        assert_eq!(
+            super::settings_snapshot_from_ui(&ui, &settings).post_processing,
+            settings.post_processing
+        );
+        ui.set_active_tab(3);
+        ui.set_settings_tab(3);
+        ui.set_post_model_status("Offline punctuation model ready (isolated UI test)".into());
+        ui.window().set_size(slint::PhysicalSize::new(1000, 1050));
+        ui.show().unwrap();
+        let weak = ui.as_weak();
+        slint::Timer::single_shot(Duration::from_millis(500), move || {
+            let ui = weak.upgrade().unwrap();
+            for tab in 0..=5 {
+                ui.set_settings_tab(tab);
+                let pixels = ui.window().take_snapshot().unwrap();
+                assert!(pixels.width() >= 760 && pixels.height() >= 600);
+                if tab == 3 {
+                    save_ui_snapshot(&pixels, "echo-post-processing-ui.bmp");
+                }
+            }
+            ui.set_settings_tab(3);
+            let before_hover = ui.window().take_snapshot().unwrap();
+            assert!(
+                before_hover.as_slice().iter().any(|p| p.r > 100),
+                "snapshot must contain rendered content; use SLINT_BACKEND=winit-software"
+            );
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::PointerMoved {
+                    position: slint::LogicalPosition::new(908.0, 365.0),
+                });
+            save_ui_snapshot(
+                &ui.window().take_snapshot().unwrap(),
+                "echo-post-processing-help-ui.bmp",
+            );
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::PointerExited);
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                    position: slint::LogicalPosition::new(500.0, 550.0),
+                    delta_x: 0.0,
+                    delta_y: -700.0,
+                });
+            save_ui_snapshot(
+                &ui.window().take_snapshot().unwrap(),
+                "echo-post-processing-lower-ui.bmp",
+            );
+            ui.set_post_model_download_prompt_visible(true);
+            ui.set_post_model_installing(true);
+            ui.set_post_model_progress(0.93);
+            ui.set_post_model_status("Loading model and testing punctuation…".into());
+            save_ui_snapshot(
+                &ui.window().take_snapshot().unwrap(),
+                "echo-post-processing-install-ui.bmp",
+            );
+            ui.set_post_model_installing(false);
+            ui.set_post_model_ready(true);
+            ui.set_post_model_progress(1.0);
+            ui.set_post_model_status("Installed, tested, and ready to use.".into());
+            save_ui_snapshot(
+                &ui.window().take_snapshot().unwrap(),
+                "echo-post-processing-ready-ui.bmp",
+            );
+            ui.hide().unwrap();
+            slint::quit_event_loop().unwrap();
+        });
+        slint::run_event_loop().unwrap();
+    }
+
+    fn save_ui_snapshot(pixels: &slint::SharedPixelBuffer<slint::Rgba8Pixel>, name: &str) {
+        // Small dependency-free BMP encoder for visual smoke-test artifacts.
+        let (width, height) = (pixels.width(), pixels.height());
+        let stride = (width * 3 + 3) & !3;
+        let mut bytes = vec![0u8; (54 + stride * height) as usize];
+        bytes[..2].copy_from_slice(b"BM");
+        let length = bytes.len() as u32;
+        bytes[2..6].copy_from_slice(&length.to_le_bytes());
+        bytes[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bytes[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bytes[18..22].copy_from_slice(&width.to_le_bytes());
+        bytes[22..26].copy_from_slice(&height.to_le_bytes());
+        bytes[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bytes[28..30].copy_from_slice(&24u16.to_le_bytes());
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = pixels.as_slice()[(y * width + x) as usize];
+                let offset = (54 + (height - 1 - y) * stride + x * 3) as usize;
+                bytes[offset..offset + 3].copy_from_slice(&[pixel.b, pixel.g, pixel.r]);
+            }
+        }
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        eprintln!("UI snapshot: {}", path.display());
+    }
 
     #[test]
     fn instance_activation_waits_for_ui_and_is_consumed_once() {

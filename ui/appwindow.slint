@@ -1,4 +1,39 @@
 import { Button, VerticalBox, HorizontalBox, LineEdit, TextEdit, ComboBox, CheckBox, ScrollView, Slider } from "std-widgets.slint";
+component HelpIcon inherits Rectangle {
+    in property <string> help;
+    width: 22px; height: 22px;
+    border-radius: 11px; background: #193e2b;
+    accessible-role: button; accessible-label: root.help;
+    Text { text: "?"; color: #bce4cc; horizontal-alignment: center; vertical-alignment: center; }
+    focus := FocusScope {
+        changed has-focus => { if self.has-focus { tip.show(); } else if !area.has-hover { tip.close(); } }
+    }
+    area := TouchArea {
+        clicked => { focus.focus(); }
+        changed has-hover => { if self.has-hover { tip.show(); } else if !focus.has-focus { tip.close(); } }
+    }
+    // Tooltips remain available even when their corresponding checkbox is disabled.
+    tip := PopupWindow {
+        x: -325px; y: 24px; width: 345px;
+        close-policy: PopupClosePolicy.no-auto-close;
+        Rectangle { background: #173b2a; border-color: #589970; border-width: 1px; border-radius: 5px;
+            VerticalBox { padding: 10px;
+                Text { text: root.help; color: #edfff2; wrap: word-wrap; font-size: 12px; }
+            }
+        }
+    }
+}
+
+component RuleToggle inherits HorizontalBox {
+    in property <string> label;
+    in property <string> help;
+    in property <bool> active: true;
+    in-out property <bool> checked;
+    callback toggled();
+    spacing: 8px;
+    CheckBox { text: root.label; checked <=> root.checked; enabled: root.active; toggled => { root.toggled(); } }
+    HelpIcon { help: root.help; }
+}
 
 component SettingsNavItem inherits Rectangle {
     in property <image> icon;
@@ -265,6 +300,31 @@ export component AppWindow inherits Window {
     in-out property <[string]> gemini-preset-options;
     in-out property <string> selected-gemini-preset;
     in-out property <string> gemini-custom-prompt;
+    in-out property <bool> post-processing-enabled: true;
+    in-out property <bool> post-format-numbers: true;
+    in-out property <bool> post-prefer-digits: true;
+    in-out property <bool> post-whole-numbers: true;
+    in-out property <bool> post-ordinals: true;
+    in-out property <bool> post-decimals: true;
+    in-out property <bool> post-money: true;
+    in-out property <bool> post-measurements: true;
+    in-out property <bool> post-dates: true;
+    in-out property <bool> post-times: true;
+    in-out property <bool> post-identifiers: true;
+    in-out property <bool> post-addresses: true;
+    in-out property <bool> post-punctuation: true;
+    in-out property <bool> post-capitalization: true;
+    in-out property <bool> post-commas: true;
+    in-out property <bool> post-periods: true;
+    in-out property <bool> post-question-marks: true;
+    in-out property <bool> post-model-ready: false;
+    callback post-processing-changed();
+    in-out property <string> post-protected-phrases-text;
+    in-out property <string> post-custom-replacements-text;
+    in property <string> post-model-status: "Punctuation model not downloaded";
+    in-out property <bool> post-model-download-prompt-visible: false;
+    in-out property <bool> post-model-installing: false;
+    in-out property <float> post-model-progress: 0;
 
     callback start-recording();
     callback stop-recording();
@@ -280,6 +340,8 @@ export component AppWindow inherits Window {
     callback cancel-unsaved-settings();
     callback check-for-updates();
     callback install-update();
+    callback download-post-processing-model();
+    callback decline-post-processing-model-download();
 
     VerticalBox {
         spacing: 0px;
@@ -609,7 +671,8 @@ export component AppWindow inherits Window {
                             SettingsNavItem { width: 104px; icon: @image-url("../assets/icons/general.svg"); label: "General"; first-line: "General"; selected: root.settings-tab == 0; accent: root.theme-button-accent-color; activated => { root.settings-tab = 0; } }
                             SettingsNavItem { width: 128px; icon: @image-url("../assets/icons/speech.svg"); label: "Speech engine"; first-line: "Speech"; second-line: "engine"; selected: root.settings-tab == 1; accent: root.theme-button-accent-color; activated => { root.settings-tab = 1; } }
                             SettingsNavItem { width: 138px; icon: @image-url("../assets/icons/rewrite.svg"); label: "Text rewriting"; first-line: "Text"; second-line: "rewriting"; selected: root.settings-tab == 2; accent: root.theme-button-accent-color; activated => { root.settings-tab = 2; } }
-                            SettingsNavItem { width: 136px; icon: @image-url("../assets/icons/appearance.svg"); label: "Appearance"; first-line: "Appearance"; selected: root.settings-tab == 3; accent: root.theme-button-accent-color; activated => { root.settings-tab = 3; } }
+                            SettingsNavItem { width: 142px; icon: @image-url("../assets/icons/rewrite.svg"); label: "Post processing"; first-line: "Post"; second-line: "processing"; selected: root.settings-tab == 3; accent: root.theme-button-accent-color; activated => { root.settings-tab = 3; } }
+                            SettingsNavItem { width: 136px; icon: @image-url("../assets/icons/appearance.svg"); label: "Appearance"; first-line: "Appearance"; selected: root.settings-tab == 4; accent: root.theme-button-accent-color; activated => { root.settings-tab = 4; } }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                         }
                     }
@@ -778,6 +841,37 @@ export component AppWindow inherits Window {
                         if root.settings-tab == 3 : ScrollView {
                             x: 20px; y: 18px; width: parent.width - 40px; height: parent.height - 36px;
                             VerticalBox {
+                                spacing: 10px;
+                                SectionTitle { title: "Post processing"; subtitle: "Local formatting runs after optional Gemini rewriting and before text is pasted."; }
+                                RuleToggle { label: "Use local post-processing"; checked <=> root.post-processing-enabled; active: !root.is-recording && !root.is-finalizing; help: "Formats only the complete transcript after you stop. The live preview stays unchanged. Save settings to keep your choices."; toggled => { root.post-processing-changed(); } }
+                                Text { text: root.post-model-status; color: #7f9d8c; font-size: 11px; wrap: word-wrap; }
+                                Text { text: "Written formats"; color: #d6e9dc; font-size: 13px; font-weight: 600; }
+                                RuleToggle { label: "Convert ordinary spoken numbers"; checked <=> root.post-format-numbers; active: root.post-processing-enabled; help: "Master switch for whole numbers, ordinals, and decimals. Other written-format categories are independent."; }
+                                RuleToggle { label: "Prefer digits for small counts"; checked <=> root.post-prefer-digits; active: root.post-processing-enabled && root.post-format-numbers; help: "When off, ordinary single-word counts below thirteen stay written as words. Explicit money, units, dates, and identifiers still use digits."; }
+                                RuleToggle { label: "Whole numbers"; checked <=> root.post-whole-numbers; active: root.post-processing-enabled && root.post-format-numbers; help: "twenty three → 23. Controls ordinary counts; money, dates, and units have separate switches."; }
+                                RuleToggle { label: "Ordinals"; checked <=> root.post-ordinals; active: root.post-processing-enabled && root.post-format-numbers; help: "twenty first → 21st."; }
+                                RuleToggle { label: "Decimals and signed quantities"; checked <=> root.post-decimals; active: root.post-processing-enabled && root.post-format-numbers; help: "three point five → 3.5; negative twenty three → -23."; }
+                                RuleToggle { label: "Currency"; checked <=> root.post-money; active: root.post-processing-enabled; help: "twelve dollars and five cents → $12.05. Supports dollars, euros, cents, and pounds sterling."; }
+                                RuleToggle { label: "Measurements and percentages"; checked <=> root.post-measurements; active: root.post-processing-enabled; help: "three kilograms → 3 kg; fifty percent → 50%; twenty degrees Celsius → 20°C."; }
+                                RuleToggle { label: "Dates"; checked <=> root.post-dates; active: root.post-processing-enabled; help: "January fifth twenty twenty six → January 5, 2026. Named months only; ambiguous numeric dates stay unchanged."; }
+                                RuleToggle { label: "Times"; checked <=> root.post-times; active: root.post-processing-enabled; help: "three thirty PM → 3:30 PM. Requires AM, PM, or o'clock to avoid guessing."; }
+                                RuleToggle { label: "Phone numbers and identifiers"; checked <=> root.post-identifiers; active: root.post-processing-enabled; help: "phone number zero one two → phone number 012; code A zero zero seven → code A007. Requires a phone, code, PIN, ID, or serial cue."; }
+                                RuleToggle { label: "Email addresses and web addresses"; checked <=> root.post-addresses; active: root.post-processing-enabled; help: "john dot smith at example dot com → john.smith@example.com. Existing written addresses stay intact."; }
+                                Text { text: "Punctuation and capitalization"; color: #d6e9dc; font-size: 13px; font-weight: 600; }
+                                RuleToggle { label: "Rebuild punctuation with the offline model"; checked <=> root.post-punctuation; active: root.post-processing-enabled; help: "Removes speech-model sentence punctuation, applies written rules, then restores punctuation locally on the CPU. Protected addresses and numbers keep internal symbols. If unavailable, retains original punctuation and reports a warning."; toggled => { root.post-processing-changed(); } }
+                                RuleToggle { label: "Sentence capitalization and the pronoun I"; checked <=> root.post-capitalization; active: root.post-processing-enabled; help: "Capitalizes sentence starts and I. Preserves existing names and acronyms. This is a rule, not a model for recognizing proper names."; }
+                                RuleToggle { label: "Commas"; checked <=> root.post-commas; active: root.post-processing-enabled && root.post-punctuation; help: "Keep commas predicted by the punctuation model. Turning this off removes predicted commas, not commas inside protected values."; }
+                                RuleToggle { label: "Periods"; checked <=> root.post-periods; active: root.post-processing-enabled && root.post-punctuation; help: "Keep sentence-ending periods predicted by the model. Does not remove decimal points or dots in addresses."; }
+                                RuleToggle { label: "Question marks"; checked <=> root.post-question-marks; active: root.post-processing-enabled && root.post-punctuation; help: "Keep question marks predicted by the model. The offline model may still miss questions; it does not rewrite words."; }
+                                HorizontalBox { Text { text: "Protected phrases (one per line)"; color: #d6e9dc; font-size: 12px; font-weight: 600; } HelpIcon { help: "Exact phrases stay as transcribed: no number conversion, replacement, or internal punctuation changes. Matching ignores letter case and uses whole words. Addresses and written numbers are protected automatically."; } }
+                                TextEdit { height: 70px; text <=> root.post-protected-phrases-text; placeholder-text: "one of a kind\nGPT-4"; enabled: root.post-processing-enabled; }
+                                HorizontalBox { Text { text: "Custom replacements (spoken => written)"; color: #d6e9dc; font-size: 12px; font-weight: 600; } HelpIcon { help: "One spoken => written pair per line. Whole-word, case-insensitive matching; longest match wins. The result is protected from further changes. Invalid or duplicate rules are rejected when saving."; } }
+                                TextEdit { height: 70px; text <=> root.post-custom-replacements-text; placeholder-text: "acme corp => Acme Corp"; enabled: root.post-processing-enabled; }
+                            }
+                        }
+                        if root.settings-tab == 4 : ScrollView {
+                            x: 20px; y: 18px; width: parent.width - 40px; height: parent.height - 36px;
+                            VerticalBox {
                                 spacing: 13px;
                                 SectionTitle { title: "Appearance"; subtitle: "Choose a palette and tune the live transcription overlay."; }
                                 Text { text: "Color palette"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
@@ -935,7 +1029,29 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.context-menu-visible && !root.local-download-prompt-visible && !root.local-download-progress-visible && !root.unsaved-settings-prompt-visible && !root.update-panel-visible : Rectangle {
+    if root.post-model-download-prompt-visible || root.post-model-installing : Rectangle {
+        x: 0; y: 0; width: root.width; height: root.height; background: #000000b8;
+        TouchArea { clicked => {} }
+        Rectangle {
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            width: 500px; height: 320px; background: #0b2117; border-color: #2a5a40; border-width: 1px; border-radius: 14px;
+            VerticalBox {
+                padding: 24px; spacing: 14px;
+                Text { text: root.post-model-installing ? "Installing punctuation model" : root.post-model-ready ? "Ready to use" : "Install punctuation model?"; color: #edfff2; font-size: 21px; font-weight: 700; }
+                Text { text: "Post-processing uses a local 62 MB CPU model. Echo downloads it now over HTTPS and verifies its SHA-256 before installing it."; color: #a9c3b2; wrap: word-wrap; font-size: 12px; }
+                VerticalBox { spacing: 7px;
+                    Text { text: root.post-model-status; color: #a9c3b2; font-size: 11px; wrap: word-wrap; }
+                    Rectangle { height: 14px; background: #193427; border-radius: 7px; Rectangle { width: parent.width * Math.max(0, Math.min(1, root.post-model-progress)); height: parent.height; background: root.theme-button-accent-color; border-radius: 7px; animate width { duration: 100ms; } } }
+                }
+                if !root.post-model-installing : HorizontalBox { spacing: 10px;
+                    if !root.post-model-ready : Button { text: "Download and install"; primary: true; enabled: !root.is-recording && !root.is-finalizing; clicked => { root.download-post-processing-model(); } }
+                    Button { text: root.post-model-ready ? "Done" : "Not now"; clicked => { root.post-model-download-prompt-visible = false; root.decline-post-processing-model-download(); } }
+                }
+            }
+        }
+    }
+
+    if root.context-menu-visible && !root.post-model-download-prompt-visible && !root.post-model-installing && !root.local-download-prompt-visible && !root.local-download-progress-visible && !root.unsaved-settings-prompt-visible && !root.update-panel-visible : Rectangle {
         x: 0; y: 0; width: root.width; height: root.height;
         TouchArea { clicked => { root.context-menu-visible = false; } }
         Rectangle {

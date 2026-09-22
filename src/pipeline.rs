@@ -28,7 +28,7 @@ impl TranscriptPipeline {
 }
 
 pub fn append_fragment(existing: &str, incoming: &str) -> String {
-    let incoming = incoming.trim().trim_start_matches('-').trim();
+    let incoming = incoming.trim();
     if incoming.is_empty() {
         return existing.to_string();
     }
@@ -72,9 +72,9 @@ mod tests {
     }
 
     #[test]
-    fn append_fragment_removes_leading_dash() {
-        let a = append_fragment("hello", "-world");
-        assert_eq!(a, "hello world ");
+    fn append_fragment_preserves_signed_values() {
+        let a = append_fragment("temperature", "-23");
+        assert_eq!(a, "temperature -23 ");
     }
 
     #[test]
