@@ -3,7 +3,7 @@ use crate::settings::PostProcessingSettings;
 use futures_util::StreamExt;
 pub use rules::validate;
 use sha2::{Digest, Sha256};
-use sherpa_onnx::{OfflinePunctuation, OfflinePunctuationConfig, OfflinePunctuationModelConfig};
+use sherpa_onnx::{OnlinePunctuation, OnlinePunctuationConfig, OnlinePunctuationModelConfig};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -13,12 +13,20 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 
+/// Edge-Punct-Casing jointly predicts sentence marks and word casing. It is
+/// the small, English-only Sherpa ONNX package; it replaces the former
+/// multilingual CT-Transformer which predicted punctuation only.
+const MODEL_DIRECTORY: &str = "edge-punct-casing";
 const MODEL: &str = "model.int8.onnx";
-const URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/punctuation-models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8.tar.bz2";
-const ARCHIVE_HASH: &str = "c0d5aa5f8eeb686032345e180bedf39319dc2e0556781c6264bcadba8328a6e1";
-const ARCHIVE_SIZE: u64 = 64_717_756;
-const MODEL_HASH: &str = "65a3fb9f5ad7bfb96bf69e0dc4481df97f6ee60513c1d94ce981ba6effd524b1";
-static PUNCTUATOR: Mutex<Option<OfflinePunctuation>> = Mutex::new(None);
+const VOCABULARY: &str = "bpe.vocab";
+const URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/punctuation-models/sherpa-onnx-online-punct-en-2024-08-06.tar.bz2";
+const ARCHIVE_HASH: &str = "9f5e5a72c7d2829635bd074fce92b6bbd5b78da8a52e7ad8ed1be933f366b99d";
+const ARCHIVE_SIZE: u64 = 30_667_839;
+const MODEL_HASH: &str = "9d611f445fe4a46186080fe161be6059d87d72eb88d3a8cb00c1a06e83a6067e";
+const MODEL_SIZE: u64 = 7_490_500;
+const VOCABULARY_HASH: &str = "e118b7ad88c54db562517df49e1cffd4836d166c34fb190fd311d7f34eb238f5";
+const VOCABULARY_SIZE: u64 = 149_430;
+static PUNCTUATOR: Mutex<Option<OnlinePunctuation>> = Mutex::new(None);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Recording/finalization and explicit model installation are mutually exclusive.
 pub struct ActivityGuard;
@@ -39,6 +47,12 @@ impl Drop for ActivityGuard {
 pub struct ProcessedText {
     pub text: String,
     pub warning: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct WordPrediction {
+    punctuation: String,
+    casing: String,
 }
 
 /// Called on the formatting worker after the provider has drained on stop.
@@ -103,14 +117,19 @@ fn process_with(
         });
         clean.push(atom.clone());
     }
-    let mut marks = vec![String::new(); clean.len()];
+    let mut predictions = (0..clean.len())
+        .map(|_| WordPrediction {
+            punctuation: String::new(),
+            casing: String::new(),
+        })
+        .collect::<Vec<_>>();
     // Bounded windows with context overlap. Each boundary has one owner.
     for start in (0..clean.len()).step_by(96) {
         let end = (start + 96).min(clean.len());
         let left = start.saturating_sub(16);
         let right = (end + 16).min(clean.len());
         let output = match infer(&projection[left..right].join(" "))
-            .and_then(|out| boundary_marks(&projection[left..right], &out))
+            .and_then(|out| word_predictions(&projection[left..right], &out))
         {
             Ok(output) => output,
             Err(warning) => {
@@ -124,20 +143,25 @@ fn process_with(
                 }
             }
         };
-        marks[start..end].clone_from_slice(&output[(start - left)..(end - left)]);
+        predictions[start..end].clone_from_slice(&output[(start - left)..(end - left)]);
     }
     let mut sentence_start = true;
     let mut text = String::new();
-    for (atom, mark) in clean.iter().zip(marks) {
+    for (atom, prediction) in clean.iter().zip(predictions) {
         if !text.is_empty() {
             text.push(' ');
         }
         let mut word = atom.content.clone();
         if s.capitalization && !atom.case_protected {
+            word = apply_model_casing(&word, &prediction.casing);
+            // A learned casing prediction should improve names and interior
+            // words, but preserve the old guaranteed sentence-start and "I"
+            // behavior if a model ever emits lowercase there.
             word = case_word(&word, sentence_start);
         }
         text.push_str(&word);
-        let mark = mark
+        let mark = prediction
+            .punctuation
             .chars()
             .filter(|c| match c {
                 ',' => s.commas,
@@ -155,6 +179,25 @@ fn process_with(
         text,
         warning: None,
     }
+}
+
+/// The model sees lowercase words, but returns their predicted casing. Keep
+/// original letters unless the model asks to make one uppercase; this lets a
+/// pre-capitalized name survive a mistaken lowercase prediction.
+fn apply_model_casing(word: &str, predicted: &str) -> String {
+    if word.chars().count() != predicted.chars().count() {
+        return word.to_string();
+    }
+    word.chars()
+        .zip(predicted.chars())
+        .fold(String::new(), |mut result, (source, prediction)| {
+            if prediction.is_uppercase() {
+                result.extend(source.to_uppercase());
+            } else {
+                result.push(source);
+            }
+            result
+        })
 }
 
 fn case_word(word: &str, start: bool) -> String {
@@ -190,24 +233,25 @@ fn capitalize_existing(atoms: &[rules::Atom]) -> String {
 }
 
 /// Extract additions only; never accept changed, lost, duplicated model words.
-fn boundary_marks(words: &[String], output: &str) -> Result<Vec<String>, String> {
-    let mut stream = output
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .peekable();
+/// Validates that inference changed only case and boundary punctuation. This
+/// keeps protected names, addresses, and written values owned by Echo.
+fn word_predictions(words: &[String], output: &str) -> Result<Vec<WordPrediction>, String> {
+    let mut stream = output.chars().filter(|c| !c.is_whitespace()).peekable();
     let mut result = Vec::new();
     for word in words {
-        for expected in word
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .flat_map(char::to_lowercase)
-        {
-            if stream.next() != Some(expected) {
+        let mut casing = String::new();
+        for expected in word.chars().filter(|c| !c.is_whitespace()) {
+            let Some(actual) = stream.next() else {
+                return Err(
+                    "Punctuation output changed words; original punctuation retained.".into(),
+                );
+            };
+            if !actual.eq_ignore_ascii_case(&expected) {
                 return Err(
                     "Punctuation output changed words; original punctuation retained.".into(),
                 );
             }
+            casing.push(actual);
         }
         let mut mark = String::new();
         while let Some(c) = stream.peek().copied() {
@@ -221,7 +265,10 @@ fn boundary_marks(words: &[String], output: &str) -> Result<Vec<String>, String>
             stream.next();
             mark.push(mapped);
         }
-        result.push(mark);
+        result.push(WordPrediction {
+            punctuation: mark,
+            casing,
+        });
     }
     if stream.next().is_some() {
         return Err("Punctuation output did not align; original punctuation retained.".into());
@@ -229,45 +276,58 @@ fn boundary_marks(words: &[String], output: &str) -> Result<Vec<String>, String>
     Ok(result)
 }
 
-fn punctuation_path() -> PathBuf {
+fn punctuation_root() -> PathBuf {
     dirs_next::data_local_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("11th_echo/models/punctuation")
-        .join(MODEL)
+}
+fn punctuation_directory() -> PathBuf {
+    punctuation_root().join(MODEL_DIRECTORY)
+}
+fn punctuation_path() -> PathBuf {
+    punctuation_directory().join(MODEL)
+}
+fn vocabulary_path() -> PathBuf {
+    punctuation_directory().join(VOCABULARY)
 }
 pub fn punctuation_model_available() -> bool {
     punctuation_path()
         .metadata()
-        .is_ok_and(|m| m.len() > 1_000_000)
+        .is_ok_and(|m| m.len() == MODEL_SIZE)
+        && vocabulary_path()
+            .metadata()
+            .is_ok_and(|m| m.len() == VOCABULARY_SIZE)
 }
-fn load(path: &Path) -> Result<OfflinePunctuation, String> {
-    if !path.is_file() {
+fn load(model_path: &Path, vocabulary_path: &Path) -> Result<OnlinePunctuation, String> {
+    if !model_path.is_file() || !vocabulary_path.is_file() {
         return Err(
-            "Punctuation model is missing. Enable post-processing in Settings to install it."
+            "Punctuation and capitalization model is missing. Enable post-processing in Settings to install it."
                 .into(),
         );
     }
-    if hash_file(path)? != MODEL_HASH {
-        return Err("Installed punctuation model failed verification. Re-enable post-processing to repair it.".into());
+    if hash_file(model_path)? != MODEL_HASH || hash_file(vocabulary_path)? != VOCABULARY_HASH {
+        return Err("Installed punctuation and capitalization model failed verification. Re-enable post-processing to repair it.".into());
     }
-    OfflinePunctuation::create(&OfflinePunctuationConfig {
-        model: OfflinePunctuationModelConfig {
-            ct_transformer: Some(path.to_string_lossy().into_owned()),
+    OnlinePunctuation::create(&OnlinePunctuationConfig {
+        model: OnlinePunctuationModelConfig {
+            cnn_bilstm: Some(model_path.to_string_lossy().into_owned()),
+            bpe_vocab: Some(vocabulary_path.to_string_lossy().into_owned()),
             num_threads: 1,
             provider: Some("cpu".into()),
             debug: false,
         },
     })
     .ok_or_else(|| {
-        "Punctuation model could not load. Re-enable post-processing to repair it.".into()
+        "Punctuation and capitalization model could not load. Re-enable post-processing to repair it."
+            .into()
     })
 }
 fn punctuate(text: &str) -> Result<String, String> {
     let mut model = PUNCTUATOR
         .lock()
-        .map_err(|_| "Punctuation worker needs a restart.")?;
+        .map_err(|_| "Punctuation and capitalization worker needs a restart.")?;
     if model.is_none() {
-        *model = Some(load(&punctuation_path())?);
+        *model = Some(load(&punctuation_path(), &vocabulary_path())?);
     }
     model
         .as_ref()
@@ -306,29 +366,58 @@ fn extract_verified(archive: &Path, staged: &Path) -> Result<(), String> {
     }
     let source = std::fs::File::open(archive).map_err(|e| e.to_string())?;
     let mut tar = tar::Archive::new(bzip2::read::BzDecoder::new(source));
-    let mut found = false;
+    let mut found_model = false;
+    let mut found_vocabulary = false;
     for entry in tar.entries().map_err(|e| e.to_string())? {
         let mut entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path().map_err(|e| e.to_string())?;
-        if path
+        let components = path
             .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect::<Vec<_>>();
+        if components.is_empty()
+            || components.len() > 2
+            || components
+                .iter()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            || components[0].as_os_str() != "sherpa-onnx-online-punct-en-2024-08-06"
         {
             return Err("Unsafe path in model archive.".into());
         }
-        if path.file_name().and_then(|n| n.to_str()) != Some(MODEL) {
+        if components.len() == 1 && entry.header().entry_type().is_dir() {
             continue;
         }
-        if found || !entry.header().entry_type().is_file() || entry.size() > 512 * 1024 * 1024 {
+        if components.len() != 2 {
+            return Err("Unsafe path in model archive.".into());
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let (destination, expected_size, already_found) = match name {
+            MODEL => (staged.join(MODEL), MODEL_SIZE, &mut found_model),
+            VOCABULARY => (
+                staged.join(VOCABULARY),
+                VOCABULARY_SIZE,
+                &mut found_vocabulary,
+            ),
+            _ => continue,
+        };
+        if *already_found || !entry.header().entry_type().is_file() || entry.size() != expected_size
+        {
             return Err("Invalid punctuation model archive entry.".into());
         }
-        let mut out = std::fs::File::create(staged).map_err(|e| e.to_string())?;
+        let mut out = std::fs::File::create(destination).map_err(|e| e.to_string())?;
         std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
         out.sync_all().map_err(|e| e.to_string())?;
-        found = true;
+        *already_found = true;
     }
-    if !found {
-        return Err("Archive has no punctuation model.".into());
+    if !found_model || !found_vocabulary {
+        return Err("Archive is missing punctuation and capitalization model files.".into());
+    }
+    if hash_file(&staged.join(MODEL))? != MODEL_HASH
+        || hash_file(&staged.join(VOCABULARY))? != VOCABULARY_HASH
+    {
+        return Err("Extracted model files failed SHA-256 verification.".into());
     }
     Ok(())
 }
@@ -337,19 +426,23 @@ pub async fn download_punctuation_model<F>(progress: F) -> Result<(), String>
 where
     F: Fn(f32, String) + Send + Sync + 'static,
 {
-    download_to(punctuation_path(), progress).await
+    download_to(punctuation_directory(), progress).await
 }
 
 async fn download_to<F>(destination: PathBuf, progress: F) -> Result<(), String>
 where
     F: Fn(f32, String) + Send + Sync + 'static,
 {
-    let directory = destination.parent().unwrap();
-    tokio::fs::create_dir_all(directory)
+    let root = destination
+        .parent()
+        .ok_or("Cannot resolve punctuation model directory.")?
+        .to_owned();
+    tokio::fs::create_dir_all(&root)
         .await
         .map_err(|e| e.to_string())?;
-    let archive = directory.join("punctuation.tar.bz2.part");
-    let staged = directory.join("model.installing.onnx");
+    let archive = root.join("edge-punct-casing.tar.bz2.part");
+    let staged = root.join("edge-punct-casing.installing");
+    let backup = root.join("edge-punct-casing.previous");
     // Reuse a previous complete download only after verification. No network
     // activity is started here except following explicit modal acceptance.
     progress(0.01, "Checking previously downloaded files…".into());
@@ -407,24 +500,48 @@ where
             return Err("Model download was incomplete; please retry.".into());
         }
     }
-    let backup = directory.join("model.previous.onnx");
     tokio::task::spawn_blocking(move || {
         progress(0.85, "Verifying and unpacking model…".into());
+        if staged.exists() {
+            std::fs::remove_dir_all(&staged).map_err(|e| e.to_string())?;
+        }
+        std::fs::create_dir(&staged).map_err(|e| e.to_string())?;
         extract_verified(&archive, &staged)?;
-        progress(0.93, "Loading model and testing punctuation…".into());
-        let model = load(&staged)?;
+        progress(
+            0.93,
+            "Loading model and testing punctuation and capitalization…".into(),
+        );
+        let model = load(&staged.join(MODEL), &staged.join(VOCABULARY))?;
         let probe = model
-            .add_punctuation("hello how are you")
+            .add_punctuation("how are you i am fine thank you")
             .ok_or("Model inference test failed.")?;
-        boundary_marks(
-            &["hello".into(), "how".into(), "are".into(), "you".into()],
+        let predictions = word_predictions(
+            &[
+                "how".into(),
+                "are".into(),
+                "you".into(),
+                "i".into(),
+                "am".into(),
+                "fine".into(),
+                "thank".into(),
+                "you".into(),
+            ],
             &probe,
         )?;
+        if !predictions[0].casing.starts_with('H')
+            || !predictions[2].punctuation.ends_with('?')
+            || !predictions[3].casing.starts_with('I')
+            || !predictions[5].punctuation.ends_with('.')
+        {
+            return Err(
+                "Model inference test did not restore expected casing and punctuation.".into(),
+            );
+        }
         let mut current = PUNCTUATOR
             .lock()
-            .map_err(|_| "Punctuation worker needs a restart.")?;
+            .map_err(|_| "Punctuation and capitalization worker needs a restart.")?;
         if backup.exists() {
-            std::fs::remove_file(&backup).map_err(|e| e.to_string())?;
+            std::fs::remove_dir_all(&backup).map_err(|e| e.to_string())?;
         }
         let had_old = destination.exists();
         if had_old {
@@ -438,7 +555,7 @@ where
         }
         *current = Some(model);
         if had_old {
-            let _ = std::fs::remove_file(&backup);
+            let _ = std::fs::remove_dir_all(&backup);
         }
         let _ = std::fs::remove_file(&archive);
         progress(1.0, "Installed, tested, and ready to use.".into());
@@ -515,13 +632,27 @@ mod tests {
         };
         assert_eq!(process_with(" hello! ", &s, |_| panic!()).text, " hello! ");
     }
+
+    #[test]
+    fn learned_casing_applies_inside_a_sentence() {
+        let result = process_with(
+            "i met alice yesterday",
+            &PostProcessingSettings::default(),
+            |input| {
+                assert_eq!(input, "i met alice yesterday");
+                Ok("I met Alice yesterday.".into())
+            },
+        );
+        assert_eq!(result.text, "I met Alice yesterday.");
+        assert!(result.warning.is_none());
+    }
     #[test]
     fn checksum_is_full_sha256() {
         assert_eq!(ARCHIVE_HASH.len(), 64);
     }
     #[test]
     fn model_cannot_change_words() {
-        assert!(boundary_marks(&["hello".into()], "goodbye.").is_err());
+        assert!(word_predictions(&["hello".into()], "goodbye.").is_err());
     }
 
     #[test]
@@ -663,14 +794,15 @@ mod tests {
             std::env::temp_dir().join(format!("echo-corrupt-archive-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let archive = dir.join("truncated.tar.bz2");
-        let model = dir.join(MODEL);
+        let staged = dir.join("staged");
+        std::fs::create_dir(&staged).unwrap();
+        let model = staged.join(MODEL);
         std::fs::write(&archive, b"truncated").unwrap();
         std::fs::write(&model, b"existing model").unwrap();
-        assert!(extract_verified(&archive, &model).is_err());
+        assert!(extract_verified(&archive, &staged).is_err());
         assert_eq!(std::fs::read(&model).unwrap(), b"existing model");
         std::fs::remove_file(archive).unwrap();
-        std::fs::remove_file(model).unwrap();
-        std::fs::remove_dir(dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     #[ignore = "requires locally downloaded verified archive; runs real CPU inference"]
@@ -680,11 +812,12 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("echo-punctuation-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        extract_verified(Path::new(&archive), &dir).unwrap();
         let model_path = dir.join(MODEL);
-        extract_verified(Path::new(&archive), &model_path).unwrap();
+        let vocabulary = dir.join(VOCABULARY);
         eprintln!("Verified model SHA-256 {}", hash_file(&model_path).unwrap());
         let start = Instant::now();
-        let model = load(&model_path).unwrap();
+        let model = load(&model_path, &vocabulary).unwrap();
         eprintln!("CPU load {:?}", start.elapsed());
         for input in [
             "how are you i am fine thank you",
@@ -700,8 +833,7 @@ mod tests {
             assert!(!result.text.is_empty());
         }
         drop(model);
-        std::fs::remove_file(model_path).unwrap();
-        std::fs::remove_dir(dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -711,9 +843,10 @@ mod tests {
             std::env::var_os("ECHO_PUNCTUATION_TEST_ARCHIVE").expect("set test archive path");
         let dir = std::env::temp_dir().join(format!("echo-install-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::copy(source, dir.join("punctuation.tar.bz2.part")).unwrap();
-        let destination = dir.join(MODEL);
-        std::fs::write(&destination, b"previous broken model").unwrap();
+        std::fs::copy(source, dir.join("edge-punct-casing.tar.bz2.part")).unwrap();
+        let destination = dir.join(MODEL_DIRECTORY);
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join(MODEL), b"previous broken model").unwrap();
         let updates = std::sync::Arc::new(Mutex::new(Vec::new()));
         let captured = updates.clone();
         tokio::runtime::Runtime::new()
@@ -723,12 +856,15 @@ mod tests {
                 captured.lock().unwrap().push(progress);
             }))
             .unwrap();
-        assert_eq!(hash_file(&destination).unwrap(), MODEL_HASH);
-        assert!(!dir.join("punctuation.tar.bz2.part").exists());
-        assert!(!dir.join("model.previous.onnx").exists());
+        assert_eq!(hash_file(&destination.join(MODEL)).unwrap(), MODEL_HASH);
+        assert_eq!(
+            hash_file(&destination.join(VOCABULARY)).unwrap(),
+            VOCABULARY_HASH
+        );
+        assert!(!dir.join("edge-punct-casing.tar.bz2.part").exists());
+        assert!(!dir.join("edge-punct-casing.previous").exists());
         assert_eq!(updates.lock().unwrap().last(), Some(&1.0));
         *PUNCTUATOR.lock().unwrap() = None;
-        std::fs::remove_file(destination).unwrap();
-        std::fs::remove_dir(dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -321,7 +321,7 @@ export component AppWindow inherits Window {
     callback post-processing-changed();
     in-out property <string> post-protected-phrases-text;
     in-out property <string> post-custom-replacements-text;
-    in property <string> post-model-status: "Punctuation model not downloaded";
+    in property <string> post-model-status: "Punctuation and capitalization model not downloaded";
     in-out property <bool> post-model-download-prompt-visible: false;
     in-out property <bool> post-model-installing: false;
     in-out property <float> post-model-progress: 0;
@@ -858,8 +858,8 @@ export component AppWindow inherits Window {
                                 RuleToggle { label: "Phone numbers and identifiers"; checked <=> root.post-identifiers; active: root.post-processing-enabled; help: "phone number zero one two → phone number 012; code A zero zero seven → code A007. Requires a phone, code, PIN, ID, or serial cue."; }
                                 RuleToggle { label: "Email addresses and web addresses"; checked <=> root.post-addresses; active: root.post-processing-enabled; help: "john dot smith at example dot com → john.smith@example.com. Existing written addresses stay intact."; }
                                 Text { text: "Punctuation and capitalization"; color: #d6e9dc; font-size: 13px; font-weight: 600; }
-                                RuleToggle { label: "Rebuild punctuation with the offline model"; checked <=> root.post-punctuation; active: root.post-processing-enabled; help: "Removes speech-model sentence punctuation, applies written rules, then restores punctuation locally on the CPU. Protected addresses and numbers keep internal symbols. If unavailable, retains original punctuation and reports a warning."; toggled => { root.post-processing-changed(); } }
-                                RuleToggle { label: "Sentence capitalization and the pronoun I"; checked <=> root.post-capitalization; active: root.post-processing-enabled; help: "Capitalizes sentence starts and I. Preserves existing names and acronyms. This is a rule, not a model for recognizing proper names."; }
+                                RuleToggle { label: "Rebuild punctuation with the offline model"; checked <=> root.post-punctuation; active: root.post-processing-enabled; help: "Removes speech-model sentence punctuation, applies written rules, then predicts punctuation and word casing locally on the CPU after you stop recording. Protected addresses and numbers keep internal symbols. If unavailable, retains original punctuation and reports a warning."; toggled => { root.post-processing-changed(); } }
+                                RuleToggle { label: "Sentence capitalization and the pronoun I"; checked <=> root.post-capitalization; active: root.post-processing-enabled; help: "Uses the offline model's casing predictions, including sentence starts and I. Existing names and acronyms are preserved when possible."; }
                                 RuleToggle { label: "Commas"; checked <=> root.post-commas; active: root.post-processing-enabled && root.post-punctuation; help: "Keep commas predicted by the punctuation model. Turning this off removes predicted commas, not commas inside protected values."; }
                                 RuleToggle { label: "Periods"; checked <=> root.post-periods; active: root.post-processing-enabled && root.post-punctuation; help: "Keep sentence-ending periods predicted by the model. Does not remove decimal points or dots in addresses."; }
                                 RuleToggle { label: "Question marks"; checked <=> root.post-question-marks; active: root.post-processing-enabled && root.post-punctuation; help: "Keep question marks predicted by the model. The offline model may still miss questions; it does not rewrite words."; }
@@ -1037,8 +1037,8 @@ export component AppWindow inherits Window {
             width: 500px; height: 320px; background: #0b2117; border-color: #2a5a40; border-width: 1px; border-radius: 14px;
             VerticalBox {
                 padding: 24px; spacing: 14px;
-                Text { text: root.post-model-installing ? "Installing punctuation model" : root.post-model-ready ? "Ready to use" : "Install punctuation model?"; color: #edfff2; font-size: 21px; font-weight: 700; }
-                Text { text: "Post-processing uses a local 62 MB CPU model. Echo downloads it now over HTTPS and verifies its SHA-256 before installing it."; color: #a9c3b2; wrap: word-wrap; font-size: 12px; }
+                Text { text: root.post-model-installing ? "Installing punctuation and capitalization model" : root.post-model-ready ? "Ready to use" : "Install punctuation and capitalization model?"; color: #edfff2; font-size: 21px; font-weight: 700; }
+                Text { text: "Post-processing uses a local 7.6 MB CPU model. Echo downloads a 30 MB package over HTTPS and verifies its SHA-256 before installing it."; color: #a9c3b2; wrap: word-wrap; font-size: 12px; }
                 VerticalBox { spacing: 7px;
                     Text { text: root.post-model-status; color: #a9c3b2; font-size: 11px; wrap: word-wrap; }
                     Rectangle { height: 14px; background: #193427; border-radius: 7px; Rectangle { width: parent.width * Math.max(0, Math.min(1, root.post-model-progress)); height: parent.height; background: root.theme-button-accent-color; border-radius: 7px; animate width { duration: 100ms; } } }

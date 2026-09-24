@@ -3287,9 +3287,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_post_model_ready(has_punctuation_model);
     ui.set_post_model_status(
         if has_punctuation_model {
-            "Checking offline punctuation model…"
+            "Checking offline punctuation and capitalization model…"
         } else {
-            "Offline punctuation model not installed"
+            "Offline punctuation and capitalization model not installed"
         }
         .into(),
     );
@@ -3306,7 +3306,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = ready_ui.upgrade_in_event_loop(move |ui| {
                 ui.set_post_model_ready(result.is_ok());
                 match result {
-                    Ok(()) => ui.set_post_model_status("Offline punctuation model ready".into()),
+                    Ok(()) => ui.set_post_model_status(
+                        "Offline punctuation and capitalization model ready".into(),
+                    ),
                     Err(error) => {
                         ui.set_post_model_status(error.into());
                         if ui.get_post_processing_enabled() && ui.get_post_punctuation() {
@@ -3344,7 +3346,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.set_post_model_installing(true);
         ui.set_post_model_ready(false);
         ui.set_post_model_progress(0.0);
-        ui.set_post_model_status("Preparing punctuation model installation…".into());
+        ui.set_post_model_status(
+            "Preparing punctuation and capitalization model installation…".into(),
+        );
         let progress_ui = post_download_ui.clone();
         let completion_ui = post_download_ui.clone();
         thread::spawn(move || {
@@ -3381,7 +3385,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.on_decline_post_processing_model_download(move || {
         if let Some(ui) = post_decline_ui.upgrade() {
             if !ui.get_post_model_ready() {
-                ui.set_post_model_status("Installation postponed. Written rules work; original punctuation will be retained.".into());
+                ui.set_post_model_status("Installation postponed. Written rules work; original punctuation and casing will be retained.".into());
             }
         }
     });
@@ -3723,7 +3727,9 @@ mod tests {
         );
         ui.set_active_tab(3);
         ui.set_settings_tab(3);
-        ui.set_post_model_status("Offline punctuation model ready (isolated UI test)".into());
+        ui.set_post_model_status(
+            "Offline punctuation and capitalization model ready (isolated UI test)".into(),
+        );
         ui.window().set_size(slint::PhysicalSize::new(1000, 1050));
         ui.show().unwrap();
         let weak = ui.as_weak();
