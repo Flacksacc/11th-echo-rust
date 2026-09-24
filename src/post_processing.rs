@@ -175,6 +175,12 @@ fn process_with(
             text.push_str(&mark);
         }
     }
+    // This formatter runs once after Stop. The learned model is deliberately
+    // allowed to omit a final mark while processing text incrementally, but a
+    // completed injection should not end in an unpunctuated sentence.
+    if s.periods && !text.trim_end().ends_with(['.', '?', '!']) {
+        text.push('.');
+    }
     ProcessedText {
         text,
         warning: None,
@@ -624,7 +630,7 @@ mod tests {
                 Ok("hello, how are you?".into())
             })
             .text,
-            "hello how are you"
+            "hello how are you."
         );
         let s = PostProcessingSettings {
             enabled: false,
@@ -645,6 +651,26 @@ mod tests {
         );
         assert_eq!(result.text, "I met Alice yesterday.");
         assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn finalization_adds_one_period_only_when_enabled() {
+        let result = process_with("hello world", &PostProcessingSettings::default(), |_| {
+            Ok("Hello world".into())
+        });
+        assert_eq!(result.text, "Hello world.");
+
+        let disabled = PostProcessingSettings {
+            periods: false,
+            ..Default::default()
+        };
+        let result = process_with("hello world", &disabled, |_| Ok("Hello world".into()));
+        assert_eq!(result.text, "Hello world");
+
+        let result = process_with("are you there", &PostProcessingSettings::default(), |_| {
+            Ok("Are you there?".into())
+        });
+        assert_eq!(result.text, "Are you there?");
     }
     #[test]
     fn checksum_is_full_sha256() {
@@ -699,7 +725,7 @@ mod tests {
             (true, true, true, "Hello, world. How are you?"),
             (false, true, true, "Hello world. How are you?"),
             (true, false, true, "Hello, world how are you?"),
-            (true, true, false, "Hello, world. How are you"),
+            (true, true, false, "Hello, world. How are you."),
         ] {
             let s = PostProcessingSettings {
                 commas,

@@ -1,4 +1,2 @@
-Echo 0.1.6 improves final transcript formatting.
-- Replaced the previous punctuation-only model with a much smaller local CPU model that jointly restores sentence punctuation and word capitalization after you stop dictating.
-- The new model is English-only, runs fully offline, and downloads only after confirmation. Existing protected names, addresses, and numbers remain protected.
-- The live transcript remains raw while you dictate; formatting is applied once to the complete transcript after Stop.
+Echo 0.1.7 ensures completed dictation ends with a period when the punctuation model omits a final mark.
+- The fallback runs only after Stop, only when punctuation rebuilding and Periods are enabled, and never replaces a predicted question mark or exclamation mark.
