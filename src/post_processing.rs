@@ -179,6 +179,11 @@ fn process_with(
     // allowed to omit a final mark while processing text incrementally, but a
     // completed injection should not end in an unpunctuated sentence.
     if s.periods && !text.trim_end().ends_with(['.', '?', '!']) {
+        // A trailing comma cannot end a completed dictated sentence. Replace
+        // it rather than appending a period, which would produce `,.`.
+        if text.ends_with(',') {
+            text.pop();
+        }
         text.push('.');
     }
     ProcessedText {
@@ -671,6 +676,11 @@ mod tests {
             Ok("Are you there?".into())
         });
         assert_eq!(result.text, "Are you there?");
+
+        let result = process_with("do it now", &PostProcessingSettings::default(), |_| {
+            Ok("Do it now,".into())
+        });
+        assert_eq!(result.text, "Do it now.");
     }
     #[test]
     fn checksum_is_full_sha256() {

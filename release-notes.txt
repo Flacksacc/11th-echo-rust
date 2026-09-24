@@ -1,2 +1,3 @@
-Echo 0.1.7 ensures completed dictation ends with a period when the punctuation model omits a final mark.
-- The fallback runs only after Stop, only when punctuation rebuilding and Periods are enabled, and never replaces a predicted question mark or exclamation mark.
+Echo 0.1.8 fixes final punctuation after dictation stops.
+- When the punctuation model leaves a trailing comma, Echo now replaces it with one final period instead of producing a comma followed by a period.
+- Final punctuation still runs only after Stop and respects the Periods setting.
