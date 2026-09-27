@@ -47,6 +47,8 @@ certificate, code-sign both the application executable and installer and set
 
 The installer deliberately never contains the local speech model. When a user selects **Local CPU** in Settings and the model is missing, the app asks permission to download the pinned model files, shows download/extraction/verification progress, and stores them under `%LOCALAPPDATA%\11th_echo\models`. The user can then save the provider setting. The application bundles the native Sherpa ONNX runtime, so users do not need Python or a separate ONNX installation.
 
+Parakeet Ultra is an optional NVIDIA GPU engine. Select Ultra and click Install; Echo downloads pinned, hash-verified dependencies directly from Python.org, PyPI, and PyTorch and installs its own private runtime. No system Python or CUDA Toolkit is needed. Source builds work with plain `cargo run`, with no runtime bundle build or manifest configuration. See [Parakeet Ultra](docs/parakeet-ultra.md) for requirements and verification.
+
 For development with an existing model directory, set `ELEVENTH_ECHO_MODEL_DIR` to the directory containing the Parakeet and Silero model folders. The optional model-backed smoke test can then be run with:
 
 ```powershell

@@ -43,6 +43,8 @@ struct RuntimeManifest {
     size: u64,
     sha256: String,
     files: Vec<RuntimeFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dependency_fingerprint: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,47 +54,12 @@ struct RuntimeFile {
     sha256: String,
 }
 
-fn manifest() -> Result<RuntimeManifest, String> {
-    let embedded = include_str!(concat!(env!("OUT_DIR"), "/ultra-runtime.json"));
-    let local;
-    let input = if uses_local_runtime() {
-        local = std::fs::read_to_string(local_manifest_path()).map_err(|_| {
-            "Build the local Ultra runtime first (see docs/parakeet-ultra.md), then click Install again. No manifest environment variable is required.".to_string()
-        })?;
-        local.as_str()
-    } else {
-        embedded
-    };
-    parse_manifest(input)
-}
-
-fn uses_local_runtime() -> bool {
-    cfg!(debug_assertions)
-        && include_str!(concat!(env!("OUT_DIR"), "/ultra-runtime.json")).trim() == "null"
-}
-
-fn local_manifest_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ultra-runtime/runtime-manifest.json")
-}
-
-fn local_archive_path(runtime: &RuntimeManifest) -> Result<PathBuf, String> {
-    let name = format!("echo-ultra-runtime-{}.zip", &runtime.sha256[..16]);
-    Ok(local_manifest_path()
-        .parent()
-        .ok_or("Missing local runtime directory")?
-        .join(name))
-}
-
 fn installed_manifest() -> Result<RuntimeManifest, String> {
-    if uses_local_runtime() {
-        let text = std::fs::read_to_string(runtime_root().join("echo-runtime-receipt.json"))
-            .map_err(|_| {
-                "Install the local Ultra runtime to create its verification receipt.".to_string()
-            })?;
-        parse_manifest(&text)
-    } else {
-        manifest()
-    }
+    let text = std::fs::read_to_string(runtime_root().join("echo-runtime-receipt.json"))
+        .map_err(|_| "Install Ultra to create its verification receipt.".to_string())?;
+    // Version 0.1.9 also wrote receipts. Preserve those installations without
+    // depending on a source tree or a retired website runtime archive.
+    parse_manifest(&text)
 }
 
 fn parse_manifest(input: &str) -> Result<RuntimeManifest, String> {
@@ -107,14 +74,106 @@ fn parse_manifest(input: &str) -> Result<RuntimeManifest, String> {
         || manifest
             .files
             .iter()
-            .any(|file| safe_relative(&file.path).is_err() || file.sha256.len() != 64)
+            .any(|file| safe_relative(&file.path).is_err() || !valid_hash(&file.sha256))
+        || manifest
+            .dependency_fingerprint
+            .as_deref()
+            .is_some_and(|value| value != dependency_fingerprint())
         || !["python.exe", "helper.py"]
             .iter()
             .all(|required| manifest.files.iter().any(|file| &file.path == required))
     {
-        return Err("Invalid pinned GPU runtime manifest".into());
+        return Err(
+            "GPU runtime verification receipt is invalid or outdated. Install Ultra to repair."
+                .into(),
+        );
     }
     Ok(manifest)
+}
+
+const DEPENDENCIES: &str = include_str!("../../runtime/ultra/dependencies.json");
+
+#[derive(Deserialize)]
+struct UpstreamDependencies {
+    protocol: u32,
+    python: UpstreamArtifact,
+    pip: UpstreamArtifact,
+    packages: Vec<UpstreamArtifact>,
+}
+
+#[derive(Deserialize)]
+struct UpstreamArtifact {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    version: String,
+    filename: String,
+    url: String,
+    size: u64,
+    sha256: String,
+}
+
+fn valid_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn dependency_fingerprint() -> String {
+    format!("{:x}", Sha256::digest(DEPENDENCIES.as_bytes()))
+}
+
+fn dependencies() -> Result<UpstreamDependencies, String> {
+    parse_dependencies(DEPENDENCIES)
+}
+
+fn parse_dependencies(text: &str) -> Result<UpstreamDependencies, String> {
+    let pins: UpstreamDependencies = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let mut names = std::collections::HashSet::new();
+    if pins.protocol != 1 || pins.packages.is_empty() {
+        return Err("Invalid upstream GPU dependency pins".into());
+    }
+    for artifact in std::iter::once(&pins.python)
+        .chain(std::iter::once(&pins.pip))
+        .chain(&pins.packages)
+    {
+        let url = reqwest::Url::parse(&artifact.url).map_err(|e| e.to_string())?;
+        if url.scheme() != "https"
+            || !matches!(
+                url.host_str(),
+                Some("www.python.org" | "files.pythonhosted.org" | "download.pytorch.org")
+            )
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || artifact.size == 0
+            || !valid_hash(&artifact.sha256)
+            || safe_relative(&artifact.filename)?.components().count() != 1
+            || !names.insert(artifact.filename.to_ascii_lowercase())
+        {
+            return Err("Invalid upstream GPU artifact".into());
+        }
+    }
+    if !pins.python.filename.ends_with(".zip")
+        || pins.pip.name != "pip"
+        || pins
+            .packages
+            .iter()
+            .chain(std::iter::once(&pins.pip))
+            .any(|artifact| {
+                !artifact.filename.ends_with(".whl")
+                    || artifact.name.is_empty()
+                    || artifact.version.is_empty()
+                    || !artifact
+                        .name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    || !artifact
+                        .version
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b".+_-".contains(&b))
+            })
+    {
+        return Err("Invalid pinned Python wheel".into());
+    }
+    Ok(pins)
 }
 
 fn root() -> PathBuf {
@@ -125,7 +184,7 @@ fn root() -> PathBuf {
 }
 
 fn runtime_root() -> PathBuf {
-    // Development override; production releases use only their pinned package.
+    // Development override; ordinary installations use the private verified runtime.
     std::env::var_os("ECHO_ULTRA_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| root().join("runtime"))
@@ -146,14 +205,8 @@ pub fn available() -> bool {
 }
 
 pub fn ultra_download_description() -> String {
-    if uses_local_runtime() {
-        return match manifest() {
-            Ok(_) => "Parakeet Ultra: installs the latest locally built GPU runtime and downloads about 1257 MB of verified model files. Requires an NVIDIA Ampere or newer GPU and a compatible driver.".into(),
-            Err(err) => err,
-        };
-    }
-    match manifest() {
-        Ok(runtime) => format!("Parakeet Ultra: {:.0} MB of model files and {:.0} MB of GPU runtime. Echo verifies pinned SHA-256 hashes. Requires an NVIDIA Ampere or newer GPU and a compatible driver.", MODEL_FILES.iter().map(|(_, size, _)| size).sum::<u64>() as f64 / 1_000_000.0, runtime.size as f64 / 1_000_000.0),
+    match dependencies() {
+        Ok(pins) => format!("Parakeet Ultra: {:.0} MB of model files and {:.0} MB of pinned GPU dependencies downloaded directly from Python.org, PyPI, and PyTorch. No Python setup required. Requires an NVIDIA Ampere or newer GPU and a compatible driver. Allow 10 GB of free disk space for installation and repair cache.", MODEL_FILES.iter().map(|(_, size, _)| size).sum::<u64>() as f64 / 1_000_000.0, (pins.python.size + pins.pip.size + pins.packages.iter().map(|p| p.size).sum::<u64>()) as f64 / 1_000_000.0),
         Err(err) => err,
     }
 }
@@ -256,50 +309,6 @@ fn verify_runtime(path: &Path, runtime: &RuntimeManifest) -> Result<(), String> 
     Ok(())
 }
 
-fn extract_runtime(
-    archive: &Path,
-    destination: &Path,
-    runtime: &RuntimeManifest,
-) -> Result<(), String> {
-    let mut zip = zip::ZipArchive::new(std::fs::File::open(archive).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    let mut seen = std::collections::HashSet::new();
-    let declared = runtime
-        .files
-        .iter()
-        .map(|file| (file.path.as_str(), file))
-        .collect::<std::collections::HashMap<_, _>>();
-    if declared.len() != runtime.files.len() {
-        return Err("Duplicate GPU runtime manifest path".into());
-    }
-    for index in 0..zip.len() {
-        let mut entry = zip.by_index(index).map_err(|e| e.to_string())?;
-        let relative = safe_relative(entry.name())?;
-        if entry.is_dir() || entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
-            return Err("Unexpected directory or link in GPU runtime package".into());
-        }
-        let file = declared
-            .get(entry.name())
-            .ok_or("Undeclared GPU runtime file")?;
-        if !seen.insert(file.path.to_ascii_lowercase()) || entry.size() != file.size {
-            return Err("Invalid GPU runtime file entry".into());
-        }
-        let target = destination.join(relative);
-        std::fs::create_dir_all(target.parent().ok_or("Missing GPU runtime directory")?)
-            .map_err(|e| e.to_string())?;
-        let mut output = std::fs::File::create(&target).map_err(|e| e.to_string())?;
-        let copied = std::io::copy(&mut entry.by_ref().take(file.size + 1), &mut output)
-            .map_err(|e| e.to_string())?;
-        if copied != file.size {
-            return Err("GPU runtime extracted size mismatch".into());
-        }
-    }
-    if seen.len() != runtime.files.len() {
-        return Err("GPU runtime package is incomplete".into());
-    }
-    verify_runtime(destination, runtime)
-}
-
 fn activate(staged: &Path, target: &Path) -> Result<(), String> {
     let backup = target.with_extension("old");
     if backup.exists() {
@@ -318,13 +327,278 @@ fn activate(staged: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn extract_python(archive: &Path, target: &Path) -> Result<(), String> {
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(archive).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0u64;
+    std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
+    for index in 0..zip.len() {
+        let mut entry = zip.by_index(index).map_err(|e| e.to_string())?;
+        let path = safe_relative(entry.name())?;
+        total = total
+            .checked_add(entry.size())
+            .ok_or("Python archive size overflow")?;
+        if path.components().count() != 1
+            || entry.is_dir()
+            || entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000)
+            || total > 100 * 1024 * 1024
+            || !seen.insert(entry.name().to_ascii_lowercase())
+        {
+            return Err("Unexpected embedded Python archive entry".into());
+        }
+        let mut output = std::fs::File::create(target.join(path)).map_err(|e| e.to_string())?;
+        let size = entry.size();
+        if std::io::copy(&mut entry.by_ref().take(size + 1), &mut output)
+            .map_err(|e| e.to_string())?
+            != size
+        {
+            return Err("Python archive extracted size mismatch".into());
+        }
+    }
+    if !target.join("python.exe").is_file() || !target.join("python312._pth").is_file() {
+        return Err("Incomplete embedded Python archive".into());
+    }
+    // Keep package loading disabled until pip has completed. The final runtime
+    // enables only its private lib directory, never system/user site-packages.
+    std::fs::write(target.join("python312._pth"), "python312.zip\n.\n").map_err(|e| e.to_string())
+}
+
+fn offline_requirements(pins: &UpstreamDependencies) -> String {
+    pins.packages
+        .iter()
+        .map(|p| format!("{}=={} --hash=sha256:{}\n", p.name, p.version, p.sha256))
+        .collect()
+}
+
+fn install_wheels(
+    runtime: &Path,
+    cache: &Path,
+    work: &Path,
+    pins: &UpstreamDependencies,
+    progress: &dyn Fn(f32, String),
+) -> Result<(), String> {
+    let requirements = work.join("requirements.txt");
+    std::fs::write(&requirements, offline_requirements(pins)).map_err(|e| e.to_string())?;
+    let log_path = work.join("install.log");
+    let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
+    let mut child = hidden_command(&runtime.join("python.exe"))
+        .args(["-I", "-S", "-c", "import sys,runpy; sys.path.insert(0,sys.argv.pop(1)); runpy.run_module('pip',run_name='__main__')"])
+        .arg(cache.join(&pins.pip.filename))
+        .args(["--isolated", "--disable-pip-version-check", "--no-input", "--no-cache-dir", "install", "--no-index", "--no-deps", "--only-binary=:all:", "--require-hashes", "--no-compile", "--find-links"])
+        .arg(cache)
+        .arg("--target").arg(runtime.join("lib"))
+        .arg("--requirement").arg(&requirements)
+        .env_remove("PYTHONPATH").env_remove("PYTHONHOME")
+        .env("PIP_CONFIG_FILE", if cfg!(windows) { "NUL" } else { "/dev/null" })
+        .stdin(Stdio::null()).stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
+        .stderr(Stdio::from(log))
+        .spawn().map_err(|e| format!("Cannot start private GPU dependency installer: {e}"))?;
+    #[cfg(windows)]
+    let _job = match ProcessJob::attach(&child) {
+        Ok(job) => job,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+    };
+    let started = Instant::now();
+    let mut last_report = Instant::now();
+    loop {
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            progress(
+                0.55,
+                format!(
+                    "Installing pinned GPU dependencies ({}s)",
+                    started.elapsed().as_secs()
+                ),
+            );
+            last_report = Instant::now();
+        }
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return Err("Pinned GPU dependencies could not be installed. Retry Install Ultra; completed downloads will be reused.".into()),
+            Ok(None) if started.elapsed() < Duration::from_secs(900) => std::thread::sleep(Duration::from_millis(100)),
+            result => {
+                let _ = child.kill(); let _ = child.wait();
+                return Err(match result { Err(err) => err.to_string(), _ => "GPU dependency installation timed out. Retry Install Ultra.".into() });
+            }
+        }
+    }
+    std::fs::write(
+        runtime.join("python312._pth"),
+        "python312.zip\n.\nlib\nimport site\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        runtime.join("helper.py"),
+        include_str!("../../runtime/ultra/helper.py"),
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(runtime.join("THIRD_PARTY_NOTICES.txt"), "Echo optional Parakeet Ultra GPU runtime\nDependencies downloaded directly from Python.org, PyPI, and PyTorch; their license files are preserved beneath lib/.\nEmbedded Python license: LICENSE.txt\nParakeet Ultra weights: Moondream / M87 Labs, based on NVIDIA Parakeet V3; CC-BY-4.0.\nhttps://huggingface.co/moondream/parakeet-ultra\nhttps://creativecommons.org/licenses/by/4.0/\n").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn record_runtime(
+    runtime: &Path,
+    pins: &UpstreamDependencies,
+    progress: &dyn Fn(f32, String),
+) -> Result<RuntimeManifest, String> {
+    let mut files = Vec::new();
+    let mut directories = vec![runtime.to_path_buf()];
+    let mut buffer = vec![0; 1024 * 1024];
+    let mut last_report = Instant::now();
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let kind = entry.file_type().map_err(|e| e.to_string())?;
+            if kind.is_symlink() {
+                return Err("Link in installed GPU runtime".into());
+            }
+            if kind.is_dir() {
+                if entry.file_name() == "__pycache__" {
+                    continue;
+                }
+                directories.push(entry.path());
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().is_some_and(|extension| extension == "pyc")
+                || path
+                    .file_name()
+                    .is_some_and(|name| name == "echo-runtime-receipt.json")
+            {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(runtime)
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .replace('\\', "/");
+            safe_relative(&relative)?;
+            let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+            let size = file.metadata().map_err(|e| e.to_string())?.len();
+            let mut hash = Sha256::new();
+            loop {
+                let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+                if count == 0 {
+                    break;
+                }
+                hash.update(&buffer[..count]);
+            }
+            files.push(RuntimeFile {
+                path: relative,
+                size,
+                sha256: format!("{:x}", hash.finalize()),
+            });
+            if last_report.elapsed() >= Duration::from_secs(1) {
+                progress(
+                    0.58,
+                    format!("Recording GPU runtime checksums ({} files)", files.len()),
+                );
+                last_report = Instant::now();
+            }
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(RuntimeManifest {
+        protocol: 1,
+        url: pins.python.url.clone(),
+        size: pins.python.size,
+        sha256: pins.python.sha256.clone(),
+        files,
+        dependency_fingerprint: Some(dependency_fingerprint()),
+    })
+}
+
+async fn prepare_runtime(
+    work: &Path,
+    cache: &Path,
+    pins: UpstreamDependencies,
+    progress: Arc<dyn Fn(f32, String) + Send + Sync>,
+) -> Result<(), String> {
+    tokio::fs::create_dir_all(cache)
+        .await
+        .map_err(|e| e.to_string())?;
+    let artifacts = std::iter::once(&pins.python)
+        .chain(std::iter::once(&pins.pip))
+        .chain(&pins.packages);
+    let total =
+        pins.python.size + pins.pip.size + pins.packages.iter().map(|p| p.size).sum::<u64>();
+    let mut completed = 0;
+    for artifact in artifacts {
+        let destination = cache.join(&artifact.filename);
+        (progress)(
+            0.55 * completed as f32 / total as f32,
+            format!("Checking {}", artifact.filename),
+        );
+        let checked = destination.clone();
+        let size = artifact.size;
+        let hash = artifact.sha256.clone();
+        let cached =
+            tokio::task::spawn_blocking(move || verify_file(&checked, size, &hash).is_ok())
+                .await
+                .map_err(|e| e.to_string())?;
+        if !cached {
+            // Use a private partial file so retries/other processes cannot race
+            // on a shared cache download. Only verified artifacts enter cache.
+            let downloaded = work.join(&artifact.filename);
+            download_verified(
+                DownloadSpec {
+                    url: &artifact.url,
+                    destination: &downloaded,
+                    expected_hash: &artifact.sha256,
+                    expected_size: artifact.size,
+                    progress_start: 0.55 * completed as f32 / total as f32,
+                    progress_span: 0.55 * artifact.size as f32 / total as f32,
+                    label: &format!("Downloading {} {}", artifact.name, artifact.version),
+                },
+                progress.clone(),
+            )
+            .await?;
+            if destination.exists() {
+                tokio::fs::remove_file(&destination)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            tokio::fs::rename(downloaded, &destination)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        completed += artifact.size;
+    }
+    (progress)(
+        0.55,
+        "Installing pinned GPU dependencies (no system Python changes)".into(),
+    );
+    let work = work.to_path_buf();
+    let cache = cache.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let staging = work.join("runtime");
+        extract_python(&cache.join(&pins.python.filename), &staging)?;
+        install_wheels(&staging, &cache, &work, &pins, progress.as_ref())?;
+        (progress)(0.58, "Recording GPU runtime verification receipt".into());
+        let receipt = record_runtime(&staging, &pins, progress.as_ref())?;
+        parse_manifest(&serde_json::to_string(&receipt).map_err(|e| e.to_string())?)?;
+        std::fs::write(
+            staging.join("echo-runtime-receipt.json"),
+            serde_json::to_vec(&receipt).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok::<_, String>(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 pub async fn download<F>(progress: F) -> Result<(), String>
 where
     F: Fn(f32, String) + Send + Sync + 'static,
 {
     // Check architecture before fetching gigabytes. CUDA itself is validated by the helper.
     probe_gpu()?;
-    let runtime = manifest()?;
+    let pins = dependencies()?;
     let progress: Arc<dyn Fn(f32, String) + Send + Sync> = Arc::new(progress);
     let base = root();
     tokio::fs::create_dir_all(&base)
@@ -339,49 +613,8 @@ where
         .await
         .map_err(|e| e.to_string())?;
     let result = async {
-        let archive = work.join("runtime.zip");
-        if uses_local_runtime() {
-            (progress)(0.0, "Verifying locally built GPU runtime".into());
-            let local_archive = local_archive_path(&runtime)?;
-            let destination = archive.clone();
-            let size = runtime.size;
-            let checksum = runtime.sha256.clone();
-            tokio::task::spawn_blocking(move || {
-                verify_file(&local_archive, size, &checksum)?;
-                std::fs::copy(&local_archive, destination).map_err(|e| e.to_string())?;
-                Ok::<_, String>(())
-            })
-            .await
-            .map_err(|e| e.to_string())??;
-        } else {
-            download_verified(
-                DownloadSpec {
-                    url: &runtime.url,
-                    destination: &archive,
-                    expected_hash: &runtime.sha256,
-                    expected_size: runtime.size,
-                    progress_start: 0.0,
-                    progress_span: 0.55,
-                    label: "Downloading GPU runtime",
-                },
-                progress.clone(),
-            )
-            .await?;
-        }
-        (progress)(0.55, "Extracting and verifying GPU runtime".into());
-        let staging = work.join("runtime");
-        let runtime = tokio::task::spawn_blocking(move || {
-            extract_runtime(&archive, &staging, &runtime)?;
-            Ok::<_, String>(runtime)
-        })
-        .await
-        .map_err(|e| e.to_string())??;
-        tokio::fs::write(
-            work.join("runtime/echo-runtime-receipt.json"),
-            serde_json::to_vec(&runtime).map_err(|e| e.to_string())?,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let cache = base.join("download-cache").join(dependency_fingerprint());
+        prepare_runtime(&work, &cache, pins, progress.clone()).await?;
         let total = MODEL_FILES.iter().map(|(_, size, _)| size).sum::<u64>();
         let mut completed = 0;
         for (name, size, hash) in MODEL_FILES {
@@ -587,7 +820,7 @@ impl PhotonEngine {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|_| {
-                "Cannot start the bundled GPU runtime. Download and install to repair.".to_string()
+                "Cannot start the private GPU runtime. Download and install to repair.".to_string()
             })?;
         #[cfg(windows)]
         let job = match ProcessJob::attach(&child) {
@@ -962,36 +1195,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a built optional runtime package; set ECHO_ULTRA_TEST_MANIFEST"]
-    fn packaged_runtime_extracts_and_verifies_with_production_rules() {
-        let manifest_path = PathBuf::from(
-            std::env::var_os("ECHO_ULTRA_TEST_MANIFEST").expect("runtime manifest path"),
-        );
-        let runtime: RuntimeManifest =
-            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-        let name = reqwest::Url::parse(&runtime.url)
-            .unwrap()
-            .path_segments()
-            .unwrap()
-            .next_back()
-            .unwrap()
-            .to_string();
-        let archive = manifest_path.parent().unwrap().join(name);
-        verify_file(&archive, runtime.size, &runtime.sha256).unwrap();
-        let work = std::env::temp_dir().join(format!(
-            "echo-ultra-package-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        extract_runtime(&archive, &work, &runtime).unwrap();
-        assert!(work.join("python.exe").is_file());
-        assert!(work.join("helper.py").is_file());
-        std::fs::remove_dir_all(work).unwrap();
-    }
-    #[test]
     fn archive_paths_cannot_escape_or_use_windows_streams() {
         for name in [
             "../python.exe",
@@ -1010,24 +1213,6 @@ mod tests {
     }
 
     #[test]
-    fn local_archive_uses_checksum_name_instead_of_publication_url() {
-        let runtime = RuntimeManifest {
-            protocol: 1,
-            url: "https://updates.example.invalid/ignored.zip".into(),
-            size: 1,
-            sha256: "a".repeat(64),
-            files: vec![],
-        };
-        assert_eq!(
-            local_archive_path(&runtime).unwrap(),
-            local_manifest_path()
-                .parent()
-                .unwrap()
-                .join("echo-ultra-runtime-aaaaaaaaaaaaaaaa.zip")
-        );
-    }
-
-    #[test]
     fn runtime_metadata_rejects_non_hex_archive_checksum() {
         let files = ["python.exe", "helper.py"].map(|path| RuntimeFile {
             path: path.into(),
@@ -1035,6 +1220,7 @@ mod tests {
             sha256: "a".repeat(64),
         });
         let mut runtime = RuntimeManifest {
+            dependency_fingerprint: None,
             protocol: 1,
             url: "https://localhost/runtime.zip".into(),
             size: 1,
@@ -1042,12 +1228,19 @@ mod tests {
             files: files.into(),
         };
         assert!(parse_manifest(&serde_json::to_string(&runtime).unwrap()).is_ok());
+        runtime.dependency_fingerprint = Some("old-dependency-set".into());
+        assert!(parse_manifest(&serde_json::to_string(&runtime).unwrap()).is_err());
+        runtime.dependency_fingerprint = Some(dependency_fingerprint());
+        assert!(parse_manifest(&serde_json::to_string(&runtime).unwrap()).is_ok());
+        runtime.files[0].sha256 = "x".repeat(64);
+        assert!(parse_manifest(&serde_json::to_string(&runtime).unwrap()).is_err());
+        runtime.files[0].sha256 = "a".repeat(64);
         runtime.sha256 = "x".repeat(64);
         assert!(parse_manifest(&serde_json::to_string(&runtime).unwrap()).is_err());
     }
 
     #[test]
-    fn runtime_extraction_verifies_every_declared_file_and_rolls_back_failed_activation() {
+    fn runtime_receipt_verifies_files_and_activation_preserves_previous_runtime_on_failure() {
         let work = std::env::temp_dir().join(format!(
             "echo-ultra-extraction-test-{}-{}",
             std::process::id(),
@@ -1057,7 +1250,6 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&work).unwrap();
-        let archive = work.join("runtime.zip");
         let bytes = b"runtime fixture";
         let file = RuntimeFile {
             path: "helper.py".into(),
@@ -1065,20 +1257,17 @@ mod tests {
             sha256: format!("{:x}", Sha256::digest(bytes)),
         };
         let runtime = RuntimeManifest {
+            dependency_fingerprint: None,
             protocol: 1,
             url: "https://example.invalid/runtime.zip".into(),
             size: 1,
             sha256: "0".repeat(64),
             files: vec![file],
         };
-        let mut packaged = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
-        packaged
-            .start_file("helper.py", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        packaged.write_all(bytes).unwrap();
-        packaged.finish().unwrap();
         let extracted = work.join("extracted");
-        extract_runtime(&archive, &extracted, &runtime).unwrap();
+        std::fs::create_dir(&extracted).unwrap();
+        std::fs::write(extracted.join("helper.py"), bytes).unwrap();
+        verify_runtime(&extracted, &runtime).unwrap();
         std::fs::write(extracted.join("helper.py"), b"corrupt fixture").unwrap();
         assert!(verify_runtime(&extracted, &runtime).is_err());
         let target = work.join("installed");
@@ -1090,5 +1279,163 @@ mod tests {
             b"old runtime"
         );
         std::fs::remove_dir_all(work).unwrap();
+    }
+
+    #[test]
+    fn runtime_receipt_excludes_mutable_python_cache_and_itself() {
+        let work = std::env::temp_dir().join(format!(
+            "echo-receipt-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(work.join("lib/__pycache__")).unwrap();
+        for name in [
+            "python.exe",
+            "helper.py",
+            "lib/library.py",
+            "lib/__pycache__/generated.pyc",
+            "echo-runtime-receipt.json",
+        ] {
+            std::fs::write(work.join(name), b"fixture").unwrap();
+        }
+        let receipt = record_runtime(&work, &dependencies().unwrap(), &|_, _| {}).unwrap();
+        assert_eq!(
+            receipt
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["helper.py", "lib/library.py", "python.exe"]
+        );
+        let parsed = parse_manifest(&serde_json::to_string(&receipt).unwrap()).unwrap();
+        verify_runtime(&work, &parsed).unwrap();
+        std::fs::write(work.join("lib/__pycache__/generated.pyc"), b"new bytecode").unwrap();
+        verify_runtime(&work, &parsed).unwrap();
+        std::fs::write(work.join("lib/library.py"), b"tampered source").unwrap();
+        assert!(verify_runtime(&work, &parsed).is_err());
+        std::fs::remove_dir_all(work).unwrap();
+    }
+
+    #[test]
+    fn upstream_pins_are_complete_and_offline_requirements_have_no_urls_or_unpinned_packages() {
+        let pins = dependencies().unwrap();
+        assert_eq!(pins.packages.len(), 35);
+        let requirements = offline_requirements(&pins);
+        assert_eq!(requirements.lines().count(), pins.packages.len());
+        assert!(!requirements.contains("https://"));
+        for package in &pins.packages {
+            assert!(requirements.contains(&format!(
+                "{}=={} --hash=sha256:{}",
+                package.name, package.version, package.sha256
+            )));
+        }
+        assert!(requirements.contains("torch==2.11.0+cu130"));
+        assert!(requirements.contains("moondream==2.4.1"));
+        assert!(ultra_download_description().contains("directly from"));
+    }
+
+    #[test]
+    fn upstream_pins_reject_unsafe_sources_names_and_missing_hashes() {
+        let original: serde_json::Value = serde_json::from_str(DEPENDENCIES).unwrap();
+        for (field, value) in [
+            ("filename", "../pip.whl"),
+            ("url", "http://files.pythonhosted.org/pip.whl"),
+            ("url", "https://untrusted.example/pip.whl"),
+            ("sha256", "invalid"),
+            ("name", "pip --extra-index-url evil"),
+        ] {
+            let mut changed = original.clone();
+            changed["pip"][field] = value.into();
+            assert!(
+                parse_dependencies(&changed.to_string()).is_err(),
+                "{field}: {value}"
+            );
+        }
+        let mut duplicate = original.clone();
+        duplicate["packages"][0] = duplicate["pip"].clone();
+        assert!(parse_dependencies(&duplicate.to_string()).is_err());
+    }
+
+    #[test]
+    fn python_extraction_rejects_traversal_duplicates_and_missing_interpreter() {
+        let work = std::env::temp_dir().join(format!(
+            "echo-python-extraction-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&work).unwrap();
+        for (index, names) in [
+            vec!["python.exe", "python312._pth"],
+            vec!["../escape"],
+            vec!["lib/nested"],
+            vec!["python.exe", "PYTHON.EXE"],
+            vec!["python.exe"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let archive = work.join(format!("{index}.zip"));
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            for name in names {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(b"fixture").unwrap();
+            }
+            zip.finish().unwrap();
+            let result = extract_python(&archive, &work.join(index.to_string()));
+            assert_eq!(result.is_ok(), index == 0);
+        }
+        assert!(!work.join("escape").exists());
+        std::fs::remove_dir_all(work).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads 2.2 GB of pinned upstream dependencies and installs private Python"]
+    async fn upstream_runtime_installs_and_verifies_without_system_python() {
+        let base = PathBuf::from(
+            std::env::var_os("ECHO_ULTRA_INSTALL_TEST_WORK")
+                .expect("set isolated validation directory"),
+        );
+        let work = base.join(format!(
+            "install-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&work).unwrap();
+        let cache = base.join("cache");
+        let progress: Arc<dyn Fn(f32, String) + Send + Sync> = Arc::new(|_, label| {
+            if !label.contains('%') {
+                eprintln!("{label}");
+            }
+        });
+        prepare_runtime(&work, &cache, dependencies().unwrap(), progress)
+            .await
+            .unwrap_or_else(|error| {
+                let log = std::fs::read_to_string(work.join("install.log")).unwrap_or_default();
+                panic!("{error}\n{log}");
+            });
+        let runtime = work.join("runtime");
+        let receipt = parse_manifest(
+            &std::fs::read_to_string(runtime.join("echo-runtime-receipt.json")).unwrap(),
+        )
+        .unwrap();
+        verify_runtime(&runtime, &receipt).unwrap();
+        let output = hidden_command(&runtime.join("python.exe"))
+            .args(["-I", "-c", "import importlib.metadata as m; import torch,moondream,kestrel; assert m.version('moondream')=='2.4.1'; assert m.version('kestrel')=='0.8.1'; assert torch.__version__=='2.11.0+cu130'; print('Pinned upstream runtime imports successfully')"])
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        eprintln!("Verified upstream runtime: {}", runtime.display());
     }
 }

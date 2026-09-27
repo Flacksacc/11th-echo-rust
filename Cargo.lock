@@ -1574,6 +1574,7 @@ dependencies = [
  "futures-util",
  "global-hotkey",
  "http",
+ "image",
  "log",
  "minisign-verify",
  "num_cpus",

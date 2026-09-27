@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 # UI Framework
 slint = "1.8"
+image = { version = "0.25", default-features = false, features = ["png", "webp"] }
 arboard = "3.3"
 
 # User configuration directories
@@ -76,3 +77,9 @@ winresource = "0.1"
 # source builds while retaining debug information for application code.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Selection/scrolling traverse the renderer's font, Unicode, geometry, and raster
+# dependencies too. Optimize dependencies for cargo run, keeping Echo itself
+# unoptimized with normal debug information. The explicit SHA-256 override wins.
+[profile.dev.package."*"]
+opt-level = 2

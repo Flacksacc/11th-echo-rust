@@ -6,40 +6,38 @@ Choose Ultra, install its optional files, and save settings to activate it. The 
 
 No user-installed Python, ONNX Runtime, CUDA Toolkit, or developer tools are required. A compatible NVIDIA driver is required. GPU failures report an error and do not silently switch models or inject unfinished text. Switching away releases the helper; Windows job ownership also terminates it if Echo exits unexpectedly.
 
-## Build and release
+## Installation and releases
 
-For source development, run `cargo run` with no manifest environment variable. Debug builds discover the latest successful package at `target/ultra-runtime/runtime-manifest.json` when you click Install. They verify and extract its local archive, ignoring its publication URL, and download the model weights normally. An installed verification receipt keeps that runtime usable even after rebuilding or removing the source package. Rebuild the local package and click Install again to use a newer runtime. Release builds retain their embedded package configuration.
+Both `cargo run` and packaged Echo install Ultra the same way: choose Ultra and click Install. No local runtime build, manifest environment variable, user-installed Python, pip, CUDA Toolkit, or developer tools are needed. Echo downloads embedded Python 3.12.10, pip 26.0.1, and the exact Windows wheels in `runtime/ultra/dependencies.json` directly from Python.org, PyPI, and PyTorch. The tested set includes Moondream 2.4.1, Kestrel 0.8.1, and PyTorch 2.11.0+cu130. Every input has a pinned URL, size, and SHA-256. Echo never resolves the newest dependencies during user installation.
 
-If the local runtime has not been built yet, use Python 3.12 and `uv` to run `python runtime/ultra/build_runtime.py --url-base https://localhost/`. The URL is unused by the source installation path; no hosting or manifest configuration is needed.
+The private Python interpreter runs the verified pip wheel with no indexes, no dependency resolution, binary wheels only, and hash-checked offline requirements. Installation does not alter system Python, PATH, or user site-packages. Package licenses and notices remain in the installed wheels. Direct upstream downloads avoid Echo publishing a repackaged runtime; they do not override upstream use/license terms. Model weights retain NVIDIA and Moondream attribution and CC-BY-4.0 notices.
 
-The publisher must have an M87 Labs agreement permitting redistribution of Photon/Kestrel and kernel packages. That permission was confirmed for this project. Runtime notices preserve supplied package licenses; Ultra's model is CC-BY-4.0 with NVIDIA and Moondream attribution.
+Downloads and the installed runtime live beneath `%LOCALAPPDATA%/11th_echo/ultra`. Completed verified dependencies are cached in `download-cache/<dependency-fingerprint>` so interrupted installs and repairs can reuse them. Partial files and failed staging directories are discarded; the active runtime is replaced only after all dependencies and model files are verified. Allow approximately 10 GB free space for staging, the runtime, model, and retained repair cache. Downloads enforce HTTPS redirects and expected sizes/hashes. Embedded Python extraction rejects traversal, duplicate Windows paths, links, and excessive expanded sizes. A file receipt is checked before runtime loading.
 
-Build-machine prerequisites: Python 3.12, `uv`, normal Rust/Windows build tools, and Inno Setup. The optional runtime uses embedded Python 3.12.10, Moondream 2.4.1, Kestrel 0.8.1, and CUDA-enabled PyTorch 2.11.0. All Python dependencies are locked with hashes; the CUDA wheel uses a pinned Windows URL. GPU assets are not added to the main installer.
+Existing 0.1.9 runtime receipts remain supported without a reinstall. Retain already-published 0.1.9 runtime archives on the website for older Echo clients. New installer builds neither create nor upload a runtime ZIP. `installer/build-installer.ps1` needs normal Rust/Windows tools, Inno Setup, and the existing update-signing setup, not Python or uv. The publisher retains legacy archive validation support for old upload bundles.
 
-`installer/build-installer.ps1` builds the optional runtime by default using the configured HTTPS update-feed directory, embeds its manifest into Echo, and adds the immutable runtime archive to the upload bundle. `build-and-publish.ps1` validates and stages that archive before advancing the update manifest. Set `ultra_enabled` to false in release configuration to intentionally make a CPU-only release. To reuse an already-built package, set `ECHO_ULTRA_RUNTIME_MANIFEST` to its manifest before building.
+For dependency maintenance only, review/update `requirements.in`, regenerate `requirements.lock`, and use Python 3.12 plus `packaging` to run `python runtime/ultra/refresh_dependencies.py`. This prints a proposed dependency inventory using locked hashes and Windows-compatible wheels; review it before updating `dependencies.json`. These are repository-owned pins, not a manifest developers must configure to run Echo.
 
-For a standalone package build:
-
-```powershell
-python runtime/ultra/build_runtime.py --url-base https://your-update-host/stable
-$env:ECHO_ULTRA_RUNTIME_MANIFEST = (Resolve-Path target/ultra-runtime/runtime-manifest.json).Path
-cargo build --release
-```
-
-The builder prints the archive, manifest, and extracted runtime directory. Publish the archive at the URL embedded in that manifest. A build without a runtime manifest explains that Ultra is unavailable instead of downloading unpinned executable code. Published runtime archives have content-derived immutable names; retain old archives for existing Echo installations.
-
-Runtime and weights install separately from CPU models beneath `%LOCALAPPDATA%/11th_echo/ultra`. Downloads enforce HTTPS redirects, pinned sizes and SHA-256, bounded extraction, no links or traversal, and staged replacement with rollback. Model revision: `73175eb7aeb0d82f1e2a6b53b3aabc10a90bcd0b`. The runtime verifies files again before loading. Inference blocks outbound sockets and DNS, including dependency telemetry; internal Windows asyncio wakeup socket pairs remain permitted. Audio travels through bounded private process pipes and is not written to disk.
+Model revision: `73175eb7aeb0d82f1e2a6b53b3aabc10a90bcd0b`. Inference blocks outbound sockets and DNS, including dependency telemetry; internal Windows asyncio wakeup socket pairs remain permitted. Audio travels through bounded private process pipes and is not written to disk.
 
 ## Verification
 
 ```powershell
 python runtime/ultra/test_helper.py
-cargo test transcription::local_photon -- --ignored --skip gpu_runtime --test-threads=1
+python runtime/ultra/test_dependencies.py
+cargo test transcription::local_photon -- --ignored --skip gpu_runtime --skip upstream_runtime --test-threads=1
 ```
 
 The subprocess fixture tests require build-machine Python (`ECHO_TEST_PYTHON` can select it). They cover tail draining, exactly one final commit, repeat sessions, crashes, malformed/stale responses, and cancellation. Default Rust tests cover model migration, protocol limits, archive validation, checksums, and install rollback.
 
-For real GPU testing, point `ECHO_ULTRA_RUNTIME_DIR` at the extracted standalone runtime (containing `python.exe` and `helper.py`) and `ECHO_ULTRA_MODEL_DIR` at the pinned weights. These are development overrides; the runtime override bypasses runtime-package verification, while model verification remains enforced.
+For isolated upstream-install validation, set `ECHO_ULTRA_INSTALL_TEST_WORK` to a dedicated test directory and run the ignored integration test. It downloads the actual pinned wheels, installs private Python, verifies the receipt, and checks imports and versions without altering the active installation:
+
+```powershell
+$env:ECHO_ULTRA_INSTALL_TEST_WORK = "$PWD/target/ultra-upstream-validation"
+cargo test upstream_runtime_installs_and_verifies -- --ignored --nocapture
+```
+
+For real GPU testing, point `ECHO_ULTRA_RUNTIME_DIR` at that test's reported private runtime (containing `python.exe` and `helper.py`) and `ECHO_ULTRA_MODEL_DIR` at the pinned weights. These are development overrides; the runtime override bypasses receipt verification, while model verification remains enforced. The install test verifies the receipt separately.
 
 ```powershell
 cargo test gpu_runtime_transcribes_fixture -- --ignored --test-threads=1

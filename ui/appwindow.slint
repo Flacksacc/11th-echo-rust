@@ -1,9 +1,63 @@
-import { Button, VerticalBox, HorizontalBox, LineEdit, TextEdit, ComboBox, CheckBox, ScrollView, Slider } from "std-widgets.slint";
+import { VerticalBox, HorizontalBox, LineEdit, TextEdit, ComboBox, CheckBox, ScrollView, Slider } from "std-widgets.slint";
+component SelectableDocument inherits TextInput {
+    font-family: "Arial";
+    in-out property <int> selected-bytes;
+    cursor-position-changed(position) => { root.selected-bytes = Math.abs(self.cursor-position-byte-offset - self.anchor-position-byte-offset); }
+    read-only: true;
+    single-line: false;
+    wrap: word-wrap;
+}
+component ActionButton inherits Rectangle {
+    in property <string> text;
+    in property <image> icon;
+    in property <bool> primary: false;
+    in property <bool> enabled: true;
+    in property <color> accent: #4ade80;
+    callback clicked();
+    height: 32px;
+    min-width: caption.preferred-width + (root.icon.width > 0 ? 48px : 28px);
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: focus.has-focus ? root.accent : #ffffff20;
+    background: !root.enabled ? #ffffff05 : root.primary ? root.accent : area.has-hover ? #ffffff15 : #ffffff08;
+    opacity: root.enabled ? 1 : 0.45;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+    forward-focus: focus;
+    Image { x: 12px; y: 8px; width: root.icon.width > 0 ? 16px : 0px; height: 16px; source: root.icon; colorize: root.primary ? #07140e : #edf5f0; }
+    caption := Text { x: root.icon.width > 0 ? 36px : 12px; width: parent.width - self.x - 12px; height: parent.height; text: root.text; color: root.primary ? #07140e : #edf5f0; font-size: 12px; font-weight: 600; vertical-alignment: center; horizontal-alignment: center; overflow: elide; }
+    focus := FocusScope { enabled: root.enabled; key-pressed(event) => { if event.text == " " || event.text == "\n" { root.clicked(); return accept; } return reject; } }
+    area := TouchArea { enabled: root.enabled; clicked => { focus.focus(); root.clicked(); } }
+}
+component VersionLink inherits Rectangle {
+    in property <string> text;
+    in property <color> accent;
+    callback clicked();
+    height: 24px;
+    min-width: caption.preferred-width + 8px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    background: transparent;
+    border-radius: 3px;
+    border-width: focus.has-focus ? 1px : 0px;
+    border-color: root.accent;
+    accessible-role: button;
+    accessible-label: "Echo " + root.text + ". Open updates";
+    accessible-action-default => { root.clicked(); }
+    forward-focus: focus;
+    caption := Text { x: 4px; height: parent.height; text: root.text; font-size: 11px; color: area.has-hover || focus.has-focus ? root.accent : #a7b8ad; vertical-alignment: center; }
+    focus := FocusScope { key-pressed(event) => { if event.text == " " || event.text == "\n" { root.clicked(); return accept; } return reject; } }
+    area := TouchArea { mouse-cursor: pointer; clicked => { focus.focus(); root.clicked(); } }
+}
 component HelpIcon inherits Rectangle {
     in property <string> help;
     width: 22px; height: 22px;
     border-radius: 11px; background: #193e2b;
     accessible-role: button; accessible-label: root.help;
+    forward-focus: focus;
     Text { text: "?"; color: #bce4cc; horizontal-alignment: center; vertical-alignment: center; }
     focus := FocusScope {
         changed has-focus => { if self.has-focus { tip.show(); } else if !area.has-hover { tip.close(); } }
@@ -31,6 +85,8 @@ component RuleToggle inherits HorizontalBox {
     in-out property <bool> checked;
     callback toggled();
     spacing: 8px;
+    padding: 0px;
+    height: 28px;
     CheckBox { text: root.label; checked <=> root.checked; enabled: root.active; toggled => { root.toggled(); } }
     HelpIcon { help: root.help; }
 }
@@ -38,98 +94,47 @@ component RuleToggle inherits HorizontalBox {
 component SettingsNavItem inherits Rectangle {
     in property <image> icon;
     in property <string> label;
-    in property <string> first-line;
-    in property <string> second-line: "";
     in property <bool> selected: false;
     in property <color> accent: #4ade80;
     callback activated();
-
-    width: 112px;
-    height: 44px;
-    border-radius: 8px;
-    border-width: settings-nav-focus.has-focus ? 1px : 0px;
+    callback hint-changed(string, length);
+    height: 36px;
+    width: 36px;
+    vertical-stretch: 0;
+    border-radius: 6px;
+    border-width: nav-focus.has-focus ? 1px : 0px;
     border-color: root.accent;
-    background: root.selected ? #173b2a : settings-nav-touch.has-hover ? #10271d : transparent;
+    background: root.selected ? root.accent.with-alpha(0.12) : nav-touch.has-hover ? #ffffff0b : transparent;
     accessible-role: tab;
     accessible-label: root.label;
     accessible-action-default => { root.activated(); }
+    forward-focus: nav-focus;
+    Rectangle { x: 0px; y: 10px; width: 3px; height: 16px; border-radius: 2px; background: root.selected ? root.accent : transparent; }
+    Image { x: 9px; y: 9px; width: 18px; height: 18px; source: root.icon; colorize: root.selected ? root.accent : #a7b8ad; image-fit: contain; }
+    nav-focus := FocusScope { changed has-focus => { if self.has-focus { root.hint-changed(root.label, self.absolute-position.y); } else if !nav-touch.has-hover { root.hint-changed("", 0px); } } key-pressed(event) => { if event.text == " " || event.text == "\n" { root.activated(); return accept; } return reject; } }
+    nav-touch := TouchArea { clicked => { nav-focus.focus(); root.hint-changed("", 0px); root.activated(); } changed has-hover => { if self.has-hover { root.hint-changed(root.label, self.absolute-position.y); } else { root.hint-changed("", 0px); } } }
 
-    Rectangle {
-        x: 6px;
-        y: parent.height - 3px;
-        width: parent.width - 12px;
-        height: 3px;
-        border-radius: 2px;
-        background: root.selected ? root.accent : transparent;
-    }
-
-    Image {
-        x: 8px;
-        y: (parent.height - self.height) / 2;
-        width: 24px;
-        height: 24px;
-        source: root.icon;
-        colorize: root.selected ? root.accent : #91aa9b;
-        image-fit: contain;
-    }
-
-    Text {
-        x: 40px;
-        y: root.second-line == "" ? 0px : 4px;
-        width: parent.width - 46px;
-        height: root.second-line == "" ? parent.height : 18px;
-        text: root.first-line;
-        color: root.selected ? #f0fff4 : #d5e8dc;
-        font-size: 14px;
-        font-weight: root.selected ? 700 : 600;
-        vertical-alignment: center;
-        overflow: elide;
-    }
-    if root.second-line != "" : Text {
-        x: 40px;
-        y: 22px;
-        width: parent.width - 46px;
-        height: 18px;
-        text: root.second-line;
-        color: root.selected ? #f0fff4 : #d5e8dc;
-        font-size: 14px;
-        font-weight: root.selected ? 700 : 600;
-        vertical-alignment: center;
-        overflow: elide;
-    }
-
-    settings-nav-focus := FocusScope {
-        width: 0px;
-        height: 0px;
-        key-pressed(event) => {
-            if event.text == " " || event.text == "\n" {
-                root.activated();
-                return accept;
-            }
-            return reject;
-        }
-    }
-    settings-nav-touch := TouchArea {
-        clicked => { settings-nav-focus.focus(); root.activated(); }
-    }
 }
 
 component PageTitle inherits VerticalBox {
     in property <string> title;
     in property <string> subtitle;
     spacing: 2px;
-    height: 58px;
+    height: root.subtitle == "" ? 32px : 48px;
+    padding: 0px;
+    alignment: start;
 
     Text {
         text: root.title;
+        font-family: "Arial";
         color: #effff3;
-        font-size: 25px;
+        font-size: 23px;
         font-weight: 700;
     }
-    Text {
+    if root.subtitle != "" : Text {
         text: root.subtitle;
         color: #86a493;
-        font-size: 12px;
+        font-size: 15px;
     }
 }
 
@@ -137,18 +142,20 @@ component SectionTitle inherits VerticalBox {
     in property <string> title;
     in property <string> subtitle;
     spacing: 2px;
-    height: root.subtitle == "" ? 30px : 48px;
+    padding: 0px;
+    alignment: start;
+    vertical-stretch: 0;
 
     Text {
         text: root.title;
         color: #e8f9ed;
-        font-size: 17px;
+        font-size: 16px;
         font-weight: 700;
     }
     if root.subtitle != "" : Text {
         text: root.subtitle;
         color: #7f9d8c;
-        font-size: 11px;
+        font-size: 12px;
         wrap: word-wrap;
     }
 }
@@ -162,7 +169,7 @@ component LabeledSlider inherits Rectangle {
     in property <float> step: 0;
     in property <float> display-divisor: 1;
 
-    height: 68px;
+    height: 64px;
     background: transparent;
 
     Text {
@@ -179,7 +186,7 @@ component LabeledSlider inherits Rectangle {
         width: parent.width;
         text: root.hint;
         color: #708b7b;
-        font-size: 10px;
+        font-size: 12px;
         overflow: elide;
     }
     Slider {
@@ -208,22 +215,35 @@ component ColorChoice inherits Rectangle {
     height: 34px;
     border-radius: 8px;
     border-width: root.selected ? 3px : 1px;
-    border-color: root.selected ? #ffffff : #52645a;
+    border-color: palette-focus.has-focus || root.selected ? #ffffff : #52645a;
     background: root.choice-color;
-    TouchArea { clicked => { root.chosen(); } }
+    forward-focus: palette-focus;
+    palette-focus := FocusScope { key-pressed(event) => { if event.text == " " || event.text == "\n" { root.chosen(); return accept; } return reject; } }
+    TouchArea { clicked => { palette-focus.focus(); root.chosen(); } }
 }
 
 export component AppWindow inherits Window {
     title: "Echo";
-    icon: @image-url("../eleventhecho.png");
+    in property <image> application-icon: @image-url("../eleventhecho.png");
+    icon: root.application-icon;
     min-width: 760px;
     min-height: 600px;
-    max-width: 1920px;
-    max-height: 1080px;
+    preferred-width: 960px;
+    preferred-height: 720px;
+    default-font-family: "Arial";
+    default-font-size: 13px;
     background: @linear-gradient(0deg, root.theme-background-top-color, root.theme-background-bottom-color);
 
     in-out property <int> active-tab: 0;
     in-out property <int> settings-tab: 0;
+    out property <string> navigation-hint;
+    property <length> navigation-hint-y;
+    in-out property <length> content-scroll-y <=> page-scroll.viewport-y;
+    changed active-tab => {
+        page-scroll.viewport-y = 0px;
+        if root.active-tab != 2 { root.selected-activity-bytes = 0; }
+    }
+    changed settings-tab => { page-scroll.viewport-y = 0px; }
     in-out property <bool> settings-dirty: false;
     in-out property <bool> unsaved-settings-prompt-visible: false;
     in-out property <int> pending-navigation-tab: 0;
@@ -236,12 +256,11 @@ export component AppWindow inherits Window {
     in-out property <bool> has-error: false;
 
     in-out property <string> transcript;
-    in-out property <[string]> transcript-history;
+    in-out property <string> transcript-history-text;
     in-out property <string> activity-log-text;
-    in-out property <int> context-menu-index: -1;
-    in-out property <bool> context-menu-visible: false;
-    in-out property <length> context-menu-x: 0;
-    in-out property <length> context-menu-y: 0;
+    in-out property <bool> model-loading-notice-visible: false;
+    in-out property <int> selected-activity-bytes;
+    out property <int> selected-transcript-bytes;
 
     in-out property <string> api-key-text;
     in-out property <string> elevenlabs-model-text;
@@ -330,12 +349,8 @@ export component AppWindow inherits Window {
     in-out property <bool> post-model-installing: false;
     in-out property <float> post-model-progress: 0;
 
-    callback start-recording();
-    callback stop-recording();
     callback apply-settings();
     callback start-hotkey-capture();
-    callback clear-transcript();
-    callback copy-transcript(int);
     callback accept-local-model-download();
     callback decline-local-model-download();
     callback request-navigation(int);
@@ -347,590 +362,298 @@ export component AppWindow inherits Window {
     callback download-post-processing-model();
     callback decline-post-processing-model-download();
 
-    VerticalBox {
-        spacing: 0px;
-
+    // Fixed navigation chrome; only the content pane scrolls.
+    HorizontalBox {
+        padding: 0px; spacing: 0px;
         Rectangle {
-            height: 68px;
-            background: #07140e;
-            border-width: 0px;
-
+            width: 44px;
+            background: root.theme-background-bottom-color;
+            Rectangle { x: parent.width - 1px; width: 1px; height: parent.height; background: #ffffff12; }
+            VerticalBox {
+                y: 0px; padding: 4px; spacing: 3px; alignment: start;
+                SettingsNavItem { icon: @image-url("../assets/icons/home.svg"); label: "Transcripts"; selected: root.active-tab == 0; accent: root.theme-button-accent-color; activated => { root.request-navigation(0); } hint-changed(label, y) => { root.navigation-hint = label; root.navigation-hint-y = y; } }
+                SettingsNavItem { icon: @image-url("../assets/icons/activity.svg"); label: "Activity"; selected: root.active-tab == 2; accent: root.theme-button-accent-color; activated => { root.request-navigation(2); } hint-changed(label, y) => { root.navigation-hint = label; root.navigation-hint-y = y; } }
+                SettingsNavItem { icon: @image-url("../assets/icons/settings.svg"); label: "Settings"; selected: root.active-tab == 3; accent: root.theme-button-accent-color; activated => { root.request-navigation(3); } hint-changed(label, y) => { root.navigation-hint = label; root.navigation-hint-y = y; } }
+                if root.active-tab == 3 : VerticalBox {
+                    padding: 0px; padding-top: 8px; spacing: 3px; alignment: start;
+                    Rectangle { height: 1px; background: #ffffff18; }
+                    SettingsNavItem { icon: @image-url("../assets/icons/general.svg"); label: "General"; selected: root.settings-tab == 0; accent: root.theme-button-accent-color; activated => { root.settings-tab = 0; } hint-changed(label, y) => { root.navigation-hint = label; root.navigation-hint-y = y; } }
+                    SettingsNavItem { icon: @image-url("../assets/icons/speech.svg"); label: "Speech engine"; selected: root.settings-tab == 1; accent: root.theme-button-accent-color; activated => { root.settings-tab = 1; } hint-changed(label, y) => { root.navigation-hint = label; root.navigation-hint-y = y; } }
+                    SettingsNavItem { icon: @image-url("../assets/icons/rewrite.svg"); label: "Text rewriting"; selected: root.settings-tab == 2; accent: root.theme-button-accent-color; activated => { root.settings-tab = 2; } hint-changed(label, y) => { root.navigation-hint = label; root.navigation-hint-y = y; } }
+                    SettingsNavItem { icon: @image-url("../assets/icons/post-processing.svg"); label: "Post processing"; selected: root.settings-tab == 3; accent: root.theme-button-accent-color; activated => { root.settings-tab = 3; } hint-changed(label, y) => { root.navigation-hint = label; root.navigation-hint-y = y; } }
+                    SettingsNavItem { icon: @image-url("../assets/icons/appearance.svg"); label: "Appearance"; selected: root.settings-tab == 4; accent: root.theme-button-accent-color; activated => { root.settings-tab = 4; } hint-changed(label, y) => { root.navigation-hint = label; root.navigation-hint-y = y; } }
+                }
+            }
+        }
+        VerticalBox {
+            padding: 0px; spacing: 0px; horizontal-stretch: 1; vertical-stretch: 1;
             HorizontalBox {
-                padding-left: 12px;
-                padding-right: 12px;
-                padding-top: 12px;
-                padding-bottom: 12px;
-                spacing: 6px;
-
-                Rectangle {
-                    width: 100px;
-                    background: transparent;
-                    Text {
-                        x: 0;
-                        y: 7px;
-                        text: "ECHO";
-                        color: root.theme-title-color;
-                        font-size: 22px;
-                        font-weight: 800;
-                        letter-spacing: 2px;
-                    }
-                }
-
-                SettingsNavItem {
-                    icon: @image-url("../assets/icons/home.svg");
-                    label: "Home";
-                    first-line: "Home";
-                    selected: root.active-tab == 0;
-                    accent: root.theme-button-accent-color;
-                    activated => { root.request-navigation(0); }
-                }
-                SettingsNavItem {
-                    icon: @image-url("../assets/icons/activity.svg");
-                    label: "Activity";
-                    first-line: "Activity";
-                    selected: root.active-tab == 2;
-                    accent: root.theme-button-accent-color;
-                    activated => { root.request-navigation(2); }
-                }
-                SettingsNavItem {
-                    icon: @image-url("../assets/icons/settings.svg");
-                    label: "Settings";
-                    first-line: "Settings";
-                    selected: root.active-tab == 3;
-                    accent: root.theme-button-accent-color;
-                    activated => { root.request-navigation(3); }
-                }
-
-                Rectangle { horizontal-stretch: 1; background: transparent; }
-
-                Rectangle {
-                    width: root.update-available-version == "" ? 88px : 154px;
-                    border-radius: 8px;
-                    background: root.update-available-version == "" ? #10271c : #174e32;
-                    border-width: 1px;
-                    border-color: root.update-available-version == "" ? #294938 : root.theme-button-accent-color;
-                    accessible-role: button;
-                    accessible-label: root.update-available-version == "" ? "Echo version " + root.app-version : "Update " + root.update-available-version + " available";
-                    TouchArea {
-                        clicked => { root.update-panel-visible = true; }
-                        Text {
-                            width: parent.width;
-                            height: parent.height;
-                            text: root.update-available-version == "" ? "v" + root.app-version : "Update " + root.update-available-version;
-                            color: root.update-available-version == "" ? #91aa9b : #d8ffe5;
-                            font-size: 11px;
-                            font-weight: 700;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-                    }
-                }
+                height: root.active-tab == 3 ? 52px : 36px; padding: 4px; spacing: 6px;
+                            PageTitle { horizontal-stretch: 1;
+                title: root.active-tab == 0 ? "Transcripts" : root.active-tab == 2 ? "Activity" : "Settings";
+                subtitle: root.active-tab != 3 ? "" : root.settings-tab == 1 ? "Speech engine" : root.settings-tab == 2 ? "Text rewriting" : root.settings-tab == 3 ? "Post processing" : root.settings-tab == 4 ? "Appearance" : "General";
             }
-        }
-
-        Rectangle {
-            background: @linear-gradient(0deg, root.theme-background-top-color, root.theme-background-bottom-color);
-            horizontal-stretch: 1;
-            vertical-stretch: 1;
-
-            if root.active-tab == 0 : VerticalBox {
-                padding: 28px;
-                spacing: 16px;
-
-                Rectangle {
-                    height: 124px;
-                    border-radius: 14px;
-                    background: root.theme-window-color;
-                    border-width: 1px;
-                    border-color: #1e4934;
-
-                    mic-toggle := Rectangle {
-                        x: (parent.width - 58px) / 2;
-                        y: 10px;
-                        width: 58px;
-                        height: 58px;
-                        border-radius: 29px;
-                        background: root.is-recording ? #194d32 : root.is-finalizing ? #2b2814 : mic-touch.has-hover ? #173528 : #10271c;
-                        border-width: mic-focus.has-focus ? 3px : 2px;
-                        border-color: root.is-recording ? root.theme-button-accent-color : mic-focus.has-focus ? root.theme-button-accent-color : #31523f;
-
-                        accessible-role: button;
-                        accessible-label: root.is-finalizing ? "Finalizing transcription" : root.is-recording ? "Stop transcription" : "Start transcription";
-                        accessible-action-default => {
-                            if !root.is-finalizing {
-                                if root.is-recording { root.stop-recording(); } else { root.start-recording(); }
-                            }
-                        }
-
-                        Rectangle {
-                            x: 21px;
-                            y: 12px;
-                            width: 16px;
-                            height: 24px;
-                            border-radius: 8px;
-                            background: root.is-recording ? root.theme-button-accent-color : #91aa9b;
-                        }
-
-                        Rectangle {
-                            x: 18px;
-                            y: 29px;
-                            width: 22px;
-                            height: 11px;
-                            border-width: 2px;
-                            border-color: root.is-recording ? root.theme-button-accent-color : #91aa9b;
-                            border-radius: 8px;
-                            background: transparent;
-                        }
-                        Rectangle {
-                            x: 28px;
-                            y: 39px;
-                            width: 2px;
-                            height: 7px;
-                            background: root.is-recording ? root.theme-button-accent-color : #91aa9b;
-                        }
-                        Rectangle {
-                            x: 23px;
-                            y: 45px;
-                            width: 12px;
-                            height: 2px;
-                            border-radius: 1px;
-                            background: root.is-recording ? root.theme-button-accent-color : #91aa9b;
-                        }
-
-                        mic-focus := FocusScope {
-                            width: 0px;
-                            height: 0px;
-                            key-pressed(event) => {
-                                if event.text == " " || event.text == "\n" {
-                                    if !root.is-finalizing {
-                                        if root.is-recording { root.stop-recording(); } else { root.start-recording(); }
-                                    }
-                                    return accept;
-                                }
-                                return reject;
-                            }
-                        }
-
-                        mic-touch := TouchArea {
-                            enabled: !root.is-finalizing;
-                            clicked => {
-                                mic-focus.focus();
-                                if root.is-recording { root.stop-recording(); } else { root.start-recording(); }
-                            }
-                        }
-                    }
-
-                    Text {
-                        y: 72px;
-                        width: parent.width;
-                        text: "Hotkey  " + root.hotkey-text;
-                        horizontal-alignment: center;
-                        color: #91aa9b;
-                        font-size: 12px;
-                        font-weight: 600;
-                        overflow: elide;
-                    }
-
-                    Text {
-                        y: 90px;
-                        width: parent.width;
-                        text: root.status-text;
-                        horizontal-alignment: center;
-                        color: root.has-error ? #fb7185 : root.is-recording ? root.theme-button-accent-color : #88a595;
-                        font-size: 11px;
-                        font-weight: root.is-recording ? 700 : 500;
-                        overflow: elide;
-                    }
-
-                    Rectangle {
-                        x: 24px;
-                        y: 112px;
-                        width: parent.width - 48px;
-                        height: 5px;
-                        border-radius: 3px;
-                        background: #183025;
-                        Rectangle {
-                            width: parent.width * Math.max(0, Math.min(1, root.audio-level));
-                            height: parent.height;
-                            border-radius: 3px;
-                            background: root.theme-button-accent-color;
-                            animate width { duration: 60ms; }
-                        }
-                    }
-                }
-
-                Rectangle {
-                    vertical-stretch: 1;
-                    min-height: 180px;
-                    border-radius: 14px;
-                    background: root.theme-window-color;
-                    border-width: 1px;
-                    border-color: #193b2b;
-
-                    Text { x: 20px; y: 17px; text: "Transcripts"; color: root.theme-title-color; font-size: 15px; font-weight: 700; }
-                    Text {
-                        x: 20px; y: 38px;
-                        text: "Your 500 most recent transcripts";
-                        color: #607b6b;
-                        font-size: 10px;
-                    }
-                    Button {
-                        x: parent.width - 116px;
-                        y: 14px;
-                        width: 96px;
-                        height: 34px;
-                        text: "Clear history";
-                        clicked => { root.clear-transcript(); }
-                    }
-
-                    if root.transcript-history.length == 0 : Text {
-                        y: 58px;
-                        width: parent.width;
-                        height: parent.height - 58px;
-                        text: "No transcripts yet";
-                        color: #668070;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                    ScrollView {
-                        x: 12px; y: 62px; width: parent.width - 24px; height: parent.height - 74px;
-                        VerticalBox {
-                            spacing: 7px;
-                            for line[i] in root.transcript-history : Rectangle {
-                                height: home-transcript-line.preferred-height + 24px;
-                                vertical-stretch: 0;
-                                border-radius: 8px;
-                                background: Math.mod(i, 2) == 0 ? #0b2116 : #0d261a;
-                                border-width: 1px;
-                                border-color: #173829;
-                                TouchArea {
-                                    pointer-event(event) => {
-                                        if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
-                                            root.context-menu-index = i;
-                                            root.context-menu-x = self.mouse-x + self.absolute-position.x;
-                                            root.context-menu-y = self.mouse-y + self.absolute-position.y;
-                                            root.context-menu-visible = true;
-                                        }
-                                    }
-                                    home-transcript-line := Text {
-                                        x: 12px; y: 10px; width: parent.width - 24px;
-                                        text: line; wrap: word-wrap; color: root.theme-text-color; font-size: 12px;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                VersionLink { text: "v" + root.app-version + (root.update-available-version == "" ? "" : " · Update"); accent: root.theme-button-accent-color; clicked => { root.update-panel-visible = true; } }
             }
-
-            if root.active-tab == 2 : VerticalBox {
-                padding: 28px;
-                spacing: 14px;
-                PageTitle { title: "Activity"; subtitle: "Select and copy any diagnostic text you need."; }
-
-                Rectangle {
-                    vertical-stretch: 1;
-                    border-radius: 14px;
-                    background: #07140e;
-                    border-width: 1px;
-                    border-color: #193b2b;
-                    clip: true;
-                    activity-log-editor := TextEdit {
-                        x: 8px;
-                        y: 8px;
-                        width: parent.width - 16px;
-                        height: parent.height - 16px;
-                        text: root.activity-log-text;
-                        read-only: true;
-                        wrap: no-wrap;
-                        font-family: "Consolas";
-                        font-size: 11px;
-                        placeholder-text: "Diagnostic events will appear here.";
-                    }
-                }
-            }
-
-            if root.active-tab == 3 : VerticalBox {
-                padding: 28px;
-                spacing: 12px;
-                PageTitle { title: "Settings"; subtitle: root.settings-dirty ? "You have unsaved changes." : "Settings are up to date."; }
-
+            page-scroll := ScrollView {
+                vertical-stretch: 1;
                 VerticalBox {
-                    spacing: 12px;
-                    vertical-stretch: 1;
-
-                    Rectangle {
-                        height: 68px;
-                        border-radius: 12px;
-                        background: #081911;
-                        border-width: 1px;
-                        border-color: #173829;
-                        HorizontalBox {
-                            padding-left: 6px;
-                            padding-right: 6px;
-                            padding-top: 12px;
-                            padding-bottom: 12px;
-                            spacing: 4px;
-                            SettingsNavItem { width: 104px; icon: @image-url("../assets/icons/general.svg"); label: "General"; first-line: "General"; selected: root.settings-tab == 0; accent: root.theme-button-accent-color; activated => { root.settings-tab = 0; } }
-                            SettingsNavItem { width: 128px; icon: @image-url("../assets/icons/speech.svg"); label: "Speech engine"; first-line: "Speech"; second-line: "engine"; selected: root.settings-tab == 1; accent: root.theme-button-accent-color; activated => { root.settings-tab = 1; } }
-                            SettingsNavItem { width: 138px; icon: @image-url("../assets/icons/rewrite.svg"); label: "Text rewriting"; first-line: "Text"; second-line: "rewriting"; selected: root.settings-tab == 2; accent: root.theme-button-accent-color; activated => { root.settings-tab = 2; } }
-                            SettingsNavItem { width: 142px; icon: @image-url("../assets/icons/rewrite.svg"); label: "Post processing"; first-line: "Post"; second-line: "processing"; selected: root.settings-tab == 3; accent: root.theme-button-accent-color; activated => { root.settings-tab = 3; } }
-                            SettingsNavItem { width: 136px; icon: @image-url("../assets/icons/appearance.svg"); label: "Appearance"; first-line: "Appearance"; selected: root.settings-tab == 4; accent: root.theme-button-accent-color; activated => { root.settings-tab = 4; } }
-                            Rectangle { horizontal-stretch: 1; background: transparent; }
-                        }
-                    }
-
-                    Rectangle {
-                        horizontal-stretch: 1;
-                        vertical-stretch: 1;
-                        border-radius: 12px;
-                        background: root.theme-window-color;
-                        border-width: 1px;
-                        border-color: #193b2b;
-                        clip: true;
-
-                        if root.settings-tab == 0 : ScrollView {
-                            x: 20px; y: 18px; width: parent.width - 40px; height: parent.height - 36px;
-                            VerticalBox {
-                                spacing: 13px;
-                                SectionTitle { title: "Input and shortcuts"; subtitle: "Choose where audio comes from and how recording starts."; }
-                                Text { text: "Microphone"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                ComboBox {
-                                    model: root.microphone-options;
-                                    current-value <=> root.selected-microphone;
-                                    selected(value) => {
-                                        root.selected-microphone = value;
-                                        root.use-default-microphone = false;
-                                    }
-                                }
-                                CheckBox { text: "Follow the Windows default microphone"; checked <=> root.use-default-microphone; }
-                                CheckBox { text: "Keep microphone active for instant start"; checked <=> root.keep-microphone-ready; }
-                                Text {
-                                    text: "Windows will show the microphone as in use while Echo is running. Echo keeps only the latest 0.5 seconds in memory and sends nothing until transcription starts.";
-                                    color: #738e7e;
-                                    font-size: 10px;
-                                    wrap: word-wrap;
-                                }
-
-                                Rectangle { height: 1px; background: #1c3a2a; }
-                                Text { text: "Global recording hotkey"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                HorizontalBox {
-                                    spacing: 10px;
-                                    Rectangle {
-                                        horizontal-stretch: 1; height: 38px; border-radius: 7px; background: #091911; border-width: 1px; border-color: #294938;
-                                        Text { x: 12px; width: parent.width - 24px; height: parent.height; text: root.hotkey-text; color: root.theme-text-color; vertical-alignment: center; }
-                                    }
-                                    Button { text: "Change hotkey"; clicked => { root.start-hotkey-capture(); } }
-                                }
-                                Text { text: "The hotkey works while Echo is running in the background."; color: #738e7e; font-size: 10px; }
-
-                                Rectangle { height: 1px; background: #1c3a2a; }
-                                SectionTitle { title: "Startup"; subtitle: "Keep speech capture available after signing in."; }
-                                CheckBox { text: "Start Echo when I sign in to Windows"; checked <=> root.start-with-windows; }
-
-                                Rectangle { height: 1px; background: #1c3a2a; }
-                                SectionTitle { title: "Updates"; subtitle: "Echo verifies update manifests and installers before installation."; }
-                                CheckBox { text: "Automatically check for updates"; checked <=> root.update-checks-enabled; enabled: root.updater-configured; }
-                                HorizontalBox {
-                                    spacing: 10px;
-                                    Button { text: root.update-state == 1 ? "Checking…" : "Check now"; enabled: root.updater-configured && root.update-state != 1 && root.update-state != 3; clicked => { root.check-for-updates(); } }
-                                    Text { text: root.updater-configured ? "Current version " + root.app-version : "Updates are disabled in this development build."; color: #738e7e; font-size: 10px; vertical-alignment: center; }
-                                }
+                    padding: 4px; padding-right: 18px; spacing: 6px; alignment: start;
+                    if root.active-tab == 0 : VerticalBox {
+                        padding: 0px; spacing: 6px; alignment: start;
+                        if root.has-error : Text { text: root.status-text; color: #fda4af; wrap: word-wrap; font-size: 12px; }
+                        Rectangle {
+                            height: Math.max(transcript-text.preferred-height + 12px, page-scroll.height - 8px);
+                            border-radius: 6px; background: root.theme-window-color; border-width: 1px; border-color: #ffffff18;
+                            transcript-text := SelectableDocument {
+                                selected-bytes <=> root.selected-transcript-bytes;
+                                x: 6px; y: 6px; width: parent.width - 12px; height: self.preferred-height;
+                                text: root.transcript-history-text;
+                                read-only: true; single-line: false; wrap: word-wrap;
+                                font-size: 14px; color: root.theme-text-color;
+                                accessible-label: "Transcript history";
                             }
                         }
-
-                        if root.settings-tab == 1 : ScrollView {
-                            x: 20px; y: 18px; width: parent.width - 40px; height: parent.height - 36px;
-                            VerticalBox {
-                                spacing: 12px;
-                                SectionTitle { title: "Speech engine"; subtitle: "Choose one transcription provider. Only relevant options are shown."; }
-                                Text { text: "Provider"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                ComboBox { model: root.transcription-provider-options; current-value <=> root.transcription-provider-text; enabled: !root.is-recording && !root.is-finalizing && !root.local-download-progress-visible; }
-
-                                if root.transcription-provider-text == "ElevenLabs Realtime" : VerticalBox {
-                                    spacing: 10px;
-                                    Rectangle { height: 1px; background: #1c3a2a; }
-                                    SectionTitle { title: "ElevenLabs Realtime"; subtitle: "Low-latency cloud transcription."; }
-                                    Text { text: "API key"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                    LineEdit { text <=> root.api-key-text; placeholder-text: "sk_..."; input-type: password; }
-                                    Text { text: "Model"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                    LineEdit { text <=> root.elevenlabs-model-text; placeholder-text: "scribe_v2_realtime"; }
-                                    Text { text: "Language code"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                    LineEdit { text <=> root.elevenlabs-language-code-text; placeholder-text: "en"; }
-                                    CheckBox { text: "Clean filler words and disfluencies"; checked <=> root.elevenlabs-no-verbatim; }
+                    }
+                    if root.active-tab == 2 : Rectangle {
+                        height: Math.max(activity-text.preferred-height + 12px, page-scroll.height - 8px);
+                        border-radius: 6px; background: root.theme-window-color; border-width: 1px; border-color: #ffffff18;
+                        activity-text := SelectableDocument { selected-bytes <=> root.selected-activity-bytes; x: 6px; y: 6px; width: parent.width - 12px; height: self.preferred-height; text: root.activity-log-text; font-size: 14px; color: root.theme-text-color; accessible-label: "Activity log"; }
+                    }
+                    if root.active-tab == 3 : VerticalBox {
+                        padding: 2px; spacing: 6px; alignment: start;
+                        if root.settings-tab == 0 : VerticalBox { alignment: start; padding: 0px;
+                            spacing: 10px;
+                            SectionTitle { title: "Input and shortcuts"; subtitle: "Choose where audio comes from and how recording starts."; }
+                            Text { text: "Microphone"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                            ComboBox { height: 32px; min-width: 0px;
+                                model: root.microphone-options;
+                                current-value <=> root.selected-microphone;
+                                selected(value) => {
+                                    root.selected-microphone = value;
+                                    root.use-default-microphone = false;
                                 }
+                            }
+                            CheckBox { height: 26px; text: "Follow the Windows default microphone"; checked <=> root.use-default-microphone; }
+                            CheckBox { height: 26px; text: "Keep microphone active for instant start"; checked <=> root.keep-microphone-ready; }
+                            Text {
+                                text: "Windows will show the microphone as in use while Echo is running. Echo keeps only the latest 0.5 seconds in memory and sends nothing until transcription starts.";
+                                color: #9cafa5;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
 
-                                if root.transcription-provider-text == "OpenAI Realtime Whisper" : VerticalBox {
-                                    spacing: 10px;
-                                    Rectangle { height: 1px; background: #1c3a2a; }
-                                    SectionTitle { title: "OpenAI Realtime Whisper"; subtitle: "Streaming cloud transcription through OpenAI."; }
-                                    Text { text: "API key"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                    LineEdit { text <=> root.openai-api-key-text; placeholder-text: "sk-..."; input-type: password; }
-                                    Text { text: "Model"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                    LineEdit { text <=> root.openai-model-text; placeholder-text: "gpt-realtime-whisper"; }
-                                    Text { text: "Language code"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                    LineEdit { text <=> root.openai-language-code-text; placeholder-text: "en"; }
+                            Rectangle { height: 1px; background: #1c3a2a; }
+                            Text { text: "Global recording hotkey"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                            HorizontalBox { padding: 0px;
+                                spacing: 10px;
+                                Rectangle {
+                                    horizontal-stretch: 1; height: 38px; border-radius: 7px; background: root.theme-window-color; border-width: 1px; border-color: #294938;
+                                    Text { x: 12px; width: parent.width - 24px; height: parent.height; text: root.hotkey-text; color: root.theme-text-color; vertical-alignment: center; }
                                 }
+                                ActionButton { accent: root.theme-button-accent-color; text: "Change hotkey"; clicked => { root.start-hotkey-capture(); } }
+                            }
+                            Text { text: "The hotkey works while Echo is running in the background."; color: #9cafa5; font-size: 12px; }
 
-                                if root.transcription-provider-text == "Local — Parakeet" : VerticalBox {
-                                    spacing: 10px;
-                                    Rectangle { height: 1px; background: #1c3a2a; }
-                                    SectionTitle { title: root.local-uses-gpu ? "Local GPU — Parakeet Ultra" : "Local CPU — Sherpa ONNX"; subtitle: "Private, offline transcription on this computer."; }
-                                    Text { text: "Speech model"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                    ComboBox { model: root.local-model-options; current-value <=> root.local-model-text; enabled: !root.is-recording && !root.is-finalizing && !root.local-download-progress-visible; }
-                                    Text { text: root.local-uses-gpu ? "Full-precision model, 25 languages detected automatically. NVIDIA Ampere or newer required. Previews start after 1.5 seconds of audio, then update every second, plus processing time." : root.local-model-text == "Parakeet TDT 0.6B v3 — 600M parameters, 25 languages, INT8" ? "Download option: 0.6B-parameter transducer, multilingual (25 languages), INT8 CPU model." : "Current default: 0.6B-parameter transducer, English, INT8 CPU model."; color: #71917d; font-size: 10px; wrap: word-wrap; }
-                                    if root.local-uses-gpu : Text { text: root.ultra-gpu-status; color: #a9c3b2; font-size: 11px; wrap: word-wrap; }
-                                    Text { text: "Engine: " + root.local-engine-status-text; color: #a9c3b2; font-size: 11px; wrap: word-wrap; }
-                                    Button { text: "Install / repair selected model"; enabled: !root.is-recording && !root.is-finalizing && !root.local-download-progress-visible; clicked => { root.local-download-error = ""; root.local-download-prompt-visible = true; } }
-                                    Rectangle {
-                                        height: 58px; border-radius: 8px; background: #0b2418; border-width: 1px; border-color: #245038;
-                                        Text { x: 12px; y: 9px; text: "Runs entirely on this computer"; color: #b9edca; font-size: 12px; font-weight: 700; }
-                                        Text { x: 12px; y: 30px; width: parent.width - 24px; text: "No API key or network connection is required after the model is installed."; color: #71917d; font-size: 10px; overflow: elide; }
-                                    }
-                                    if !root.local-uses-gpu : VerticalBox {
-                                    spacing: 10px;
-                                    LabeledSlider { label: "CPU threads"; hint: "More threads can reduce latency but increase CPU use."; minimum: 1; maximum: root.local-max-cpu-threads; step: 1; value <=> root.local-cpu-threads; }
-                                    LabeledSlider { label: "Speech sensitivity"; hint: "Lower values detect quieter speech and more background noise."; minimum: 0.1; maximum: 0.9; value <=> root.local-vad-threshold; }
-                                    CheckBox { text: "Re-decode the full session when recording stops"; checked <=> root.local-redecode-full-session; }
-                                    Rectangle { height: 1px; background: #1c3a2a; }
-                                    SectionTitle { title: "Advanced"; subtitle: "Fine-tune speech detection and live transcript updates."; }
-                                    VerticalBox {
-                                        spacing: 5px;
-                                        LabeledSlider { label: "End-of-speech pause (seconds)"; hint: "Wait 1 to 10 seconds before splitting at a pause."; minimum: 1000; maximum: 10000; step: 1000; display-divisor: 1000; value <=> root.local-silence-ms; }
-                                        LabeledSlider { label: "Pre-roll (ms)"; hint: "Audio retained before speech is detected."; minimum: 0; maximum: 1000; step: 1; value <=> root.local-pre-roll-ms; }
-                                        LabeledSlider { label: "Post-roll (ms)"; hint: "Audio retained after speech ends."; minimum: 0; maximum: 1000; step: 1; value <=> root.local-post-roll-ms; }
-                                        LabeledSlider { label: "Minimum speech (ms)"; hint: "Shorter sounds are ignored."; minimum: 50; maximum: 2000; step: 1; value <=> root.local-min-speech-ms; }
-                                        LabeledSlider { label: "Maximum phrase (seconds)"; hint: "Long speech is split without stopping recording."; minimum: 5; maximum: 120; step: 1; value <=> root.local-max-segment-seconds; }
-                                        LabeledSlider { label: "Provisional refresh (ms)"; hint: "Short intervals update sooner and consume more CPU."; minimum: 250; maximum: 5000; step: 1; value <=> root.local-partial-interval-ms; }
-                                        Button {
-                                            text: "Reset local defaults";
-                                            clicked => {
-                                                root.local-cpu-threads = Math.round(Math.max(1, Math.min(4, root.local-max-cpu-threads / 2)));
-                                                root.local-vad-threshold = 0.5;
-                                                root.local-silence-ms = 1000;
-                                                root.local-pre-roll-ms = 250;
-                                                root.local-post-roll-ms = 150;
-                                                root.local-min-speech-ms = 200;
-                                                root.local-max-segment-seconds = 30;
-                                                root.local-partial-interval-ms = 1000;
-                                                root.local-redecode-full-session = false;
-                                            }
+                            Rectangle { height: 1px; background: #1c3a2a; }
+                            SectionTitle { title: "Startup"; subtitle: "Keep speech capture available after signing in."; }
+                            CheckBox { height: 26px; text: "Start Echo when I sign in to Windows"; checked <=> root.start-with-windows; }
+
+                            Rectangle { height: 1px; background: #1c3a2a; }
+                            SectionTitle { title: "Updates"; subtitle: "Echo verifies update manifests and installers before installation."; }
+                            CheckBox { height: 26px; text: "Automatically check for updates"; checked <=> root.update-checks-enabled; enabled: root.updater-configured; }
+                            HorizontalBox { padding: 0px;
+                                spacing: 10px;
+                                ActionButton { accent: root.theme-button-accent-color; text: root.update-state == 1 ? "Checking…" : "Check now"; enabled: root.updater-configured && root.update-state != 1 && root.update-state != 3; clicked => { root.check-for-updates(); } }
+                                Text { text: root.updater-configured ? "Current version " + root.app-version : "Updates are disabled in this development build."; color: #9cafa5; font-size: 12px; vertical-alignment: center; }
+                            }
+                        }
+                        if root.settings-tab == 1 : VerticalBox { alignment: start; padding: 0px;
+                            spacing: 12px;
+                            Text { text: "Provider"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                            ComboBox { height: 32px; min-width: 0px; model: root.transcription-provider-options; current-value <=> root.transcription-provider-text; enabled: !root.is-recording && !root.is-finalizing && !root.local-download-progress-visible; }
+
+                            if root.transcription-provider-text == "ElevenLabs Realtime" : VerticalBox { alignment: start; padding: 0px;
+                                spacing: 10px;
+                                Rectangle { height: 1px; background: #1c3a2a; }
+                                SectionTitle { title: "ElevenLabs Realtime"; subtitle: "Low-latency cloud transcription."; }
+                                Text { text: "API key"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                LineEdit { height: 32px; min-width: 0px; text <=> root.api-key-text; placeholder-text: "sk_..."; input-type: password; }
+                                Text { text: "Model"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                LineEdit { height: 32px; min-width: 0px; text <=> root.elevenlabs-model-text; placeholder-text: "scribe_v2_realtime"; }
+                                Text { text: "Language code"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                LineEdit { height: 32px; min-width: 0px; text <=> root.elevenlabs-language-code-text; placeholder-text: "en"; }
+                                CheckBox { height: 26px; text: "Clean filler words and disfluencies"; checked <=> root.elevenlabs-no-verbatim; }
+                            }
+
+                            if root.transcription-provider-text == "OpenAI Realtime Whisper" : VerticalBox { alignment: start; padding: 0px;
+                                spacing: 10px;
+                                Rectangle { height: 1px; background: #1c3a2a; }
+                                SectionTitle { title: "OpenAI Realtime Whisper"; subtitle: "Streaming cloud transcription through OpenAI."; }
+                                Text { text: "API key"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                LineEdit { height: 32px; min-width: 0px; text <=> root.openai-api-key-text; placeholder-text: "sk-..."; input-type: password; }
+                                Text { text: "Model"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                LineEdit { height: 32px; min-width: 0px; text <=> root.openai-model-text; placeholder-text: "gpt-realtime-whisper"; }
+                                Text { text: "Language code"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                LineEdit { height: 32px; min-width: 0px; text <=> root.openai-language-code-text; placeholder-text: "en"; }
+                            }
+
+                            if root.transcription-provider-text == "Local — Parakeet" : VerticalBox { alignment: start; padding: 0px;
+                                spacing: 10px;
+                                Rectangle { height: 1px; background: #1c3a2a; }
+                                SectionTitle { title: root.local-uses-gpu ? "Local GPU — Parakeet Ultra" : "Local CPU — Sherpa ONNX"; subtitle: "Private, offline transcription on this computer."; }
+                                Text { text: "Speech model"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                ComboBox { height: 32px; min-width: 0px; model: root.local-model-options; current-value <=> root.local-model-text; enabled: !root.is-recording && !root.is-finalizing && !root.local-download-progress-visible; }
+                                Text { text: root.local-uses-gpu ? "Full-precision model, 25 languages detected automatically. NVIDIA Ampere or newer required. Previews start after 1.5 seconds of audio, then update every second, plus processing time." : root.local-model-text == "Parakeet TDT 0.6B v3 — 600M parameters, 25 languages, INT8" ? "Download option: 0.6B-parameter transducer, multilingual (25 languages), INT8 CPU model." : "Current default: 0.6B-parameter transducer, English, INT8 CPU model."; color: #9cafa5; font-size: 12px; wrap: word-wrap; }
+                                if root.local-uses-gpu : Text { text: root.ultra-gpu-status; color: #a9c3b2; font-size: 12px; wrap: word-wrap; }
+                                Text { text: "Engine: " + root.local-engine-status-text; color: #a9c3b2; font-size: 12px; wrap: word-wrap; }
+                                ActionButton { accent: root.theme-button-accent-color; text: "Install / repair selected model"; enabled: !root.is-recording && !root.is-finalizing && !root.local-download-progress-visible; clicked => { root.local-download-error = ""; root.local-download-prompt-visible = true; } }
+                                Rectangle {
+                                    height: 58px; border-radius: 8px; background: root.theme-window-color; border-width: 1px; border-color: #245038;
+                                    Text { x: 12px; y: 9px; text: "Runs entirely on this computer"; color: #b9edca; font-size: 12px; font-weight: 700; }
+                                    Text { x: 12px; y: 30px; width: parent.width - 24px; text: "No API key or network connection is required after the model is installed."; color: #9cafa5; font-size: 12px; overflow: elide; }
+                                }
+                                if !root.local-uses-gpu : VerticalBox { alignment: start; padding: 0px;
+                                spacing: 10px;
+                                LabeledSlider { label: "CPU threads"; hint: "More threads can reduce latency but increase CPU use."; minimum: 1; maximum: root.local-max-cpu-threads; step: 1; value <=> root.local-cpu-threads; }
+                                LabeledSlider { label: "Speech sensitivity"; hint: "Lower values detect quieter speech and more background noise."; minimum: 0.1; maximum: 0.9; value <=> root.local-vad-threshold; }
+                                CheckBox { height: 26px; text: "Re-decode the full session when recording stops"; checked <=> root.local-redecode-full-session; }
+                                Rectangle { height: 1px; background: #1c3a2a; }
+                                SectionTitle { title: "Advanced"; subtitle: "Fine-tune speech detection and live transcript updates."; }
+                                VerticalBox { alignment: start; padding: 0px;
+                                    spacing: 5px;
+                                    LabeledSlider { label: "End-of-speech pause (seconds)"; hint: "Wait 1 to 10 seconds before splitting at a pause."; minimum: 1000; maximum: 10000; step: 1000; display-divisor: 1000; value <=> root.local-silence-ms; }
+                                    LabeledSlider { label: "Pre-roll (ms)"; hint: "Audio retained before speech is detected."; minimum: 0; maximum: 1000; step: 1; value <=> root.local-pre-roll-ms; }
+                                    LabeledSlider { label: "Post-roll (ms)"; hint: "Audio retained after speech ends."; minimum: 0; maximum: 1000; step: 1; value <=> root.local-post-roll-ms; }
+                                    LabeledSlider { label: "Minimum speech (ms)"; hint: "Shorter sounds are ignored."; minimum: 50; maximum: 2000; step: 1; value <=> root.local-min-speech-ms; }
+                                    LabeledSlider { label: "Maximum phrase (seconds)"; hint: "Long speech is split without stopping recording."; minimum: 5; maximum: 120; step: 1; value <=> root.local-max-segment-seconds; }
+                                    LabeledSlider { label: "Provisional refresh (ms)"; hint: "Short intervals update sooner and consume more CPU."; minimum: 250; maximum: 5000; step: 1; value <=> root.local-partial-interval-ms; }
+                                    ActionButton { accent: root.theme-button-accent-color;
+                                        text: "Reset local defaults";
+                                        clicked => {
+                                            root.local-cpu-threads = Math.round(Math.max(1, Math.min(4, root.local-max-cpu-threads / 2)));
+                                            root.local-vad-threshold = 0.5;
+                                            root.local-silence-ms = 1000;
+                                            root.local-pre-roll-ms = 250;
+                                            root.local-post-roll-ms = 150;
+                                            root.local-min-speech-ms = 200;
+                                            root.local-max-segment-seconds = 30;
+                                            root.local-partial-interval-ms = 1000;
+                                            root.local-redecode-full-session = false;
                                         }
                                     }
-                                    }
+                                }
                                 }
                             }
                         }
-
-                        if root.settings-tab == 2 : ScrollView {
-                            x: 20px; y: 18px; width: parent.width - 40px; height: parent.height - 36px;
-                            VerticalBox {
-                                spacing: 12px;
-                                SectionTitle { title: "Gemini text rewriting"; subtitle: "Optionally polish the transcript before it is pasted."; }
-                                CheckBox { text: "Rewrite completed transcripts with Gemini"; checked <=> root.use-gemini-modifier; }
-                                Rectangle {
-                                    height: 54px; border-radius: 8px; background: #0b2117; border-width: 1px; border-color: #1d422f;
-                                    Text { x: 12px; y: 9px; text: root.use-gemini-modifier ? "Rewriting is enabled" : "Rewriting is disabled"; color: root.use-gemini-modifier ? #a8e9bd : #9aafa1; font-size: 12px; font-weight: 700; }
-                                    Text { x: 12px; y: 29px; text: "Your original transcript remains available in history."; color: #6d8878; font-size: 10px; }
-                                }
-                                Text { text: "Gemini API key"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                LineEdit { text <=> root.gemini-api-key-text; placeholder-text: "AIza..."; input-type: password; enabled: root.use-gemini-modifier; }
-                                Text { text: "Model"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                LineEdit { text <=> root.gemini-model-text; placeholder-text: "gemini-3.1-flash-lite-preview"; enabled: root.use-gemini-modifier; }
-                                Text { text: "Rewrite style"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                ComboBox { model: root.gemini-preset-options; current-value <=> root.selected-gemini-preset; enabled: root.use-gemini-modifier; }
-                                if root.selected-gemini-preset == "Custom" : VerticalBox {
-                                    spacing: 7px;
-                                    Text { text: "Custom instruction"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                    LineEdit { text <=> root.gemini-custom-prompt; placeholder-text: "Describe how Gemini should rewrite your text"; enabled: root.use-gemini-modifier; }
-                                }
+                        if root.settings-tab == 2 : VerticalBox { alignment: start; padding: 0px;
+                            spacing: 12px;
+                            SectionTitle { title: "Gemini text rewriting"; subtitle: "Optionally polish the transcript before it is pasted."; }
+                            CheckBox { height: 26px; text: "Rewrite completed transcripts with Gemini"; checked <=> root.use-gemini-modifier; }
+                            Rectangle {
+                                height: 54px; border-radius: 8px; background: root.theme-window-color; border-width: 1px; border-color: #1d422f;
+                                Text { x: 12px; y: 9px; text: root.use-gemini-modifier ? "Rewriting is enabled" : "Rewriting is disabled"; color: root.use-gemini-modifier ? #a8e9bd : #9aafa1; font-size: 12px; font-weight: 700; }
+                                Text { x: 12px; y: 29px; text: "Your original transcript remains available in history."; color: #9cafa5; font-size: 12px; }
+                            }
+                            Text { text: "Gemini API key"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                            LineEdit { height: 32px; min-width: 0px; text <=> root.gemini-api-key-text; placeholder-text: "AIza..."; input-type: password; enabled: root.use-gemini-modifier; }
+                            Text { text: "Model"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                            LineEdit { height: 32px; min-width: 0px; text <=> root.gemini-model-text; placeholder-text: "gemini-3.1-flash-lite-preview"; enabled: root.use-gemini-modifier; }
+                            Text { text: "Rewrite style"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                            ComboBox { height: 32px; min-width: 0px; model: root.gemini-preset-options; current-value <=> root.selected-gemini-preset; enabled: root.use-gemini-modifier; }
+                            if root.selected-gemini-preset == "Custom" : VerticalBox { alignment: start; padding: 0px;
+                                spacing: 7px;
+                                Text { text: "Custom instruction"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                                LineEdit { height: 32px; min-width: 0px; text <=> root.gemini-custom-prompt; placeholder-text: "Describe how Gemini should rewrite your text"; enabled: root.use-gemini-modifier; }
                             }
                         }
-
-                        if root.settings-tab == 3 : ScrollView {
-                            x: 20px; y: 18px; width: parent.width - 40px; height: parent.height - 36px;
-                            VerticalBox {
+                        if root.settings-tab == 3 : VerticalBox { alignment: start; padding: 0px;
+                            spacing: 10px;
+                            RuleToggle { label: "Use local post-processing"; checked <=> root.post-processing-enabled; active: !root.is-recording && !root.is-finalizing; help: "Formats only the complete transcript after you stop. The live preview stays unchanged. Save settings to keep your choices."; toggled => { root.post-processing-changed(); } }
+                            Text { text: root.post-model-status; color: #9cafa5; font-size: 12px; wrap: word-wrap; }
+                            Text { text: "Written formats"; color: #d6e9dc; font-size: 13px; font-weight: 600; }
+                            RuleToggle { label: "Convert ordinary spoken numbers"; checked <=> root.post-format-numbers; active: root.post-processing-enabled; help: "Master switch for whole numbers, ordinals, and decimals. Other written-format categories are independent."; }
+                            RuleToggle { label: "Prefer digits for small counts"; checked <=> root.post-prefer-digits; active: root.post-processing-enabled && root.post-format-numbers; help: "When off, ordinary single-word counts below thirteen stay written as words. Explicit money, units, dates, and identifiers still use digits."; }
+                            RuleToggle { label: "Whole numbers"; checked <=> root.post-whole-numbers; active: root.post-processing-enabled && root.post-format-numbers; help: "twenty three → 23. Controls ordinary counts; money, dates, and units have separate switches."; }
+                            RuleToggle { label: "Ordinals"; checked <=> root.post-ordinals; active: root.post-processing-enabled && root.post-format-numbers; help: "twenty first → 21st."; }
+                            RuleToggle { label: "Decimals and signed quantities"; checked <=> root.post-decimals; active: root.post-processing-enabled && root.post-format-numbers; help: "three point five → 3.5; negative twenty three → -23."; }
+                            RuleToggle { label: "Currency"; checked <=> root.post-money; active: root.post-processing-enabled; help: "twelve dollars and five cents → $12.05. Supports dollars, euros, cents, and pounds sterling."; }
+                            RuleToggle { label: "Measurements and percentages"; checked <=> root.post-measurements; active: root.post-processing-enabled; help: "three kilograms → 3 kg; fifty percent → 50%; twenty degrees Celsius → 20°C."; }
+                            RuleToggle { label: "Dates"; checked <=> root.post-dates; active: root.post-processing-enabled; help: "January fifth twenty twenty six → January 5, 2026. Named months only; ambiguous numeric dates stay unchanged."; }
+                            RuleToggle { label: "Times"; checked <=> root.post-times; active: root.post-processing-enabled; help: "three thirty PM → 3:30 PM. Requires AM, PM, or o'clock to avoid guessing."; }
+                            RuleToggle { label: "Phone numbers and identifiers"; checked <=> root.post-identifiers; active: root.post-processing-enabled; help: "phone number zero one two → phone number 012; code A zero zero seven → code A007. Requires a phone, code, PIN, ID, or serial cue."; }
+                            RuleToggle { label: "Email addresses and web addresses"; checked <=> root.post-addresses; active: root.post-processing-enabled; help: "john dot smith at example dot com → john.smith@example.com. Existing written addresses stay intact."; }
+                            Text { text: "Punctuation and capitalization"; color: #d6e9dc; font-size: 13px; font-weight: 600; }
+                            RuleToggle { label: "Rebuild punctuation with the offline model"; checked <=> root.post-punctuation; active: root.post-processing-enabled; help: "Removes speech-model sentence punctuation, applies written rules, then predicts punctuation and word casing locally on the CPU after you stop recording. Protected addresses and numbers keep internal symbols. If unavailable, retains original punctuation and reports a warning."; toggled => { root.post-processing-changed(); } }
+                            RuleToggle { label: "Sentence capitalization and the pronoun I"; checked <=> root.post-capitalization; active: root.post-processing-enabled; help: "Uses the offline model's casing predictions, including sentence starts and I. Existing names and acronyms are preserved when possible."; }
+                            RuleToggle { label: "Commas"; checked <=> root.post-commas; active: root.post-processing-enabled && root.post-punctuation; help: "Keep commas predicted by the punctuation model. Turning this off removes predicted commas, not commas inside protected values."; }
+                            RuleToggle { label: "Periods"; checked <=> root.post-periods; active: root.post-processing-enabled && root.post-punctuation; help: "Keep sentence-ending periods predicted by the model. Does not remove decimal points or dots in addresses."; }
+                            RuleToggle { label: "Question marks"; checked <=> root.post-question-marks; active: root.post-processing-enabled && root.post-punctuation; help: "Keep question marks predicted by the model. The offline model may still miss questions; it does not rewrite words."; }
+                            HorizontalBox { padding: 0px; Text { text: "Protected phrases (one per line)"; color: #d6e9dc; font-size: 12px; font-weight: 600; } HelpIcon { help: "Exact phrases stay as transcribed: no number conversion, replacement, or internal punctuation changes. Matching ignores letter case and uses whole words. Addresses and written numbers are protected automatically."; } }
+                            TextEdit { height: 70px; text <=> root.post-protected-phrases-text; placeholder-text: "one of a kind\nGPT-4"; enabled: root.post-processing-enabled; }
+                            HorizontalBox { padding: 0px; Text { text: "Custom replacements (spoken => written)"; color: #d6e9dc; font-size: 12px; font-weight: 600; } HelpIcon { help: "One spoken => written pair per line. Whole-word, case-insensitive matching; longest match wins. The result is protected from further changes. Invalid or duplicate rules are rejected when saving."; } }
+                            TextEdit { height: 70px; text <=> root.post-custom-replacements-text; placeholder-text: "acme corp => Acme Corp"; enabled: root.post-processing-enabled; }
+                        }
+                        if root.settings-tab == 4 : VerticalBox { alignment: start; padding: 0px;
+                            spacing: 10px;
+                            Text { text: "Color palette"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                            HorizontalBox { padding: 0px;
                                 spacing: 10px;
-                                SectionTitle { title: "Post processing"; subtitle: "Local formatting runs after optional Gemini rewriting and before text is pasted."; }
-                                RuleToggle { label: "Use local post-processing"; checked <=> root.post-processing-enabled; active: !root.is-recording && !root.is-finalizing; help: "Formats only the complete transcript after you stop. The live preview stays unchanged. Save settings to keep your choices."; toggled => { root.post-processing-changed(); } }
-                                Text { text: root.post-model-status; color: #7f9d8c; font-size: 11px; wrap: word-wrap; }
-                                Text { text: "Written formats"; color: #d6e9dc; font-size: 13px; font-weight: 600; }
-                                RuleToggle { label: "Convert ordinary spoken numbers"; checked <=> root.post-format-numbers; active: root.post-processing-enabled; help: "Master switch for whole numbers, ordinals, and decimals. Other written-format categories are independent."; }
-                                RuleToggle { label: "Prefer digits for small counts"; checked <=> root.post-prefer-digits; active: root.post-processing-enabled && root.post-format-numbers; help: "When off, ordinary single-word counts below thirteen stay written as words. Explicit money, units, dates, and identifiers still use digits."; }
-                                RuleToggle { label: "Whole numbers"; checked <=> root.post-whole-numbers; active: root.post-processing-enabled && root.post-format-numbers; help: "twenty three → 23. Controls ordinary counts; money, dates, and units have separate switches."; }
-                                RuleToggle { label: "Ordinals"; checked <=> root.post-ordinals; active: root.post-processing-enabled && root.post-format-numbers; help: "twenty first → 21st."; }
-                                RuleToggle { label: "Decimals and signed quantities"; checked <=> root.post-decimals; active: root.post-processing-enabled && root.post-format-numbers; help: "three point five → 3.5; negative twenty three → -23."; }
-                                RuleToggle { label: "Currency"; checked <=> root.post-money; active: root.post-processing-enabled; help: "twelve dollars and five cents → $12.05. Supports dollars, euros, cents, and pounds sterling."; }
-                                RuleToggle { label: "Measurements and percentages"; checked <=> root.post-measurements; active: root.post-processing-enabled; help: "three kilograms → 3 kg; fifty percent → 50%; twenty degrees Celsius → 20°C."; }
-                                RuleToggle { label: "Dates"; checked <=> root.post-dates; active: root.post-processing-enabled; help: "January fifth twenty twenty six → January 5, 2026. Named months only; ambiguous numeric dates stay unchanged."; }
-                                RuleToggle { label: "Times"; checked <=> root.post-times; active: root.post-processing-enabled; help: "three thirty PM → 3:30 PM. Requires AM, PM, or o'clock to avoid guessing."; }
-                                RuleToggle { label: "Phone numbers and identifiers"; checked <=> root.post-identifiers; active: root.post-processing-enabled; help: "phone number zero one two → phone number 012; code A zero zero seven → code A007. Requires a phone, code, PIN, ID, or serial cue."; }
-                                RuleToggle { label: "Email addresses and web addresses"; checked <=> root.post-addresses; active: root.post-processing-enabled; help: "john dot smith at example dot com → john.smith@example.com. Existing written addresses stay intact."; }
-                                Text { text: "Punctuation and capitalization"; color: #d6e9dc; font-size: 13px; font-weight: 600; }
-                                RuleToggle { label: "Rebuild punctuation with the offline model"; checked <=> root.post-punctuation; active: root.post-processing-enabled; help: "Removes speech-model sentence punctuation, applies written rules, then predicts punctuation and word casing locally on the CPU after you stop recording. Protected addresses and numbers keep internal symbols. If unavailable, retains original punctuation and reports a warning."; toggled => { root.post-processing-changed(); } }
-                                RuleToggle { label: "Sentence capitalization and the pronoun I"; checked <=> root.post-capitalization; active: root.post-processing-enabled; help: "Uses the offline model's casing predictions, including sentence starts and I. Existing names and acronyms are preserved when possible."; }
-                                RuleToggle { label: "Commas"; checked <=> root.post-commas; active: root.post-processing-enabled && root.post-punctuation; help: "Keep commas predicted by the punctuation model. Turning this off removes predicted commas, not commas inside protected values."; }
-                                RuleToggle { label: "Periods"; checked <=> root.post-periods; active: root.post-processing-enabled && root.post-punctuation; help: "Keep sentence-ending periods predicted by the model. Does not remove decimal points or dots in addresses."; }
-                                RuleToggle { label: "Question marks"; checked <=> root.post-question-marks; active: root.post-processing-enabled && root.post-punctuation; help: "Keep question marks predicted by the model. The offline model may still miss questions; it does not rewrite words."; }
-                                HorizontalBox { Text { text: "Protected phrases (one per line)"; color: #d6e9dc; font-size: 12px; font-weight: 600; } HelpIcon { help: "Exact phrases stay as transcribed: no number conversion, replacement, or internal punctuation changes. Matching ignores letter case and uses whole words. Addresses and written numbers are protected automatically."; } }
-                                TextEdit { height: 70px; text <=> root.post-protected-phrases-text; placeholder-text: "one of a kind\nGPT-4"; enabled: root.post-processing-enabled; }
-                                HorizontalBox { Text { text: "Custom replacements (spoken => written)"; color: #d6e9dc; font-size: 12px; font-weight: 600; } HelpIcon { help: "One spoken => written pair per line. Whole-word, case-insensitive matching; longest match wins. The result is protected from further changes. Invalid or duplicate rules are rejected when saving."; } }
-                                TextEdit { height: 70px; text <=> root.post-custom-replacements-text; placeholder-text: "acme corp => Acme Corp"; enabled: root.post-processing-enabled; }
-                            }
-                        }
-                        if root.settings-tab == 4 : ScrollView {
-                            x: 20px; y: 18px; width: parent.width - 40px; height: parent.height - 36px;
-                            VerticalBox {
-                                spacing: 13px;
-                                SectionTitle { title: "Appearance"; subtitle: "Choose a palette and tune the live transcription overlay."; }
-                                Text { text: "Color palette"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                HorizontalBox {
-                                    spacing: 10px;
-                                    ColorChoice {
-                                        label: "Forest green palette"; choice-color: #4ade80; selected: root.theme-button-accent-color == #4ade80;
-                                        chosen => { root.theme-background-top-color=#02140b; root.theme-background-bottom-color=#000806; root.theme-window-color=#041b11; root.theme-button-accent-color=#4ade80; root.theme-title-color=#e4ffe9; root.theme-text-color=#ccefd6; root.overlay-background-color=#03150c; root.overlay-text-color=#e6fff0; }
-                                    }
-                                    ColorChoice {
-                                        label: "Ocean blue palette"; choice-color: #38bdf8; selected: root.theme-button-accent-color == #38bdf8;
-                                        chosen => { root.theme-background-top-color=#071523; root.theme-background-bottom-color=#030811; root.theme-window-color=#091b2a; root.theme-button-accent-color=#38bdf8; root.theme-title-color=#e0f2fe; root.theme-text-color=#c7e8f8; root.overlay-background-color=#061827; root.overlay-text-color=#e0f2fe; }
-                                    }
-                                    ColorChoice {
-                                        label: "Violet palette"; choice-color: #a78bfa; selected: root.theme-button-accent-color == #a78bfa;
-                                        chosen => { root.theme-background-top-color=#170f27; root.theme-background-bottom-color=#08050f; root.theme-window-color=#1a1029; root.theme-button-accent-color=#a78bfa; root.theme-title-color=#f1eaff; root.theme-text-color=#ded2f6; root.overlay-background-color=#160d24; root.overlay-text-color=#f1eaff; }
-                                    }
-                                    ColorChoice {
-                                        label: "Rose palette"; choice-color: #fb7185; selected: root.theme-button-accent-color == #fb7185;
-                                        chosen => { root.theme-background-top-color=#251015; root.theme-background-bottom-color=#0e0507; root.theme-window-color=#281217; root.theme-button-accent-color=#fb7185; root.theme-title-color=#fff1f2; root.theme-text-color=#f7d4d9; root.overlay-background-color=#240e14; root.overlay-text-color=#fff1f2; }
-                                    }
+                                ColorChoice {
+                                    label: "Forest green palette"; choice-color: #4ade80; selected: root.theme-button-accent-color == #4ade80;
+                                    chosen => { root.theme-background-top-color=#02140b; root.theme-background-bottom-color=#000806; root.theme-window-color=#041b11; root.theme-button-accent-color=#4ade80; root.theme-title-color=#e4ffe9; root.theme-text-color=#ccefd6; root.overlay-background-color=#03150c; root.overlay-text-color=#e6fff0; }
                                 }
-                                Rectangle { height: 1px; background: #1c3a2a; }
-                                Text { text: "Overlay opacity: " + root.overlay-opacity; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                Slider { minimum: 0.3; maximum: 1.0; value <=> root.overlay-opacity; }
-                                Text { text: "The overlay remains movable and always on top while transcription is active."; color: #718c7c; font-size: 10px; wrap: word-wrap; }
+                                ColorChoice {
+                                    label: "Ocean blue palette"; choice-color: #38bdf8; selected: root.theme-button-accent-color == #38bdf8;
+                                    chosen => { root.theme-background-top-color=#071523; root.theme-background-bottom-color=#030811; root.theme-window-color=#091b2a; root.theme-button-accent-color=#38bdf8; root.theme-title-color=#e0f2fe; root.theme-text-color=#c7e8f8; root.overlay-background-color=#061827; root.overlay-text-color=#e0f2fe; }
+                                }
+                                ColorChoice {
+                                    label: "Violet palette"; choice-color: #a78bfa; selected: root.theme-button-accent-color == #a78bfa;
+                                    chosen => { root.theme-background-top-color=#170f27; root.theme-background-bottom-color=#08050f; root.theme-window-color=#1a1029; root.theme-button-accent-color=#a78bfa; root.theme-title-color=#f1eaff; root.theme-text-color=#ded2f6; root.overlay-background-color=#160d24; root.overlay-text-color=#f1eaff; }
+                                }
+                                ColorChoice {
+                                    label: "Rose palette"; choice-color: #fb7185; selected: root.theme-button-accent-color == #fb7185;
+                                    chosen => { root.theme-background-top-color=#251015; root.theme-background-bottom-color=#0e0507; root.theme-window-color=#281217; root.theme-button-accent-color=#fb7185; root.theme-title-color=#fff1f2; root.theme-text-color=#f7d4d9; root.overlay-background-color=#240e14; root.overlay-text-color=#fff1f2; }
+                                }
+                            }
+                            Rectangle { height: 1px; background: #1c3a2a; }
+                            Text { text: "Overlay opacity: " + root.overlay-opacity; color: #d6e9dc; font-size: 12px; font-weight: 600; }
+                            Slider { minimum: 0.3; maximum: 1.0; value <=> root.overlay-opacity; }
+                            Text { text: "The overlay remains movable and always on top while transcription is active."; color: #9cafa5; font-size: 12px; wrap: word-wrap; }
 
+                            Rectangle {
+                                height: 116px; border-radius: 10px; background: root.theme-window-color; border-width: 1px; border-color: #244534;
+                                Text { x: 14px; y: 12px; text: "Overlay preview"; color: #9cafa5; font-size: 12px; }
                                 Rectangle {
-                                    height: 116px; border-radius: 10px; background: #07140e; border-width: 1px; border-color: #244534;
-                                    Text { x: 14px; y: 12px; text: "Overlay preview"; color: #779383; font-size: 10px; }
-                                    Rectangle {
-                                        x: 14px; y: 35px; width: parent.width - 28px; height: 64px; border-radius: 8px;
-                                        background: root.overlay-background-color; opacity: root.overlay-opacity; border-width: 1px; border-color: #3b5848;
-                                        Text { x: 12px; y: 10px; text: "Live"; color: root.theme-button-accent-color; font-size: 10px; }
-                                        Text { x: 12px; y: 29px; text: "Your words will appear here as you speak."; color: root.overlay-text-color; font-size: 12px; }
-                                    }
+                                    x: 14px; y: 35px; width: parent.width - 28px; height: 64px; border-radius: 8px;
+                                    background: root.overlay-background-color; opacity: root.overlay-opacity; border-width: 1px; border-color: #3b5848;
+                                    Text { x: 12px; y: 10px; text: "Live"; color: root.theme-button-accent-color; font-size: 12px; }
+                                    Text { x: 12px; y: 29px; text: "Your words will appear here as you speak."; color: root.overlay-text-color; font-size: 12px; }
                                 }
                             }
                         }
+                                        Rectangle {
+                    height: 40px;
+                    Rectangle { width: parent.width; height: 1px; background: #ffffff18; }
+                    HorizontalBox {
+                        padding: 0px; padding-top: 4px; spacing: 6px;
+                        Text { text: root.settings-dirty ? "Unsaved changes" : "All changes saved"; color: root.settings-dirty ? root.theme-button-accent-color : #94a3b8; font-size: 12px; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        ActionButton { text: "Save settings"; primary: true; accent: root.theme-button-accent-color; enabled: !root.is-recording && !root.is-finalizing && !root.local-download-progress-visible; clicked => { root.apply-settings(); } }
                     }
                 }
-
-                HorizontalBox {
-                    height: 40px;
-                    Rectangle { horizontal-stretch: 1; background: transparent; }
-                    Button { text: "Save settings"; primary: true; enabled: !root.is-recording && !root.is-finalizing && !root.local-download-progress-visible; clicked => { root.apply-settings(); } }
+                    }
                 }
             }
         }
+    }
+
+    if root.navigation-hint != "" && !root.update-panel-visible && !root.unsaved-settings-prompt-visible && !root.local-download-prompt-visible && !root.local-download-progress-visible && !root.post-model-download-prompt-visible && !root.post-model-installing : Rectangle {
+        x: 48px; y: root.navigation-hint-y;
+        width: hint-text.preferred-width + 16px; height: 32px;
+        border-radius: 4px; background: #173b2a; border-color: #589970; border-width: 1px;
+        accessible-role: none;
+        hint-text := Text { x: 8px; height: parent.height; text: root.navigation-hint; color: #edfff2; font-size: 12px; vertical-alignment: center; }
     }
 
     if root.update-panel-visible : Rectangle {
@@ -940,33 +663,35 @@ export component AppWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             width: 520px;
-            height: root.update-release-notes == "" ? 270px : 350px;
-            background: #0b2117;
+            height: dialog0.preferred-height;
+            background: root.theme-window-color;
             border-color: root.update-state == 4 ? #7f3345 : #2a5a40;
             border-width: 1px;
             border-radius: 14px;
             drop-shadow-blur: 18px;
             drop-shadow-color: #00000080;
 
-            VerticalBox {
-                padding: 24px;
+            dialog0 := VerticalBox { alignment: start;
+                padding: 20px;
                 spacing: 13px;
-                Text { text: root.update-available-version == "" ? "Echo updates" : "Echo " + root.update-available-version + " is available"; color: #edfff2; font-size: 21px; font-weight: 700; }
+                Text { text: root.update-available-version == "" ? "Echo updates" : "Echo " + root.update-available-version + " is available"; color: #edfff2; font-size: 19px; wrap: word-wrap; font-weight: 700; }
                 Text { text: "Installed version: " + root.app-version; color: #91aa9b; font-size: 11px; }
                 Text { text: root.update-status; color: root.update-state == 4 ? #fda4af : #b7d2bf; wrap: word-wrap; font-size: 12px; }
                 if root.update-release-notes != "" : Rectangle {
-                    height: 80px; border-radius: 8px; background: #081911; border-width: 1px; border-color: #1c3a2a; clip: true;
-                    Text { x: 12px; y: 10px; width: parent.width - 24px; height: parent.height - 20px; text: root.update-release-notes; color: #a9c3b2; wrap: word-wrap; overflow: elide; font-size: 11px; }
+                    height: 80px; border-radius: 8px; background: root.theme-window-color; border-width: 1px; border-color: #1c3a2a; clip: true;
+                    ScrollView { x: 12px; y: 10px; width: parent.width - 24px; height: parent.height - 20px;
+                        Text { text: root.update-release-notes; color: #a9c3b2; wrap: word-wrap; font-size: 12px; }
+                    }
                 }
                 if root.update-state == 3 : Rectangle {
-                    height: 8px; border-radius: 4px; background: #10271c; clip: true;
+                    height: 8px; border-radius: 4px; background: root.theme-window-color; clip: true;
                     Rectangle { width: parent.width * root.update-progress; height: parent.height; border-radius: 4px; background: root.theme-button-accent-color; }
                 }
-                HorizontalBox {
+                HorizontalBox { height: 32px; padding: 0px; alignment: end;
                     spacing: 10px;
-                    if root.update-available-version != "" && root.update-state != 1 && root.update-state != 3 : Button { text: root.update-state == 4 ? "Retry" : "Install now"; primary: true; clicked => { root.install-update(); } }
-                    if root.update-available-version == "" && root.update-state != 1 : Button { text: "Check now"; primary: true; enabled: root.updater-configured; clicked => { root.check-for-updates(); } }
-                    Button { text: "Later"; enabled: root.update-state != 3; clicked => { root.update-panel-visible = false; } }
+                    if root.update-available-version != "" && root.update-state != 1 && root.update-state != 3 : ActionButton { accent: root.theme-button-accent-color; text: root.update-state == 4 ? "Retry" : "Install now"; primary: true; clicked => { root.install-update(); } }
+                    if root.update-available-version == "" && root.update-state != 1 : ActionButton { accent: root.theme-button-accent-color; text: "Check now"; primary: true; enabled: root.updater-configured; clicked => { root.check-for-updates(); } }
+                    ActionButton { accent: root.theme-button-accent-color; text: "Later"; enabled: root.update-state != 3; clicked => { root.update-panel-visible = false; } }
                 }
             }
         }
@@ -979,31 +704,31 @@ export component AppWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             width: 540px;
-            height: root.local-download-progress-visible ? 218px : root.local-uses-gpu ? 360px : 300px;
-            background: #0b2117;
+            height: dialog1.preferred-height;
+            background: root.theme-window-color;
             border-color: #2a5a40;
             border-width: 1px;
             border-radius: 14px;
             drop-shadow-blur: 18px;
             drop-shadow-color: #00000080;
 
-            VerticalBox {
-                padding: 24px;
+            dialog1 := VerticalBox { alignment: start;
+                padding: 20px;
                 spacing: 13px;
-                Text { text: root.local-download-progress-visible ? "Installing local speech" : "Install local speech files?"; color: #edfff2; font-size: 21px; font-weight: 700; }
+                Text { text: root.local-download-progress-visible ? "Installing local speech" : "Install local speech files?"; color: #edfff2; font-size: 19px; wrap: word-wrap; font-weight: 700; }
                 if root.local-download-prompt-visible && root.local-download-error != "" : Text { text: root.local-download-error; color: #fda4af; wrap: word-wrap; }
                 Text {
                     text: root.local-download-progress-visible ? root.local-download-status : root.local-uses-gpu ? root.ultra-download-description : "Selected: " + root.local-model-text + ". About 465 MB will be downloaded; Echo verifies the pinned SHA-256 before installing Parakeet and Silero.";
                     color: #a9c3b2; wrap: word-wrap; font-size: 12px;
                 }
                 if root.local-download-progress-visible : Rectangle {
-                    height: 14px; background: #193427; border-radius: 7px;
+                    height: 14px; background: root.theme-window-color; border-radius: 7px;
                     Rectangle { width: parent.width * Math.max(0, Math.min(1, root.local-download-progress)); height: parent.height; background: root.theme-button-accent-color; border-radius: 7px; animate width { duration: 100ms; } }
                 }
-                if !root.local-download-progress-visible : HorizontalBox {
+                if !root.local-download-progress-visible : HorizontalBox { height: 32px; padding: 0px; alignment: end;
                     spacing: 10px;
-                    Button { text: "Download and install"; primary: true; clicked => { root.accept-local-model-download(); } }
-                    Button { text: "Not now"; clicked => { root.decline-local-model-download(); } }
+                    ActionButton { accent: root.theme-button-accent-color; text: "Download and install"; primary: true; clicked => { root.accept-local-model-download(); } }
+                    ActionButton { accent: root.theme-button-accent-color; text: "Not now"; clicked => { root.decline-local-model-download(); } }
                 }
             }
         }
@@ -1016,24 +741,24 @@ export component AppWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             width: 500px;
-            height: 230px;
-            background: #0b2117;
+            height: dialog2.preferred-height;
+            background: root.theme-window-color;
             border-color: #2a5a40;
             border-width: 1px;
             border-radius: 14px;
             drop-shadow-blur: 18px;
             drop-shadow-color: #00000080;
 
-            VerticalBox {
-                padding: 24px;
+            dialog2 := VerticalBox { alignment: start;
+                padding: 20px;
                 spacing: 14px;
-                Text { text: "Save settings changes?"; color: #edfff2; font-size: 21px; font-weight: 700; }
+                Text { text: "Save settings changes?"; color: #edfff2; font-size: 19px; wrap: word-wrap; font-weight: 700; }
                 Text { text: "You changed one or more settings. Save them before leaving this page?"; color: #a9c3b2; wrap: word-wrap; font-size: 12px; }
-                HorizontalBox {
+                HorizontalBox { height: 32px; padding: 0px; alignment: end;
                     spacing: 10px;
-                    Button { text: "Save"; primary: true; clicked => { root.save-unsaved-settings(); } }
-                    Button { text: "Don't save"; clicked => { root.discard-unsaved-settings(); } }
-                    Button { text: "Cancel"; clicked => { root.cancel-unsaved-settings(); } }
+                    ActionButton { accent: root.theme-button-accent-color; text: "Save"; primary: true; clicked => { root.save-unsaved-settings(); } }
+                    ActionButton { accent: root.theme-button-accent-color; text: "Don't save"; clicked => { root.discard-unsaved-settings(); } }
+                    ActionButton { accent: root.theme-button-accent-color; text: "Cancel"; clicked => { root.cancel-unsaved-settings(); } }
                 }
             }
         }
@@ -1044,43 +769,30 @@ export component AppWindow inherits Window {
         TouchArea { clicked => {} }
         Rectangle {
             x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-            width: 500px; height: 320px; background: #0b2117; border-color: #2a5a40; border-width: 1px; border-radius: 14px;
-            VerticalBox {
-                padding: 24px; spacing: 14px;
-                Text { text: root.post-model-installing ? "Installing punctuation and capitalization model" : root.post-model-ready ? "Ready to use" : "Install punctuation and capitalization model?"; color: #edfff2; font-size: 21px; font-weight: 700; }
+            width: 500px; height: dialog3.preferred-height; background: root.theme-window-color; border-color: #2a5a40; border-width: 1px; border-radius: 14px;
+            dialog3 := VerticalBox { alignment: start;
+                padding: 20px; spacing: 14px;
+                Text { text: root.post-model-installing ? "Installing punctuation and capitalization model" : root.post-model-ready ? "Ready to use" : "Install punctuation and capitalization model?"; color: #edfff2; font-size: 19px; wrap: word-wrap; font-weight: 700; }
                 Text { text: "Post-processing uses a local 7.6 MB CPU model. Echo downloads a 30 MB package over HTTPS and verifies its SHA-256 before installing it."; color: #a9c3b2; wrap: word-wrap; font-size: 12px; }
-                VerticalBox { spacing: 7px;
+                VerticalBox { alignment: start; spacing: 7px;
                     Text { text: root.post-model-status; color: #a9c3b2; font-size: 11px; wrap: word-wrap; }
-                    Rectangle { height: 14px; background: #193427; border-radius: 7px; Rectangle { width: parent.width * Math.max(0, Math.min(1, root.post-model-progress)); height: parent.height; background: root.theme-button-accent-color; border-radius: 7px; animate width { duration: 100ms; } } }
+                    Rectangle { height: 14px; background: root.theme-window-color; border-radius: 7px; Rectangle { width: parent.width * Math.max(0, Math.min(1, root.post-model-progress)); height: parent.height; background: root.theme-button-accent-color; border-radius: 7px; animate width { duration: 100ms; } } }
                 }
-                if !root.post-model-installing : HorizontalBox { spacing: 10px;
-                    if !root.post-model-ready : Button { text: "Download and install"; primary: true; enabled: !root.is-recording && !root.is-finalizing; clicked => { root.download-post-processing-model(); } }
-                    Button { text: root.post-model-ready ? "Done" : "Not now"; clicked => { root.post-model-download-prompt-visible = false; root.decline-post-processing-model-download(); } }
+                if !root.post-model-installing : HorizontalBox { height: 32px; padding: 0px; alignment: end; spacing: 10px;
+                    if !root.post-model-ready : ActionButton { accent: root.theme-button-accent-color; text: "Download and install"; primary: true; enabled: !root.is-recording && !root.is-finalizing; clicked => { root.download-post-processing-model(); } }
+                    ActionButton { accent: root.theme-button-accent-color; text: root.post-model-ready ? "Done" : "Not now"; clicked => { root.post-model-download-prompt-visible = false; root.decline-post-processing-model-download(); } }
                 }
             }
         }
     }
 
-    if root.context-menu-visible && !root.post-model-download-prompt-visible && !root.post-model-installing && !root.local-download-prompt-visible && !root.local-download-progress-visible && !root.unsaved-settings-prompt-visible && !root.update-panel-visible : Rectangle {
-        x: 0; y: 0; width: root.width; height: root.height;
-        TouchArea { clicked => { root.context-menu-visible = false; } }
-        Rectangle {
-            x: root.context-menu-x; y: root.context-menu-y; width: 170px; height: 38px;
-            background: #12291d; border-radius: 7px; border-width: 1px; border-color: #31523f;
-            TouchArea {
-                clicked => {
-                    root.copy-transcript(root.context-menu-index);
-                    root.context-menu-visible = false;
-                }
-                Text { x: 12px; width: parent.width - 24px; height: parent.height; text: "Copy to clipboard"; color: #e2f5e8; font-size: 12px; vertical-alignment: center; }
-            }
-        }
-    }
 }
 
 export component HotkeyCaptureWindow inherits Window {
+    default-font-family: "Arial";
     title: "Capture Hotkey";
-    icon: @image-url("../eleventhecho.png");
+    in property <image> application-icon: @image-url("../eleventhecho.png");
+    icon: root.application-icon;
     width: 390px;
     height: 190px;
     background: #07140e;
@@ -1091,7 +803,7 @@ export component HotkeyCaptureWindow inherits Window {
     Rectangle {
         x: 16px; y: 16px; width: parent.width - 32px; height: parent.height - 32px;
         border-radius: 12px; background: #0b2117; border-width: 1px; border-color: #28513a;
-        VerticalBox {
+        VerticalBox { alignment: start;
             padding: 20px; spacing: 12px;
             Text { text: "Press your shortcut"; color: #effff3; font-size: 19px; font-weight: 700; }
             Text { text: root.state-text; color: #91aa9b; wrap: word-wrap; }
@@ -1101,7 +813,11 @@ export component HotkeyCaptureWindow inherits Window {
 }
 
 export component TranscriptOverlayWindow inherits Window {
+    default-font-family: "Arial";
     title: "Echo Live";
+    // Animate content, never the native icon of this frameless window:
+    // WM_SETICON can repaint non-client chrome on Windows.
+    in property <image> recording-indicator: @image-url("../eleventhecho.png");
     icon: @image-url("../eleventhecho.png");
     no-frame: true;
     always-on-top: true;
@@ -1143,9 +859,8 @@ export component TranscriptOverlayWindow inherits Window {
                 border-radius: 10px;
                 background: root.is-error ? #5a1827 : #123b27;
                 Image {
-                    x: 4px; y: 4px; width: 12px; height: 12px;
-                    source: @image-url("../assets/icons/speech.svg");
-                    colorize: root.is-error ? #fda4af : #4ade80;
+                    x: 0px; y: 0px; width: 20px; height: 20px;
+                    source: root.recording-indicator;
                     image-fit: contain;
                 }
             }

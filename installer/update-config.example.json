@@ -4,7 +4,6 @@
   "secret_key_path": "C:\\secure\\echo-update.key",
   "release_notes_path": "",
   "authenticode_required": false,
-  "ultra_enabled": true,
   "publish_host": "your-ssh-host-alias",
   "publish_path": "/var/www/your-site/echo/updates/stable"
 }

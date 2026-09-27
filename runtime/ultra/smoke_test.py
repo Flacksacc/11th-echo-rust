@@ -1,6 +1,6 @@
-"""Opt-in GPU test of the actual bundled helper; does not use microphone or network.
+"""Opt-in GPU test of the private helper; does not use microphone or network.
 
-python runtime/ultra/smoke_test.py --python <bundle>/python.exe --model-dir <weights> --wav <16k mono PCM wav>
+python runtime/ultra/smoke_test.py --python <runtime>/python.exe --model-dir <weights> --wav <16k mono PCM wav>
 """
 import argparse
 import importlib.util
@@ -25,7 +25,7 @@ def main():
         if (audio.getframerate(), audio.getnchannels(), audio.getsampwidth()) != (16000, 1, 2):
             parser.error("Use 16 kHz mono PCM16 WAV")
         samples = audio.readframes(audio.getnframes())
-    process = subprocess.Popen([args.python, "-I", str(Path(__file__).with_name("helper.py").resolve()), "--model-dir", args.model_dir], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    process = subprocess.Popen([args.python, "-I", str(Path(__file__).with_name("helper.py").resolve()), "--model-dir", args.model_dir], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     watchdog = threading.Timer(240, process.kill)
     watchdog.start()
     started = time.monotonic()

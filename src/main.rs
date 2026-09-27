@@ -7,6 +7,7 @@ mod audio;
 mod diagnostics;
 mod gemini;
 mod hotkey;
+mod icon_animation;
 mod injector;
 mod pipeline;
 mod post_processing;
@@ -16,7 +17,6 @@ mod state;
 mod transcription;
 mod updater;
 
-use arboard::Clipboard;
 use chrono::Local;
 use pipeline::TranscriptPipeline;
 use settings::{
@@ -34,6 +34,29 @@ use std::sync::{
 use std::thread;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
+
+const MAX_TRANSCRIPT_DISPLAY_LINES: usize = 100;
+
+fn transcript_history_text(history: &[TranscriptHistoryEntry]) -> String {
+    // Persisted history is already newest-first. Format once per commit,
+    // away from the UI event loop, without creating controls per entry.
+    let mut lines = Vec::with_capacity(MAX_TRANSCRIPT_DISPLAY_LINES);
+    for entry in history {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        let text = entry.display_text();
+        lines.extend(
+            text.lines()
+                .take(MAX_TRANSCRIPT_DISPLAY_LINES - lines.len())
+                .map(str::to_owned),
+        );
+        if lines.len() == MAX_TRANSCRIPT_DISPLAY_LINES {
+            break;
+        }
+    }
+    lines.join("\n")
+}
 
 fn begin_update_check(
     ui: slint::Weak<AppWindow>,
@@ -774,6 +797,29 @@ fn reset_overlay_to_listening(overlay: &TranscriptOverlayWindow, microphone_name
     show_overlay_without_activation(overlay);
 }
 
+fn show_model_loading_notice(overlay: &TranscriptOverlayWindow) {
+    overlay.set_sentence_text("Model is loading. No audio is being recorded. Please wait, then press your recording shortcut again.".into());
+    overlay.set_microphone_name("Parakeet Ultra · Loading".into());
+    overlay.set_is_system_message(true);
+    overlay.set_is_error(false);
+    overlay.set_audio_level(0.0);
+    overlay.set_is_visible(true);
+    set_overlay_height(overlay, OVERLAY_HEIGHT);
+    show_overlay_without_activation(overlay);
+}
+
+fn ultra_recording_blocked(
+    provider: transcription::TranscriptionProvider,
+    model: transcription::LocalModel,
+    status: &transcription::LocalEngineStatus,
+) -> bool {
+    matches!(
+        provider,
+        transcription::TranscriptionProvider::LocalSherpaOnnx
+    ) && model.uses_gpu()
+        && !matches!(status, transcription::LocalEngineStatus::Ready)
+}
+
 /// Display the prepared live overlay through Slint's supported window API.
 #[cfg(target_os = "windows")]
 fn show_overlay_without_activation(overlay: &TranscriptOverlayWindow) {
@@ -793,6 +839,9 @@ fn show_overlay_without_activation(overlay: &TranscriptOverlayWindow) {
     let overlay_after_show = overlay.as_weak();
     slint::Timer::single_shot(std::time::Duration::ZERO, move || {
         if let Some(overlay) = overlay_after_show.upgrade() {
+            if let Err(err) = configure_overlay_as_non_activating(&overlay) {
+                echo_warn!("overlay", "Could not refresh frameless style: {err}");
+            }
             if let Err(err) = apply_overlay_rounded_region(&overlay) {
                 echo_warn!("overlay", "Could not apply rounded window region: {err}");
             }
@@ -848,17 +897,21 @@ fn clamp_overlay_position(
 #[cfg(target_os = "windows")]
 fn overlay_hwnd() -> Result<HWND, Box<dyn std::error::Error>> {
     unsafe {
-        let hwnd = FindWindowW(None, windows::core::w!("Echo Live"));
-        if hwnd.0 == 0 {
-            return Err("Windows could not find the Echo live overlay".into());
+        use windows::Win32::UI::WindowsAndMessaging::FindWindowExW;
+        let mut previous = HWND::default();
+        loop {
+            let hwnd = FindWindowExW(None, previous, None, windows::core::w!("Echo Live"));
+            if hwnd.0 == 0 {
+                return Err("Windows could not find this process's Echo live overlay".into());
+            }
+            let mut owner_process_id = 0;
+            if GetWindowThreadProcessId(hwnd, Some(&mut owner_process_id)) != 0
+                && owner_process_id == std::process::id()
+            {
+                return Ok(hwnd);
+            }
+            previous = hwnd;
         }
-        let mut owner_process_id = 0;
-        if GetWindowThreadProcessId(hwnd, Some(&mut owner_process_id)) == 0
-            || owner_process_id != std::process::id()
-        {
-            return Err("The Echo live overlay belongs to another process".into());
-        }
-        Ok(hwnd)
     }
 }
 
@@ -901,6 +954,24 @@ fn configure_overlay_as_non_activating(
         let overlay_style =
             existing_style | WS_EX_NOACTIVATE.0 as isize | WS_EX_TOOLWINDOW.0 as isize;
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, overlay_style);
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SWP_NOZORDER, WS_CAPTION, WS_THICKFRAME,
+        };
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let frameless = style & !(WS_CAPTION.0 as isize | WS_THICKFRAME.0 as isize);
+        if style != frameless {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, frameless);
+            SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+            )?;
+        }
     }
     Ok(())
 }
@@ -918,28 +989,8 @@ fn default_overlay_position() -> slint::LogicalPosition {
     slint::LogicalPosition::new(24.0, 820.0)
 }
 
-#[cfg(target_os = "windows")]
-fn load_tray_icon() -> Result<tray_icon::Icon, Box<dyn std::error::Error>> {
-    let mut candidates = Vec::new();
-    if let Some(executable_dir) = std::env::current_exe()?.parent() {
-        candidates.push(executable_dir.join("eleventhecho.png"));
-        candidates.push(executable_dir.join("eleventhecho.ico"));
-    }
-    candidates.push(std::path::PathBuf::from("eleventhecho.png"));
-    candidates.push(std::path::PathBuf::from("eleventhecho.ico"));
-
-    let mut failures = Vec::new();
-    for path in candidates {
-        match tray_icon::Icon::from_path(&path, None) {
-            Ok(icon) => return Ok(icon),
-            Err(err) => failures.push(format!("{}: {err}", path.display())),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("No usable tray icon was found ({})", failures.join("; ")),
-    )
-    .into())
+fn activity_log_refresh_needed(tab: i32, selected_bytes: i32, revision: u64, seen: u64) -> bool {
+    tab == 2 && selected_bytes == 0 && revision != seen
 }
 
 fn select_ui_backend() -> Result<(), slint::PlatformError> {
@@ -1350,12 +1401,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_transcript_history = load_transcript_history();
     let transcript_history_store = Arc::new(Mutex::new(initial_transcript_history.clone()));
     let transcript_history_revision = Arc::new(AtomicU64::new(0));
-    let transcript_raw_for_clipboard = Arc::new(Mutex::new(
-        initial_transcript_history
-            .iter()
-            .map(|entry| entry.text.clone())
-            .collect::<Vec<_>>(),
-    ));
     if matches!(
         transcription::TranscriptionProvider::from_id(&initial_settings.transcription_provider),
         transcription::TranscriptionProvider::LocalSherpaOnnx
@@ -1402,14 +1447,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let icons = icon_animation::Icons::load()?;
     #[cfg(target_os = "windows")]
-    let (quit_item_id, settings_item_id, _tray_icon) = {
+    let (quit_item_id, settings_item_id, tray_icon) = {
         let tray_menu = Menu::new();
         let settings_item = MenuItem::new("Settings Tab", true, None);
         let quit_item = MenuItem::new("Quit", true, None);
         tray_menu.append_items(&[&settings_item, &quit_item])?;
 
-        let icon = load_tray_icon()?;
+        let icon = icons.idle.tray.clone();
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu))
             .with_tooltip("Echo")
@@ -1648,12 +1694,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &initial_settings.theme_text_color,
         Color::from_rgb_u8(204, 239, 214),
     ));
-    ui.set_transcript_history(ModelRc::new(VecModel::from(
-        initial_transcript_history
-            .iter()
-            .map(|entry| SharedString::from(entry.display_text()))
-            .collect::<Vec<_>>(),
-    )));
+    ui.set_transcript_history_text(transcript_history_text(&initial_transcript_history).into());
     let initial_activity = diagnostics::session_snapshot();
     let initial_activity_revision = initial_activity.revision;
     ui.set_activity_log_text(initial_activity.text.into());
@@ -1774,22 +1815,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings_for_runtime = settings.clone();
     let cmd_tx_for_runtime = cmd_tx.clone();
 
-    ui.on_copy_transcript({
-        let raw = transcript_raw_for_clipboard.clone();
-        move |index| {
-            if let Ok(hist) = raw.lock() {
-                if let Some(text) = hist.get(index as usize) {
-                    if let Ok(mut cb) = Clipboard::new() {
-                        let _ = cb.set_text(text.clone());
-                    }
-                }
-            }
-        }
-    });
-
     let transcript_history_for_runtime = transcript_history_store.clone();
     let transcript_history_revision_for_runtime = transcript_history_revision.clone();
-    let transcript_raw_for_runtime = transcript_raw_for_clipboard.clone();
     thread::spawn(move || {
         let rt = Runtime::new().unwrap();
         rt.block_on(async move {
@@ -1985,6 +2012,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     continue;
                             }
 
+                            if ultra_recording_blocked(provider, current_settings.local_sherpa.model,
+                                &transcription::local_engine_status_for(&current_settings.local_sherpa))
+                            {
+                                // Never attach/forward microphone audio while Ultra is loading.
+                                transcription::preload_local_engine(&current_settings.local_sherpa);
+                                echo_info!("session", "Start rejected: Ultra model is loading; no audio session created");
+                                let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
+                                    ui.set_model_loading_notice_visible(true);
+                                    ui.set_status_text("Parakeet Ultra model is loading…".into());
+                                    ui.set_is_recording(false);
+                                    ui.set_is_finalizing(false);
+                                    ui.set_has_error(false);
+                                });
+                                let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
+                                    show_model_loading_notice(&overlay);
+                                });
+                                continue;
+                            }
+
+                            let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
+                                ui.set_model_loading_notice_visible(false);
+                            });
                             let current_session_epoch =
                                 session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -2142,7 +2191,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let transcript_history_for_text = transcript_history_for_runtime.clone();
                                     let transcript_history_revision_for_text =
                                         transcript_history_revision_for_runtime.clone();
-                                    let transcript_raw_for_cb = transcript_raw_for_runtime.clone();
                                     let log_line_tx_for_text = log_line_tx.clone();
                                     let settings_for_text = settings_for_runtime.clone();
                                     let finalize_tx_for_transcript = finalize_tx.clone();
@@ -2445,24 +2493,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                                     current_session_epoch
                                                                 );
                                                             }
-                                                            *transcript_raw_for_cb.lock().unwrap() = history
-                                                                .iter()
-                                                                .map(|entry| entry.text.clone())
-                                                                .collect();
                                                             let revision = transcript_history_revision_for_text
                                                                 .fetch_add(1, Ordering::SeqCst)
                                                                 + 1;
                                                             (history.clone(), revision)
                                                         };
-                                                        let items = history_snapshot
-                                                            .iter()
-                                                            .map(|entry| SharedString::from(entry.display_text()))
-                                                            .collect::<Vec<_>>();
+                                                        let history_text = transcript_history_text(&history_snapshot);
                                                         let revision_for_ui =
                                                             transcript_history_revision_for_text.clone();
                                                         let _ = ui_handle_for_transcript.upgrade_in_event_loop(move |ui| {
                                                             if revision_for_ui.load(Ordering::SeqCst) == revision {
-                                                                ui.set_transcript_history(ModelRc::new(VecModel::from(items)));
+                                                                ui.set_transcript_history_text(history_text.into());
+                                                                if ui.get_active_tab() == 0 {
+                                                                    ui.set_content_scroll_y(0.0);
+                                                                }
                                                             }
                                                         });
                                                         let _ = log_line_tx_for_text.send(format!(
@@ -2811,17 +2855,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     }
                                     });
-    });
-    let start_tx = cmd_tx.clone();
-    ui.on_start_recording(move || {
-        echo_info!("ui", "Start recording invoked from main window");
-        let _ = start_tx.send(AppCommand::StartRecording);
-    });
-
-    let stop_tx = cmd_tx.clone();
-    ui.on_stop_recording(move || {
-        echo_info!("ui", "Stop recording invoked from main window");
-        let _ = stop_tx.send(AppCommand::StopRecording);
     });
 
     let settings_for_ui = settings.clone();
@@ -3462,36 +3495,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let ui_weak_for_clear = ui.as_weak();
-    let transcript_history_for_clear = transcript_history_store.clone();
-    let transcript_history_revision_for_clear = transcript_history_revision.clone();
-    let transcript_raw_for_clear = transcript_raw_for_clipboard.clone();
-    ui.on_clear_transcript(move || {
-        echo_info!("history", "User requested transcript history clear");
-        if !save_transcript_history(&[]) {
-            echo_error!("history", "Failed to clear persisted transcript history");
-            if let Some(ui) = ui_weak_for_clear.upgrade() {
-                ui.set_has_error(true);
-                ui.set_status_text(
-                    "Could not clear transcript history; the existing history was kept".into(),
-                );
-            }
-            return;
-        }
-        {
-            let mut history = transcript_history_for_clear.lock().unwrap();
-            history.clear();
-            transcript_raw_for_clear.lock().unwrap().clear();
-            transcript_history_revision_for_clear.fetch_add(1, Ordering::SeqCst);
-        }
-        if let Some(ui) = ui_weak_for_clear.upgrade() {
-            ui.set_has_error(false);
-            ui.set_status_text("Transcript history cleared".into());
-            ui.set_transcript("".into());
-            ui.set_transcript_history(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
-        }
-    });
-
     let ui_handle_for_timer = ui.as_weak();
     let cmd_tx_for_timer = cmd_tx.clone();
     let settings_for_timer = settings.clone();
@@ -3513,6 +3516,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let activity_revision_for_timer = activity_revision_seen.clone();
     let ui_weak_for_activity_timer = ui.as_weak();
+    let icon_timer = slint::Timer::default();
+    let icon_ui = ui.as_weak();
+    let icon_overlay = transcript_overlay.as_weak();
+    #[cfg(windows)]
+    let icon_hotkey = hotkey_capture_window.as_weak();
+    let mut animation_start = None::<std::time::Instant>;
+    let mut previous_frame = None;
+    icon_timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(50),
+        move || {
+            let Some(ui) = icon_ui.upgrade() else {
+                return;
+            };
+            let index = if ui.get_is_recording() || ui.get_is_finalizing() {
+                let start = animation_start.get_or_insert_with(std::time::Instant::now);
+                Some(icons.index(start.elapsed()))
+            } else {
+                animation_start = None;
+                None
+            };
+            if previous_frame == Some(index) {
+                return;
+            }
+            previous_frame = Some(index);
+            let frame = index.map_or(&icons.idle, |index| &icons.frames[index]);
+            ui.set_application_icon(frame.image.clone());
+            if let Some(overlay) = icon_overlay.upgrade() {
+                overlay.set_recording_indicator(frame.image.clone());
+            }
+            #[cfg(windows)]
+            {
+                if let Some(hotkey) = icon_hotkey.upgrade() {
+                    hotkey.set_application_icon(frame.image.clone());
+                }
+                if let Some(tray) = &tray_icon {
+                    let _ = tray.set_icon(Some(frame.tray.clone()));
+                }
+                frame.update_taskbar();
+            }
+        },
+    );
+
     let activity_timer = slint::Timer::default();
     activity_timer.start(
         slint::TimerMode::Repeated,
@@ -3521,11 +3567,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(ui) = ui_weak_for_activity_timer.upgrade() else {
                 return;
             };
-            if ui.get_active_tab() != 2 {
-                return;
-            }
             let revision = diagnostics::session_revision();
-            if revision == activity_revision_for_timer.get() {
+            if !activity_log_refresh_needed(
+                ui.get_active_tab(),
+                ui.get_selected_activity_bytes(),
+                revision,
+                activity_revision_for_timer.get(),
+            ) {
                 return;
             }
             let snapshot = diagnostics::session_snapshot();
@@ -3544,8 +3592,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if activation_event.take_request() {
                     show_main_window(&ui);
                 }
-                let saved = settings_for_timer.lock().unwrap().clone();
-                ui.set_settings_dirty(settings_editor_is_dirty(&ui, &saved));
+                let (saved_local, settings_dirty, local_gpu_selected) = {
+                    let saved = settings_for_timer.lock().unwrap();
+                    // The console needs no settings diff and no history clone.
+                    let dirty =
+                        (ui.get_active_tab() == 3).then(|| settings_editor_is_dirty(&ui, &saved));
+                    let local_gpu = matches!(
+                        transcription::TranscriptionProvider::from_id(&saved.transcription_provider),
+                        transcription::TranscriptionProvider::LocalSherpaOnnx
+                    ) && saved.local_sherpa.model.uses_gpu();
+                    (saved.local_sherpa.clone(), dirty, local_gpu)
+                };
+                if let Some(dirty) = settings_dirty {
+                    ui.set_settings_dirty(dirty);
+                }
 
                 let selected_provider = ui.get_transcription_provider_text().to_string();
                 let provider_changed = {
@@ -3567,11 +3627,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if provider_changed || model_changed {
                     local_offer_for_timer.set(false);
                 }
-                let mut selected_local = saved.local_sherpa.clone();
+                let mut selected_local = saved_local.clone();
                 selected_local.model =
                     transcription::LocalModel::from_id(&ui.get_local_model_text());
                 ui.set_local_engine_status_text(
-                    if selected_local.model != saved.local_sherpa.model {
+                    if selected_local.model != saved_local.model {
                         "Save settings to activate this model".to_string()
                     } else {
                         match transcription::local_engine_status_for(&selected_local) {
@@ -3617,6 +3677,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     overlay.set_overlay_opacity(ui.get_overlay_opacity());
                     overlay.set_overlay_background_color(ui.get_overlay_background_color());
                     overlay.set_overlay_text_color(ui.get_overlay_text_color());
+                    if ui.get_model_loading_notice_visible() && !local_gpu_selected {
+                        ui.set_model_loading_notice_visible(false);
+                        hide_overlay_window(&overlay);
+                    }
+                    if ui.get_model_loading_notice_visible() {
+                        match transcription::local_engine_status_for(&saved_local) {
+                            transcription::LocalEngineStatus::Ready => {
+                                ui.set_model_loading_notice_visible(false);
+                                ui.set_status_text("Parakeet Ultra ready".into());
+                                overlay.set_sentence_text("Model is ready. Press your recording shortcut to start dictation.".into());
+                                overlay.set_microphone_name("Parakeet Ultra · Ready".into());
+                                let weak_ui = ui.as_weak();
+                                let weak_overlay = overlay.as_weak();
+                                slint::Timer::single_shot(std::time::Duration::from_secs(3), move || {
+                                    if let (Some(ui), Some(overlay)) = (weak_ui.upgrade(), weak_overlay.upgrade()) {
+                                        if !ui.get_is_recording() && !ui.get_is_finalizing()
+                                            && !ui.get_model_loading_notice_visible()
+                                            && overlay.get_is_system_message() && !overlay.get_is_error()
+                                            && overlay.get_microphone_name() == "Parakeet Ultra · Ready" {
+                                            hide_overlay_window(&overlay);
+                                        }
+                                    }
+                                });
+                            }
+                            transcription::LocalEngineStatus::Failed(error) => {
+                                ui.set_model_loading_notice_visible(false);
+                                ui.set_has_error(true);
+                                ui.set_status_text(format!("Ultra could not load: {error}").into());
+                                overlay.set_is_error(true);
+                                overlay.set_sentence_text(format!("Model could not load: {error}").into());
+                            }
+                            _ => {}
+                        }
+                    }
                 }
 
                 #[cfg(target_os = "windows")]
@@ -3686,7 +3780,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                                 let _ = ui.show();
                             } else if ui.get_active_tab() == 3
-                                && settings_editor_is_dirty(&ui, &saved)
+                                && settings_editor_is_dirty(
+                                    &ui,
+                                    &settings_for_timer.lock().unwrap(),
+                                )
                             {
                                 ui.set_pending_navigation_tab(-2);
                                 ui.set_unsaved_settings_prompt_visible(true);
@@ -3801,7 +3898,7 @@ mod tests {
         let weak = ui.as_weak();
         slint::Timer::single_shot(Duration::from_millis(500), move || {
             let ui = weak.upgrade().unwrap();
-            for tab in 0..=5 {
+            for tab in 0..=4 {
                 ui.set_settings_tab(tab);
                 let pixels = ui.window().take_snapshot().unwrap();
                 assert!(pixels.width() >= 760 && pixels.height() >= 600);
@@ -3817,7 +3914,7 @@ mod tests {
             );
             ui.window()
                 .dispatch_event(slint::platform::WindowEvent::PointerMoved {
-                    position: slint::LogicalPosition::new(908.0, 365.0),
+                    position: slint::LogicalPosition::new(968.0, 72.0),
                 });
             save_ui_snapshot(
                 &ui.window().take_snapshot().unwrap(),
@@ -3878,7 +3975,9 @@ mod tests {
                 .collect::<Vec<_>>(),
         )));
         ui.set_ultra_gpu_status("Detected NVIDIA GPU: RTX 5080 (isolated UI fixture)".into());
-        ui.set_ultra_download_description("Parakeet Ultra: 1257 MB of model files and 2252 MB of GPU runtime. NVIDIA Ampere or newer required.".into());
+        ui.set_ultra_download_description(
+            super::transcription::ultra_download_description().into(),
+        );
         ui.set_local_engine_status_text("Ready".into());
         ui.set_active_tab(3);
         ui.set_settings_tab(1);
@@ -3903,7 +4002,7 @@ mod tests {
                 "echo-ultra-install.bmp",
             );
             ui.set_local_download_prompt_visible(false);
-            for tab in 0..=5 {
+            for tab in 0..=4 {
                 ui.set_settings_tab(tab);
                 let pixels = ui.window().take_snapshot().unwrap();
                 assert!(pixels.width() >= 760 && pixels.height() >= 600);
@@ -3912,6 +4011,460 @@ mod tests {
             slint::quit_event_loop().unwrap();
         });
         slint::run_event_loop().unwrap();
+    }
+
+    #[test]
+    fn activity_refresh_preserves_selection_and_catches_up_afterward() {
+        assert!(!super::activity_log_refresh_needed(2, 10, 2, 1));
+        assert!(super::activity_log_refresh_needed(2, 0, 2, 1));
+        assert!(!super::activity_log_refresh_needed(2, 0, 2, 2));
+        assert!(!super::activity_log_refresh_needed(0, 0, 2, 1));
+    }
+
+    #[test]
+    fn ultra_requires_ready_engine_before_recording() {
+        use super::transcription::{
+            LocalEngineStatus as Status, LocalModel, TranscriptionProvider as Provider,
+        };
+        for status in [
+            Status::Unloaded,
+            Status::Loading,
+            Status::Failed("failed".into()),
+        ] {
+            assert!(super::ultra_recording_blocked(
+                Provider::LocalSherpaOnnx,
+                LocalModel::ParakeetUltra,
+                &status
+            ));
+        }
+        assert!(!super::ultra_recording_blocked(
+            Provider::LocalSherpaOnnx,
+            LocalModel::ParakeetUltra,
+            &Status::Ready
+        ));
+        assert!(!super::ultra_recording_blocked(
+            Provider::LocalSherpaOnnx,
+            LocalModel::ParakeetTdtV2,
+            &Status::Unloaded
+        ));
+        assert!(!super::ultra_recording_blocked(
+            Provider::ElevenLabsRealtime,
+            LocalModel::ParakeetUltra,
+            &Status::Loading
+        ));
+    }
+
+    #[test]
+    fn transcript_document_limits_display_to_latest_100_lines() {
+        let history: Vec<_> = (0..500)
+            .map(|index| super::TranscriptHistoryEntry {
+                timestamp: index.to_string(),
+                text: format!("Message {index}"),
+            })
+            .collect();
+        let text = super::transcript_history_text(&history);
+        assert!(text.starts_with("[0] Message 0"));
+        assert!(text.lines().count() <= super::MAX_TRANSCRIPT_DISPLAY_LINES);
+        assert!(!text.contains("[50] Message 50"));
+        assert_eq!(history.len(), 500, "Display limits must not delete history");
+
+        let multiline = vec![super::TranscriptHistoryEntry {
+            timestamp: "new".into(),
+            text: (0..150)
+                .map(|i| format!("Line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }];
+        let text = super::transcript_history_text(&multiline);
+        assert_eq!(text.lines().count(), 100);
+        assert!(text.ends_with("Line 99"));
+        assert!(!text.contains("Line 100"));
+    }
+
+    #[test]
+    fn transcript_document_preserves_newest_first_history() {
+        let history = vec![
+            super::TranscriptHistoryEntry {
+                timestamp: "new".into(),
+                text: "Latest message".into(),
+            },
+            super::TranscriptHistoryEntry {
+                timestamp: "old".into(),
+                text: "Earlier message".into(),
+            },
+        ];
+        assert_eq!(
+            super::transcript_history_text(&history),
+            "[new] Latest message\n\n[old] Earlier message"
+        );
+        assert_eq!(super::transcript_history_text(&[]), "");
+        let source = include_str!("../ui/appwindow.slint");
+        assert_eq!(
+            source
+                .matches("transcript-text := SelectableDocument")
+                .count(),
+            1
+        );
+        assert!(!source.contains("for line[i]"));
+        assert!(source.contains("text: root.transcript-history-text;"));
+        assert!(source.contains("text: root.activity-log-text;"));
+        assert!(!source.contains("native-document"));
+        assert_eq!(source.matches("default-font-family: \"Arial\";").count(), 3);
+        assert!(!source.contains("Segoe UI"));
+        assert!(!source.contains("RECENT TRANSCRIPTS"));
+        assert!(!source.contains("text: \"Copy\""));
+    }
+
+    #[test]
+    #[ignore = "isolated 1000-line Activity selection/scroll performance check"]
+    fn activity_console_performance_smoke() {
+        use slint::ComponentHandle;
+        let ui = super::AppWindow::new().unwrap();
+        ui.set_active_tab(2);
+        ui.set_activity_log_text((0..1000).map(|i| format!("12:00:00 [{i:04}] Speech engine ready. This is a full-length diagnostic line for scrolling and selection.")).collect::<Vec<_>>().join("\n").into());
+        ui.window().set_size(slint::PhysicalSize::new(960, 720));
+        ui.show().unwrap();
+        let outcome = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let result_for_timer = outcome.clone();
+        let weak = ui.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_millis(300), move || {
+            let ui = weak.upgrade().unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = ui.window().take_snapshot().unwrap();
+                let position = slint::LogicalPosition::new(60.0, 53.0);
+                let button = slint::platform::PointerEventButton::Left;
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerPressed {
+                        position,
+                        button,
+                    });
+                let start = std::time::Instant::now();
+                for step in 0..12 {
+                    ui.window()
+                        .dispatch_event(slint::platform::WindowEvent::PointerMoved {
+                            position: slint::LogicalPosition::new(90.0 + step as f32 * 10.0, 53.0),
+                        });
+                    let _ = ui.window().take_snapshot().unwrap();
+                }
+                println!(
+                    "Activity selection: {:.1} ms/frame",
+                    start.elapsed().as_secs_f64() * 1000.0 / 12.0
+                );
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                        position: slint::LogicalPosition::new(210.0, 53.0),
+                        button,
+                    });
+                assert!(ui.get_selected_activity_bytes() > 0);
+                let start = std::time::Instant::now();
+                for _ in 0..12 {
+                    ui.window()
+                        .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                            position: slint::LogicalPosition::new(950.0, 350.0),
+                            delta_x: 0.0,
+                            delta_y: -100.0,
+                        });
+                    let _ = ui.window().take_snapshot().unwrap();
+                }
+                println!(
+                    "Activity scrolling: {:.1} ms/frame",
+                    start.elapsed().as_secs_f64() * 1000.0 / 12.0
+                );
+                assert!(ui.get_content_scroll_y() < 0.0);
+                save_ui_snapshot(
+                    &ui.window().take_snapshot().unwrap(),
+                    "echo-activity-performance.bmp",
+                );
+            }));
+            if result.is_err() {
+                *result_for_timer.borrow_mut() = Some(result);
+                ui.hide().unwrap();
+                slint::quit_event_loop().unwrap();
+            } else {
+                ui.set_active_tab(0);
+                let weak = ui.as_weak();
+                slint::Timer::single_shot(std::time::Duration::from_millis(100), move || {
+                    let ui = weak.upgrade().unwrap();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        assert_eq!(
+                            ui.get_selected_activity_bytes(),
+                            0,
+                            "Leaving Activity must clear the refresh pause"
+                        );
+                        ui.set_active_tab(2);
+                        let _ = ui.window().take_snapshot().unwrap();
+                        assert!(super::activity_log_refresh_needed(
+                            2,
+                            ui.get_selected_activity_bytes(),
+                            2,
+                            1
+                        ));
+                    }));
+                    *result_for_timer.borrow_mut() = Some(result);
+                    ui.hide().unwrap();
+                    slint::quit_event_loop().unwrap();
+                });
+            }
+        });
+        slint::run_event_loop().unwrap();
+        if let Err(panic) = outcome
+            .borrow_mut()
+            .take()
+            .expect("Activity check must finish")
+        {
+            std::panic::resume_unwind(panic);
+        };
+    }
+
+    #[test]
+    #[ignore = "renders isolated UI pages and dialogs; no recording, network, or settings writes"]
+    fn redesigned_ui_smoke() {
+        use slint::ComponentHandle;
+        let ui = super::AppWindow::new().unwrap();
+        let navigated = std::rc::Rc::new(std::cell::Cell::new(-1));
+        let outcome = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let timer_outcome = outcome.clone();
+        let flag = navigated.clone();
+        ui.on_request_navigation(move |tab| flag.set(tab));
+        let settings = super::AppSettings::default();
+        super::populate_settings_editor(&ui, &settings);
+        ui.set_hotkey_text("Ctrl + Space".into());
+        ui.set_app_version("0.1.9".into());
+        ui.set_ultra_download_description(
+            super::transcription::ultra_download_description().into(),
+        );
+        ui.set_activity_log_text(
+            "12:00  Ready\n12:01  Speech engine initialized\n12:02  Transcription completed".into(),
+        );
+        ui.set_transcript_history_text("A compact workspace leaves more room for the actual transcript.\n\nLonger transcripts wrap naturally. Select any text and copy it with Ctrl+C.".into());
+        let width = std::env::var("ECHO_UI_SMOKE_WIDTH")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(960);
+        let height = std::env::var("ECHO_UI_SMOKE_HEIGHT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(720);
+        ui.window()
+            .set_size(slint::PhysicalSize::new(width, height));
+        ui.show().unwrap();
+        let weak = ui.as_weak();
+        slint::Timer::single_shot(Duration::from_millis(500), move || {
+            let ui = weak.upgrade().unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                {
+                    for tab in [0, 2, 3] {
+                        ui.set_active_tab(tab);
+                        let pages = if tab == 3 { 5 } else { 1 };
+                        for page in 0..pages {
+                            ui.set_settings_tab(page);
+                            let pixels = ui.window().take_snapshot().unwrap();
+                            assert_eq!(
+                                (pixels.width(), pixels.height()),
+                                (width, height),
+                                "Run with SLINT_SCALE_FACTOR=1"
+                            );
+                            assert!(pixels.as_slice().iter().any(|p| p.r > 100));
+                            save_ui_snapshot(
+                                &pixels,
+                                &format!("echo-redesign-{width}-{tab}-{page}.bmp"),
+                            );
+                        }
+                    }
+                }
+                ui.set_unsaved_settings_prompt_visible(true);
+                #[cfg(windows)]
+                {
+                    use windows::{
+                        core::w,
+                        Win32::{
+                            Foundation::{LPARAM, WPARAM},
+                            UI::WindowsAndMessaging::*,
+                        },
+                    };
+                    let icons = super::icon_animation::Icons::load().unwrap();
+                    let hwnd = unsafe { FindWindowW(None, w!("Echo")) };
+                    assert_ne!(hwnd.0, 0);
+                    let mut previous = 0;
+                    for frame in icons.frames.iter().chain(std::iter::once(&icons.idle)) {
+                        ui.set_application_icon(frame.image.clone());
+                        let _ = ui.window().take_snapshot().unwrap();
+                        frame.update_taskbar();
+                        let big = unsafe { SendMessageW(hwnd, WM_GETICON, WPARAM(1), LPARAM(0)) }.0;
+                        let small =
+                            unsafe { SendMessageW(hwnd, WM_GETICON, WPARAM(0), LPARAM(0)) }.0;
+                        assert_ne!(big, 0, "Running taskbar icon must be set");
+                        assert_ne!(small, 0, "Title-bar icon must be set");
+                        assert_ne!(
+                            big, previous,
+                            "Each animation frame must replace the native icon"
+                        );
+                        previous = big;
+                    }
+                    // Clear the borrowed BIG handle before the cached frames are dropped.
+                    unsafe {
+                        SendMessageW(hwnd, WM_SETICON, WPARAM(1), LPARAM(0));
+                    }
+                }
+                save_ui_snapshot(
+                    &ui.window().take_snapshot().unwrap(),
+                    "echo-redesign-unsaved.bmp",
+                );
+                ui.set_unsaved_settings_prompt_visible(false);
+                ui.set_update_panel_visible(true);
+                ui.set_update_available_version("0.2.0".into());
+                ui.set_update_status("An update is available.".into());
+                save_ui_snapshot(
+                    &ui.window().take_snapshot().unwrap(),
+                    "echo-redesign-update.bmp",
+                );
+                ui.set_update_panel_visible(false);
+                ui.set_local_download_prompt_visible(true);
+                save_ui_snapshot(
+                    &ui.window().take_snapshot().unwrap(),
+                    "echo-redesign-download.bmp",
+                );
+                ui.set_local_download_prompt_visible(false);
+                ui.set_active_tab(0);
+                let _ = ui.window().take_snapshot().unwrap();
+                for (x, y) in [(22.0, 61.0)] {
+                    ui.window()
+                        .dispatch_event(slint::platform::WindowEvent::PointerMoved {
+                            position: slint::LogicalPosition::new(x, y),
+                        });
+                    if x == 22.0 {
+                        assert_eq!(
+                            ui.get_navigation_hint(),
+                            "Activity",
+                            "Hover must explain the navigation icon"
+                        );
+                        save_ui_snapshot(
+                            &ui.window().take_snapshot().unwrap(),
+                            &format!("echo-redesign-{width}-hover.bmp"),
+                        );
+                    }
+                    for pressed in [true, false] {
+                        let position = slint::LogicalPosition::new(x, y);
+                        let button = slint::platform::PointerEventButton::Left;
+                        ui.window().dispatch_event(if pressed {
+                            slint::platform::WindowEvent::PointerPressed { position, button }
+                        } else {
+                            slint::platform::WindowEvent::PointerReleased { position, button }
+                        });
+                    }
+                }
+                assert_eq!(navigated.get(), 2);
+                let position = slint::LogicalPosition::new(60.0, 53.0);
+                let button = slint::platform::PointerEventButton::Left;
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerPressed {
+                        position,
+                        button,
+                    });
+                let position = slint::LogicalPosition::new(320.0, 53.0);
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                        position,
+                        button,
+                    });
+                save_ui_snapshot(
+                    &ui.window().take_snapshot().unwrap(),
+                    &format!("echo-redesign-{width}-selection.bmp"),
+                );
+                assert!(
+                    ui.get_selected_transcript_bytes() > 0,
+                    "Transcript text must support native selection for copying"
+                );
+                let before = ui.get_transcript_history_text();
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: "x".into() });
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::KeyReleased { text: "x".into() });
+                assert_eq!(
+                    ui.get_transcript_history_text(),
+                    before,
+                    "History must remain read-only"
+                );
+                save_ui_snapshot(
+                    &ui.window().take_snapshot().unwrap(),
+                    &format!("echo-redesign-{width}-selection.bmp"),
+                );
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerMoved {
+                        position: slint::LogicalPosition::new(width as f32 - 20.0, 16.0),
+                    });
+                for pressed in [true, false] {
+                    let position = slint::LogicalPosition::new(width as f32 - 20.0, 16.0);
+                    let button = slint::platform::PointerEventButton::Left;
+                    ui.window().dispatch_event(if pressed {
+                        slint::platform::WindowEvent::PointerPressed { position, button }
+                    } else {
+                        slint::platform::WindowEvent::PointerReleased { position, button }
+                    });
+                }
+                assert!(
+                    ui.get_update_panel_visible(),
+                    "Version text must open updates"
+                );
+                ui.set_update_panel_visible(false);
+                ui.set_transcript_history_text(
+                    (0..50)
+                        .map(|i| format!("Transcript row {i}: scroll the page, not an inset card."))
+                        .collect::<Vec<String>>()
+                        .join("\n\n")
+                        .into(),
+                );
+                let _ = ui.window().take_snapshot().unwrap();
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                        position: slint::LogicalPosition::new(
+                            width as f32 - 5.0,
+                            height as f32 - 40.0,
+                        ),
+                        delta_x: 0.0,
+                        delta_y: -400.0,
+                    });
+                assert!(
+                    ui.get_content_scroll_y() < 0.0,
+                    "The outer page must scroll at the window edge"
+                );
+                save_ui_snapshot(
+                    &ui.window().take_snapshot().unwrap(),
+                    &format!("echo-redesign-{width}-scrolled.bmp"),
+                );
+                ui.set_active_tab(3);
+                assert_eq!(
+                    super::settings_snapshot_from_ui(&ui, &settings).post_processing,
+                    settings.post_processing
+                );
+            }));
+            *timer_outcome.borrow_mut() = Some(result);
+            let weak = ui.as_weak();
+            slint::Timer::single_shot(Duration::from_millis(100), move || {
+                let ui = weak.upgrade().unwrap();
+                let reset_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    assert_eq!(
+                        ui.get_content_scroll_y(),
+                        0.0,
+                        "Switching pages must reset scrolling after change notifications"
+                    );
+                }));
+                if reset_result.is_err() {
+                    *timer_outcome.borrow_mut() = Some(reset_result);
+                }
+                ui.hide().unwrap();
+                slint::quit_event_loop().unwrap();
+            });
+        });
+        slint::run_event_loop().unwrap();
+        let result = outcome.borrow_mut().take().expect("UI timer must finish");
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     fn save_ui_snapshot(pixels: &slint::SharedPixelBuffer<slint::Rgba8Pixel>, name: &str) {
@@ -4004,6 +4557,78 @@ mod tests {
     fn parse_hotkey_rejects_unknown_key_token() {
         let err = parse_hotkey("Ctrl+Tab").unwrap_err();
         assert!(err.contains("Unsupported key token"));
+    }
+
+    #[test]
+    #[ignore = "opens an isolated overlay window; run with SLINT_BACKEND=winit-software"]
+    #[cfg(windows)]
+    fn overlay_animation_remains_frameless_ui_smoke() {
+        use slint::ComponentHandle;
+        use windows::Win32::{
+            Foundation::{LPARAM, WPARAM},
+            UI::WindowsAndMessaging::*,
+        };
+        let overlay = super::TranscriptOverlayWindow::new().unwrap();
+        overlay.set_sentence_text("Animated recording indicator".into());
+        overlay.show().unwrap();
+        let icons = super::icon_animation::Icons::load().unwrap();
+        let weak = overlay.as_weak();
+        let outcome = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let result_for_timer = outcome.clone();
+        let timer = slint::Timer::default();
+        let mut tick = 0;
+        let mut native_icon = None;
+        timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(100),
+            move || {
+                let overlay = weak.upgrade().unwrap();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let frame = if tick < 6 {
+                        &icons.frames[tick % 3]
+                    } else {
+                        &icons.idle
+                    };
+                    overlay.set_recording_indicator(frame.image.clone());
+                    let pixels = overlay.window().take_snapshot().unwrap();
+                    if tick == 0 {
+                        super::configure_overlay_as_non_activating(&overlay).unwrap();
+                    }
+                    let hwnd = super::overlay_hwnd().unwrap();
+                    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+                    assert_eq!(
+                        style & WS_CAPTION.0 as isize,
+                        0,
+                        "Overlay must have no native caption"
+                    );
+                    let icon = unsafe { SendMessageW(hwnd, WM_GETICON, WPARAM(0), LPARAM(0)) }.0;
+                    if let Some(previous) = native_icon {
+                        assert_eq!(
+                            icon, previous,
+                            "Content animation must not change the native window icon"
+                        );
+                    }
+                    native_icon = Some(icon);
+                    if tick == 1 {
+                        save_ui_snapshot(&pixels, "echo-overlay-waveform.bmp");
+                    }
+                }));
+                tick += 1;
+                if result.is_err() || tick == 7 {
+                    *result_for_timer.borrow_mut() = Some(result);
+                    overlay.hide().unwrap();
+                    slint::quit_event_loop().unwrap();
+                }
+            },
+        );
+        slint::run_event_loop().unwrap();
+        if let Err(panic) = outcome
+            .borrow_mut()
+            .take()
+            .expect("Overlay smoke must finish")
+        {
+            std::panic::resume_unwind(panic);
+        };
     }
 
     #[test]

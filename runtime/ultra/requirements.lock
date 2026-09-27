@@ -554,7 +554,7 @@ tokenizers==0.23.2 \
     --hash=sha256:eb2f9c8a24da020ea8c11a01a19c1c2547912d92121ae4a01cfbca46125dee40 \
     --hash=sha256:f486f402f6f9abee5bb032553736813af0c710a86b2e0ca592634c55cea1f835
     # via kestrel
-torch @ https://download-r2.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-win_amd64.whl#sha256=ef8beae16d781c3244ef28dc7bee6d8871c26bbde65d5bf66e902cb61972c4ab \
+torch @ https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-win_amd64.whl#sha256=ef8beae16d781c3244ef28dc7bee6d8871c26bbde65d5bf66e902cb61972c4ab \
     --hash=sha256:ef8beae16d781c3244ef28dc7bee6d8871c26bbde65d5bf66e902cb61972c4ab
     # via
     #   -r runtime/ultra/requirements.in
