@@ -1,5 +1,6 @@
-Echo 0.1.9 adds Parakeet Ultra for private NVIDIA GPU transcription.
-- Select Ultra under Local — Parakeet and install its optional GPU runtime and model files. Requires an NVIDIA Ampere or newer GPU and a compatible driver.
-- Live previews become eligible after 1.5 seconds of audio and update every second, plus GPU processing time. Echo retains the full-context final transcript after Stop.
-- Source builds discover the latest locally built runtime automatically. Checksum verification is optimized to avoid long debug-build startup stalls.
-- CPU Parakeet V2/V3 models and saved settings remain supported. GPU failures do not inject unfinished previews.
+Echo 0.1.10 refreshes the interface and simplifies local Ultra setup.
+- Compact, content-first layout with icon navigation, a single selectable transcript textbox, Arial text, and a 100-line transcript display. Older saved history is retained.
+- Activity, settings, dialogs, and the live overlay have been refined. The recording indicator uses an animated waveform in the app and tray while dictating.
+- Parakeet Ultra now installs pinned, hash-verified Python and GPU dependencies directly from upstream sources. A prebuilt runtime bundle is no longer required.
+- Starting Ultra before its model is ready shows a loading notice and does not start a recording session. Press the shortcut again once the model is ready.
+- CPU speech models and existing settings remain supported.
