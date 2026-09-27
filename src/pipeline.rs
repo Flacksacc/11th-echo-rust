@@ -25,6 +25,17 @@ impl TranscriptPipeline {
     pub fn committed_text(&self) -> &str {
         &self.transcript
     }
+
+    pub fn finalization_text(
+        &mut self,
+        latest_partial: &str,
+        allow_preview_fallback: bool,
+    ) -> String {
+        if self.stop_requested && allow_preview_fallback && !latest_partial.trim().is_empty() {
+            self.push_fragment(latest_partial);
+        }
+        self.transcript.clone()
+    }
 }
 
 pub fn append_fragment(existing: &str, incoming: &str) -> String {
@@ -58,6 +69,29 @@ pub fn append_fragment(existing: &str, incoming: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{append_fragment, TranscriptPipeline};
+
+    #[test]
+    fn failed_gpu_session_cannot_promote_preview_to_injection_payload() {
+        let mut pipeline = TranscriptPipeline::new();
+        pipeline.request_stop();
+        assert_eq!(
+            pipeline.finalization_text("unfinished GPU preview", false),
+            ""
+        );
+        pipeline.push_fragment("Verified final transcript.");
+        assert_eq!(
+            pipeline.finalization_text("stale preview", false).trim(),
+            "Verified final transcript."
+        );
+        let mut cloud = TranscriptPipeline::new();
+        cloud.request_stop();
+        assert_eq!(
+            cloud
+                .finalization_text("existing cloud fallback", true)
+                .trim(),
+            "existing cloud fallback"
+        );
+    }
 
     #[test]
     fn append_fragment_adds_spaces_between_words() {

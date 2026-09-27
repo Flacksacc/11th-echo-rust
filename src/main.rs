@@ -1441,10 +1441,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SharedString::from(transcription::LOCAL_SHERPA_PROVIDER_LABEL),
     ])));
     ui.set_transcription_provider_text(initial_provider.label().into());
-    ui.set_local_model_options(ModelRc::new(VecModel::from(vec![
-        SharedString::from(transcription::LocalModel::ParakeetTdtV2.label()),
-        SharedString::from(transcription::LocalModel::ParakeetTdtV3.label()),
-    ])));
+    ui.set_local_model_options(ModelRc::new(VecModel::from(
+        transcription::LocalModel::ALL
+            .into_iter()
+            .map(|model| SharedString::from(model.label()))
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_ultra_download_description(transcription::ultra_download_description().into());
+    let gpu_status_ui = ui.as_weak();
+    thread::spawn(move || {
+        let status = transcription::ultra_gpu_status();
+        let _ =
+            gpu_status_ui.upgrade_in_event_loop(move |ui| ui.set_ultra_gpu_status(status.into()));
+    });
     ui.set_api_key_text(initial_settings.elevenlabs_api_key.clone().into());
     ui.set_elevenlabs_model_text(initial_settings.elevenlabs_model.clone().into());
     ui.set_elevenlabs_language_code_text(initial_settings.elevenlabs_language_code.clone().into());
@@ -1463,7 +1472,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_local_max_segment_seconds(initial_settings.local_sherpa.max_segment_seconds as f32);
     ui.set_local_partial_interval_ms(initial_settings.local_sherpa.partial_interval_ms as f32);
     ui.set_local_redecode_full_session(initial_settings.local_sherpa.redecode_full_session);
-    // The settings workflow offers the model when Local CPU is selected.
+    // The settings workflow offers the model when the local provider is selected.
     // Keep startup non-modal; existing Local users are prompted on opening the
     // Speech Engine settings page if their model is missing.
     ui.set_local_download_prompt_visible(false);
@@ -2086,13 +2095,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         current_settings.use_default_microphone,
                                         current_settings.gemini_enabled
                                     );
-                                    if matches!(
+                                    let loading_local_model = matches!(
                                         provider,
                                         transcription::TranscriptionProvider::LocalSherpaOnnx
                                     ) && !matches!(
                                         transcription::local_engine_status(),
                                         transcription::LocalEngineStatus::Ready
-                                    ) {
+                                    );
+                                    if loading_local_model {
                                         echo_info!(
                                             "local_model",
                                             "Local model preload requested after capture started"
@@ -2102,8 +2112,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         );
                                     }
 
-                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
-                                        ui.set_status_text("Connecting...".into());
+                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(move |ui| {
+                                        ui.set_status_text(if loading_local_model {
+                                            "Loading local speech model…".into()
+                                        } else {
+                                            "Connecting...".into()
+                                        });
                                         ui.set_has_error(false);
                                         ui.set_is_finalizing(false);
                                         ui.set_transcript("".into());
@@ -2121,6 +2135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let client = transcription::TranscriberClient::from_config(
                                         current_settings.transcription_config(),
                                     );
+                                    let requires_committed_final = matches!(provider, transcription::TranscriptionProvider::LocalSherpaOnnx) && current_settings.local_sherpa.model.uses_gpu();
                                     let client_state = state.clone();
                                     let injection_state = state.clone();
                                     let transcript_pipeline_for_text = transcript_pipeline.clone();
@@ -2181,8 +2196,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             s.transition_to_connecting();
                                         }
 
+                                        let error_tx = text_tx.clone();
                                         let result = client.run(audio_to_net_rx, network_stop_rx, text_tx, log_line_tx).await;
                                         if let Err(err) = result {
+                                            if requires_committed_final {
+                                                let _ = error_tx.send(transcription::TranscriptionEvent::Error(err.to_string())).await;
+                                            }
                                             echo_error!(
                                                 "provider",
                                                 "Transcription client failed epoch={}: {}",
@@ -2277,7 +2296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     //   commit the current partial if we have one. Falling back to
                                                     //   the existing committed transcript would duplicate content.
                                                     let empty_commit = text.trim().is_empty();
-                                                    let base_text = if empty_commit {
+                                                    let base_text = if empty_commit && !requires_committed_final {
                                                         if !latest_partial.trim().is_empty() {
                                                             latest_partial.trim().to_string()
                                                         } else {
@@ -2385,10 +2404,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                         let (base_text, stopped) = {
                                             let mut pipeline = transcript_pipeline_for_text.lock().unwrap();
-                                            if !latest_partial.trim().is_empty() && pipeline.stop_requested() {
-                                                pipeline.push_fragment(&latest_partial);
-                                            }
-                                            (pipeline.committed_text().to_string(), pipeline.stop_requested())
+                                            (pipeline.finalization_text(&latest_partial, !requires_committed_final && !had_error), pipeline.stop_requested())
                                         };
                                         if stopped && !had_error && !base_text.trim().is_empty()
                                             && session_epoch_for_transcript.load(Ordering::SeqCst) == current_session_epoch
@@ -3119,6 +3135,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
                 });
+            } else {
+                transcription::unload_local_engine();
             }
         }
 
@@ -3210,6 +3228,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings_for_download = settings.clone();
     ui.on_accept_local_model_download(move || {
         echo_info!("local_model", "User accepted local model download");
+        let Some(activity) = post_processing::ActivityGuard::acquire() else {
+            if let Some(ui) = ui_weak_for_download.upgrade() {
+                ui.set_local_download_error("Finish recording or the current model installation before installing speech files.".into());
+            }
+            return;
+        };
         let local_config = if let Some(ui) = ui_weak_for_download.upgrade() {
             ui.set_local_repair_pending(false);
             ui.set_local_download_prompt_visible(false);
@@ -3217,13 +3241,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_local_download_progress(0.0);
             ui.set_local_download_status("Preparing download...".into());
             ui.set_local_download_error("".into());
-            settings_for_download.lock().unwrap().local_sherpa.clone()
+            let mut config = settings_for_download.lock().unwrap().local_sherpa.clone();
+            config.model = transcription::LocalModel::from_id(&ui.get_local_model_text());
+            config
         } else {
             transcription::LocalSherpaConfig::default()
         };
         let progress_ui = ui_weak_for_download.clone();
         let completion_ui = ui_weak_for_download.clone();
+        let settings_after_download = settings_for_download.clone();
         thread::spawn(move || {
+            let _activity = activity;
             let runtime = Runtime::new().unwrap();
             let result = runtime.block_on(transcription::download_local_models(
                 local_config.model,
@@ -3236,8 +3264,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
 
             let result = result.and_then(|_| {
-                transcription::preload_local_engine(&local_config);
-                transcription::wait_for_local_engine()
+                let saved = settings_after_download.lock().unwrap().clone();
+                if saved.local_sherpa.model == local_config.model
+                    && matches!(
+                        transcription::TranscriptionProvider::from_id(
+                            &saved.transcription_provider
+                        ),
+                        transcription::TranscriptionProvider::LocalSherpaOnnx
+                    )
+                {
+                    transcription::preload_local_engine(&saved.local_sherpa);
+                    transcription::wait_for_local_engine()
+                } else {
+                    Ok(())
+                }
             });
             match &result {
                 Ok(()) => echo_info!(
@@ -3460,6 +3500,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.get_transcription_provider_text().to_string(),
     ));
     let last_provider_for_timer_tick = last_provider_for_timer.clone();
+    let last_model_for_timer = Rc::new(RefCell::new(ui.get_local_model_text().to_string()));
     let local_offer_for_timer = local_download_offer_suppressed.clone();
     #[cfg(target_os = "windows")]
     let hotkey_capture_window_for_timer = hotkey_capture_window.as_weak();
@@ -3516,9 +3557,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         true
                     }
                 };
-                if provider_changed {
+                let model_changed = {
+                    let mut previous = last_model_for_timer.borrow_mut();
+                    let selected = ui.get_local_model_text().to_string();
+                    let changed = *previous != selected;
+                    *previous = selected;
+                    changed
+                };
+                if provider_changed || model_changed {
                     local_offer_for_timer.set(false);
                 }
+                let mut selected_local = saved.local_sherpa.clone();
+                selected_local.model =
+                    transcription::LocalModel::from_id(&ui.get_local_model_text());
+                ui.set_local_engine_status_text(
+                    if selected_local.model != saved.local_sherpa.model {
+                        "Save settings to activate this model".to_string()
+                    } else {
+                        match transcription::local_engine_status_for(&selected_local) {
+                            transcription::LocalEngineStatus::Unloaded => "Not loaded".into(),
+                            transcription::LocalEngineStatus::Loading => "Loading…".into(),
+                            transcription::LocalEngineStatus::Ready => "Ready".into(),
+                            transcription::LocalEngineStatus::Failed(err) => {
+                                format!("Failed: {err}")
+                            }
+                        }
+                    }
+                    .into(),
+                );
                 if ui.get_local_repair_pending()
                     && !ui.get_unsaved_settings_prompt_visible()
                     && !ui.get_local_download_prompt_visible()
@@ -3536,9 +3602,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         transcription::TranscriptionProvider::from_id(&selected_provider),
                         transcription::TranscriptionProvider::LocalSherpaOnnx
                     )
-                    && !transcription::local_models_available(
-                        &settings.lock().unwrap().local_sherpa,
-                    )
+                    && !transcription::local_models_available(&selected_local)
                     && !local_offer_for_timer.get()
                     && !ui.get_unsaved_settings_prompt_visible()
                     && !ui.get_local_download_prompt_visible()
@@ -3683,7 +3747,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     echo_info!("app", "Slint event loop starting");
-    slint::run_event_loop_until_quit()?;
+    let event_loop_result = slint::run_event_loop_until_quit();
+    transcription::shutdown_local_engine();
+    event_loop_result?;
     echo_info!("app", "Slint event loop stopped; Echo exiting cleanly");
     Ok(())
 }
@@ -3785,6 +3851,63 @@ mod tests {
                 &ui.window().take_snapshot().unwrap(),
                 "echo-post-processing-ready-ui.bmp",
             );
+            ui.hide().unwrap();
+            slint::quit_event_loop().unwrap();
+        });
+        slint::run_event_loop().unwrap();
+    }
+
+    #[test]
+    #[ignore = "renders isolated local-model settings; no microphone, network, or user settings writes"]
+    fn parakeet_model_settings_ui_smoke() {
+        use slint::ComponentHandle;
+        let ui = super::AppWindow::new().unwrap();
+        let settings = super::AppSettings {
+            transcription_provider: super::transcription::LOCAL_SHERPA_PROVIDER_ID.into(),
+            local_sherpa: super::transcription::LocalSherpaConfig {
+                num_threads: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        super::populate_settings_editor(&ui, &settings);
+        ui.set_local_model_options(slint::ModelRc::new(slint::VecModel::from(
+            super::transcription::LocalModel::ALL
+                .into_iter()
+                .map(|model| slint::SharedString::from(model.label()))
+                .collect::<Vec<_>>(),
+        )));
+        ui.set_ultra_gpu_status("Detected NVIDIA GPU: RTX 5080 (isolated UI fixture)".into());
+        ui.set_ultra_download_description("Parakeet Ultra: 1257 MB of model files and 2252 MB of GPU runtime. NVIDIA Ampere or newer required.".into());
+        ui.set_local_engine_status_text("Ready".into());
+        ui.set_active_tab(3);
+        ui.set_settings_tab(1);
+        ui.window().set_size(slint::PhysicalSize::new(1000, 1050));
+        ui.show().unwrap();
+        let weak = ui.as_weak();
+        slint::Timer::single_shot(Duration::from_millis(500), move || {
+            let ui = weak.upgrade().unwrap();
+            for model in super::transcription::LocalModel::ALL {
+                ui.set_local_model_text(model.label().into());
+                let snapshot = super::settings_snapshot_from_ui(&ui, &settings);
+                assert_eq!(snapshot.local_sherpa.model, model);
+                assert_eq!(snapshot.local_sherpa.num_threads, 2);
+                save_ui_snapshot(
+                    &ui.window().take_snapshot().unwrap(),
+                    &format!("echo-{}.bmp", model.id()),
+                );
+            }
+            ui.set_local_download_prompt_visible(true);
+            save_ui_snapshot(
+                &ui.window().take_snapshot().unwrap(),
+                "echo-ultra-install.bmp",
+            );
+            ui.set_local_download_prompt_visible(false);
+            for tab in 0..=5 {
+                ui.set_settings_tab(tab);
+                let pixels = ui.window().take_snapshot().unwrap();
+                assert!(pixels.width() >= 760 && pixels.height() >= 600);
+            }
             ui.hide().unwrap();
             slint::quit_event_loop().unwrap();
         });

@@ -101,9 +101,23 @@ $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath).Hash.
 if ($actualHash -ne ([string]$manifest.installer.sha256).ToLowerInvariant()) {
     throw "Installer SHA-256 does not match manifest.json."
 }
-$hashLine = (Get-Content -LiteralPath $hashesPath -Raw).Trim()
-if ($hashLine -ne "$actualHash  $installerName") {
-    throw "SHA256SUMS.txt does not exactly describe the bundled installer."
+$uploadNames = @($installerName, "manifest.json.minisig", "SHA256SUMS.txt", "manifest.json")
+$expectedHashes = "$actualHash  $installerName`n"
+$ultraName = $null
+$ultraManifestPath = Join-Path $BundlePath "ultra-runtime.json"
+if (Test-Path -LiteralPath $ultraManifestPath) {
+    $ultra = Get-Content -LiteralPath $ultraManifestPath -Raw | ConvertFrom-Json
+    $ultraName = [IO.Path]::GetFileName(([Uri]$ultra.url).AbsolutePath)
+    if ($ultraName -notmatch '^echo-ultra-runtime-[a-f0-9]{16}\.zip$') { throw "Unsafe Ultra archive filename." }
+    $ultraPath = Join-Path $BundlePath $ultraName
+    $ultraHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ultraPath).Hash.ToLowerInvariant()
+    if ($ultraHash -ne $ultra.sha256 -or (Get-Item -LiteralPath $ultraPath).Length -ne $ultra.size) { throw "Ultra archive checksum or size mismatch." }
+    $ultraManifestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ultraManifestPath).Hash.ToLowerInvariant()
+    $expectedHashes += "$ultraHash  $ultraName`n$ultraManifestHash  ultra-runtime.json`n"
+    $uploadNames += @($ultraName, "ultra-runtime.json")
+}
+if ((Get-Content -LiteralPath $hashesPath -Raw).Trim() -ne $expectedHashes.Trim()) {
+    throw "SHA256SUMS.txt does not exactly describe the bundled files."
 }
 
 if (-not $config.public_key_path) {
@@ -134,6 +148,7 @@ if (-not $config.feed_url -or
 if (-not $feedUri.AbsolutePath.EndsWith('/manifest.json', [StringComparison]::OrdinalIgnoreCase)) {
     throw "feed_url must end with /manifest.json."
 }
+if ($ultraName -and $ultra.url -ne [Uri]::new($feedUri, $ultraName).AbsoluteUri) { throw "Ultra runtime URL does not match the publication directory." }
 
 Write-Host "Validated signed Echo $($manifest.version) update bundle."
 if ($ValidateOnly) {
@@ -159,7 +174,7 @@ if ($LASTEXITCODE -ne 0 -or $remoteStage -notmatch '^/tmp/echo-update\.[A-Za-z0-
 try {
     Push-Location $BundlePath
     try {
-        & $scp.Source -q $installerName "manifest.json.minisig" "SHA256SUMS.txt" "manifest.json" "${publishHost}:$remoteStage/"
+        & $scp.Source -q @uploadNames "${publishHost}:$remoteStage/"
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to upload the update bundle to the staging directory."
         }
@@ -170,11 +185,20 @@ try {
 
     # Every interpolated remote value above is restricted to a conservative
     # filename/path character set before reaching this command.
-    $remoteCommand = @(
+    $runtimeCommands = @()
+    if ($ultraName) {
+        $runtimeCommands = @(
+            "sudo install -o root -g root -m 644 $ultraName $publishPath/$ultraName.incoming",
+            "sudo mv -f $publishPath/$ultraName.incoming $publishPath/$ultraName",
+            "sudo install -o root -g root -m 644 ultra-runtime.json $publishPath/ultra-runtime.json"
+        )
+    }
+    $remoteCommand = (@(
         "set -eu",
         "cd $remoteStage",
         "sha256sum -c SHA256SUMS.txt",
         "sudo install -d -o root -g www-data -m 775 $publishPath",
+        ($runtimeCommands -join "; "),
         "sudo install -o root -g root -m 644 $installerName $publishPath/$installerName.incoming",
         "sudo install -o root -g root -m 644 manifest.json.minisig $publishPath/manifest.json.minisig.incoming",
         "sudo install -o root -g root -m 644 SHA256SUMS.txt $publishPath/SHA256SUMS.txt.incoming",
@@ -183,14 +207,15 @@ try {
         "sudo mv -f $publishPath/SHA256SUMS.txt.incoming $publishPath/SHA256SUMS.txt",
         "sudo mv -f $publishPath/manifest.json.minisig.incoming $publishPath/manifest.json.minisig",
         "sudo mv -f $publishPath/manifest.json.incoming $publishPath/manifest.json"
-    ) -join "; "
+    ) | Where-Object { $_ }) -join "; "
     & $ssh.Source -o BatchMode=yes $publishHost $remoteCommand
     if ($LASTEXITCODE -ne 0) {
         throw "The server rejected the staged update. The public manifest was not intentionally advanced."
     }
 }
 finally {
-    & $ssh.Source -o BatchMode=yes $publishHost "rm -f $remoteStage/$installerName $remoteStage/manifest.json.minisig $remoteStage/SHA256SUMS.txt $remoteStage/manifest.json; rmdir $remoteStage 2>/dev/null || true" | Out-Null
+    $stagedFiles = ($uploadNames | ForEach-Object { "$remoteStage/$_" }) -join " "
+    & $ssh.Source -o BatchMode=yes $publishHost "rm -f $stagedFiles; rmdir $remoteStage 2>/dev/null || true" | Out-Null
 }
 
 $installerUrl = [Uri]::new($feedUri, $installerName).AbsoluteUri

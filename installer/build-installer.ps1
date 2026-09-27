@@ -115,7 +115,14 @@ Push-Location $projectRoot
 $previousSherpaArchiveDir = $env:SHERPA_ONNX_ARCHIVE_DIR
 $previousUpdateFeedUrl = $env:ECHO_UPDATE_FEED_URL
 $previousUpdatePublicKey = $env:ECHO_UPDATE_PUBLIC_KEY
+$previousUltraManifest = $env:ECHO_ULTRA_RUNTIME_MANIFEST
 try {
+    if ($updateConfig.ultra_enabled -ne $false -and -not $env:ECHO_ULTRA_RUNTIME_MANIFEST) {
+        $runtimeUrlBase = [Uri]::new($feedUri, ".").AbsoluteUri
+        python (Join-Path $projectRoot "runtime\ultra\build_runtime.py") --url-base $runtimeUrlBase
+        if ($LASTEXITCODE -ne 0) { throw "Optional Ultra runtime build failed." }
+        $env:ECHO_ULTRA_RUNTIME_MANIFEST = Join-Path $projectRoot "target\ultra-runtime\runtime-manifest.json"
+    }
     # sherpa-onnx-sys otherwise trusts an already-extracted target cache. Force
     # every production build to extract from the repository-pinned archive.
     $sherpaExtractedDir = Join-Path $sherpaCacheRoot (
@@ -221,13 +228,39 @@ try {
         throw "Minisign failed to sign the update manifest."
     }
     $hashOutput = Join-Path $bundleDir "SHA256SUMS.txt"
+    $hashText = "$installerHash  $($installerInfo.Name)`n"
+    if ($env:ECHO_ULTRA_RUNTIME_MANIFEST) {
+        $ultraManifestPath = [IO.Path]::GetFullPath($env:ECHO_ULTRA_RUNTIME_MANIFEST)
+        $ultraManifest = Get-Content -LiteralPath $ultraManifestPath -Raw | ConvertFrom-Json
+        $ultraUri = [Uri]$ultraManifest.url
+        $ultraName = [IO.Path]::GetFileName($ultraUri.AbsolutePath)
+        if ($ultraName -notmatch '^echo-ultra-runtime-[a-f0-9]{16}\.zip$' -or
+            $ultraManifest.url -ne [Uri]::new($feedUri, $ultraName).AbsoluteUri) {
+            throw "Ultra runtime URL must be an immutable archive beside the update feed."
+        }
+        $ultraArchive = Join-Path (Split-Path -Parent $ultraManifestPath) $ultraName
+        $ultraInfo = Get-Item -LiteralPath $ultraArchive
+        $ultraHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ultraArchive).Hash.ToLowerInvariant()
+        if ($ultraHash -ne $ultraManifest.sha256 -or $ultraInfo.Length -ne $ultraManifest.size) {
+            throw "Ultra runtime archive does not match the embedded manifest."
+        }
+        Copy-Item -LiteralPath $ultraArchive -Destination (Join-Path $bundleDir $ultraName)
+        Copy-Item -LiteralPath $ultraManifestPath -Destination (Join-Path $bundleDir "ultra-runtime.json")
+        $ultraManifestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $bundleDir "ultra-runtime.json")).Hash.ToLowerInvariant()
+        $hashText += "$ultraHash  $ultraName`n$ultraManifestHash  ultra-runtime.json`n"
+    }
     [IO.File]::WriteAllText(
         $hashOutput,
-        "$installerHash  $($installerInfo.Name)`n",
+        $hashText,
         [Text.UTF8Encoding]::new($false)
     )
 }
 finally {
+    if ($null -eq $previousUltraManifest) {
+        Remove-Item Env:ECHO_ULTRA_RUNTIME_MANIFEST -ErrorAction SilentlyContinue
+    } else {
+        $env:ECHO_ULTRA_RUNTIME_MANIFEST = $previousUltraManifest
+    }
     if ($null -eq $previousSherpaArchiveDir) {
         Remove-Item Env:SHERPA_ONNX_ARCHIVE_DIR -ErrorAction SilentlyContinue
     }

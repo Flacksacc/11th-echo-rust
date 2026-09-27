@@ -444,7 +444,7 @@ impl AppSettings {
             ),
             TranscriptionProvider::LocalSherpaOnnx => (
                 String::new(),
-                provider.default_model_id().to_string(),
+                self.local_sherpa.model.id().to_string(),
                 "en".to_string(),
                 false,
             ),
@@ -774,6 +774,37 @@ mod tests {
         assert_eq!(loaded.keep_microphone_ready, expected.keep_microphone_ready);
         assert_eq!(loaded.hotkey_text, expected.hotkey_text);
         assert_eq!(loaded.start_with_windows, expected.start_with_windows);
+    }
+
+    #[test]
+    fn ultra_roundtrip_preserves_legacy_provider_and_cpu_tuning() {
+        let path = unique_path();
+        let original = AppSettings {
+            transcription_provider: "Local CPU - Parakeet".into(),
+            local_sherpa: LocalSherpaConfig {
+                model: crate::transcription::LocalModel::ParakeetUltra,
+                num_threads: 2,
+                silence_ms: 3000,
+                redecode_full_session: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(save_settings_to_path(&path, &original));
+        let loaded = load_settings_from_path(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(
+            loaded.transcription_config().provider,
+            TranscriptionProvider::LocalSherpaOnnx
+        );
+        assert_eq!(loaded.transcription_config().model_id, "parakeet-ultra");
+        assert_eq!(
+            loaded.local_sherpa.model,
+            crate::transcription::LocalModel::ParakeetUltra
+        );
+        assert_eq!(loaded.local_sherpa.num_threads, 2);
+        assert_eq!(loaded.local_sherpa.silence_ms, 3000);
+        assert!(loaded.local_sherpa.redecode_full_session);
     }
 
     #[test]

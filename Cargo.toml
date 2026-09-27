@@ -1,6 +1,6 @@
 [package]
 name = "echo"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 
 [dependencies]
@@ -20,6 +20,7 @@ rubato = "0.14" # High-quality resampling
 crossbeam-channel = "0.5"
 bzip2 = "0.4"
 tar = "0.4"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
 # Networking
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
@@ -63,9 +64,15 @@ windows = { version = "0.54", features = [
     "Win32_System_DataExchange",
     "Win32_System_Com", 
     "Win32_Media_Audio", # For WASAPI notifications
-    "Win32_System_Threading"
+    "Win32_System_Threading",
+    "Win32_System_JobObjects"
 ] }
 
 [build-dependencies]
 slint-build = "1.8"
 winresource = "0.1"
+
+# Ultra verifies several GB before loading. Keep checksum compression fast in
+# source builds while retaining debug information for application code.
+[profile.dev.package.sha2]
+opt-level = 3

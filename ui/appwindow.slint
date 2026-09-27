@@ -254,6 +254,10 @@ export component AppWindow inherits Window {
     in-out property <string> transcription-provider-text;
     in property <[string]> local-model-options;
     in-out property <string> local-model-text;
+    private property <bool> local-uses-gpu: root.local-model-text == "Parakeet Ultra — NVIDIA GPU, 25 languages";
+    in property <string> ultra-download-description;
+    in-out property <string> ultra-gpu-status: "Checking NVIDIA GPU…";
+    in-out property <string> local-engine-status-text: "Not loaded";
     in-out property <float> local-cpu-threads: 2;
     in property <float> local-max-cpu-threads: 4;
     in-out property <float> local-vad-threshold: 0.5;
@@ -742,7 +746,7 @@ export component AppWindow inherits Window {
                                 spacing: 12px;
                                 SectionTitle { title: "Speech engine"; subtitle: "Choose one transcription provider. Only relevant options are shown."; }
                                 Text { text: "Provider"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                ComboBox { model: root.transcription-provider-options; current-value <=> root.transcription-provider-text; }
+                                ComboBox { model: root.transcription-provider-options; current-value <=> root.transcription-provider-text; enabled: !root.is-recording && !root.is-finalizing && !root.local-download-progress-visible; }
 
                                 if root.transcription-provider-text == "ElevenLabs Realtime" : VerticalBox {
                                     spacing: 10px;
@@ -769,18 +773,23 @@ export component AppWindow inherits Window {
                                     LineEdit { text <=> root.openai-language-code-text; placeholder-text: "en"; }
                                 }
 
-                                if root.transcription-provider-text == "Local CPU - Parakeet" : VerticalBox {
+                                if root.transcription-provider-text == "Local — Parakeet" : VerticalBox {
                                     spacing: 10px;
                                     Rectangle { height: 1px; background: #1c3a2a; }
-                                    SectionTitle { title: "Local CPU — Sherpa ONNX"; subtitle: "Private, offline transcription using Parakeet and Silero VAD."; }
+                                    SectionTitle { title: root.local-uses-gpu ? "Local GPU — Parakeet Ultra" : "Local CPU — Sherpa ONNX"; subtitle: "Private, offline transcription on this computer."; }
                                     Text { text: "Speech model"; color: #d6e9dc; font-size: 12px; font-weight: 600; }
-                                    ComboBox { model: root.local-model-options; current-value <=> root.local-model-text; }
-                                    Text { text: root.local-model-text == "Parakeet TDT 0.6B v3 — 600M parameters, 25 languages, INT8" ? "Download option: 0.6B-parameter transducer, multilingual (25 languages), INT8 CPU model." : "Current default: 0.6B-parameter transducer, English, INT8 CPU model."; color: #71917d; font-size: 10px; wrap: word-wrap; }
+                                    ComboBox { model: root.local-model-options; current-value <=> root.local-model-text; enabled: !root.is-recording && !root.is-finalizing && !root.local-download-progress-visible; }
+                                    Text { text: root.local-uses-gpu ? "Full-precision model, 25 languages detected automatically. NVIDIA Ampere or newer required. Previews start after 1.5 seconds of audio, then update every second, plus processing time." : root.local-model-text == "Parakeet TDT 0.6B v3 — 600M parameters, 25 languages, INT8" ? "Download option: 0.6B-parameter transducer, multilingual (25 languages), INT8 CPU model." : "Current default: 0.6B-parameter transducer, English, INT8 CPU model."; color: #71917d; font-size: 10px; wrap: word-wrap; }
+                                    if root.local-uses-gpu : Text { text: root.ultra-gpu-status; color: #a9c3b2; font-size: 11px; wrap: word-wrap; }
+                                    Text { text: "Engine: " + root.local-engine-status-text; color: #a9c3b2; font-size: 11px; wrap: word-wrap; }
+                                    Button { text: "Install / repair selected model"; enabled: !root.is-recording && !root.is-finalizing && !root.local-download-progress-visible; clicked => { root.local-download-error = ""; root.local-download-prompt-visible = true; } }
                                     Rectangle {
                                         height: 58px; border-radius: 8px; background: #0b2418; border-width: 1px; border-color: #245038;
                                         Text { x: 12px; y: 9px; text: "Runs entirely on this computer"; color: #b9edca; font-size: 12px; font-weight: 700; }
                                         Text { x: 12px; y: 30px; width: parent.width - 24px; text: "No API key or network connection is required after the model is installed."; color: #71917d; font-size: 10px; overflow: elide; }
                                     }
+                                    if !root.local-uses-gpu : VerticalBox {
+                                    spacing: 10px;
                                     LabeledSlider { label: "CPU threads"; hint: "More threads can reduce latency but increase CPU use."; minimum: 1; maximum: root.local-max-cpu-threads; step: 1; value <=> root.local-cpu-threads; }
                                     LabeledSlider { label: "Speech sensitivity"; hint: "Lower values detect quieter speech and more background noise."; minimum: 0.1; maximum: 0.9; value <=> root.local-vad-threshold; }
                                     CheckBox { text: "Re-decode the full session when recording stops"; checked <=> root.local-redecode-full-session; }
@@ -808,6 +817,7 @@ export component AppWindow inherits Window {
                                                 root.local-redecode-full-session = false;
                                             }
                                         }
+                                    }
                                     }
                                 }
                             }
@@ -917,7 +927,7 @@ export component AppWindow inherits Window {
                 HorizontalBox {
                     height: 40px;
                     Rectangle { horizontal-stretch: 1; background: transparent; }
-                    Button { text: "Save settings"; primary: true; clicked => { root.apply-settings(); } }
+                    Button { text: "Save settings"; primary: true; enabled: !root.is-recording && !root.is-finalizing && !root.local-download-progress-visible; clicked => { root.apply-settings(); } }
                 }
             }
         }
@@ -969,7 +979,7 @@ export component AppWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             width: 540px;
-            height: root.local-download-progress-visible ? 218px : 276px;
+            height: root.local-download-progress-visible ? 218px : root.local-uses-gpu ? 360px : 300px;
             background: #0b2117;
             border-color: #2a5a40;
             border-width: 1px;
@@ -983,7 +993,7 @@ export component AppWindow inherits Window {
                 Text { text: root.local-download-progress-visible ? "Installing local speech" : "Install local speech files?"; color: #edfff2; font-size: 21px; font-weight: 700; }
                 if root.local-download-prompt-visible && root.local-download-error != "" : Text { text: root.local-download-error; color: #fda4af; wrap: word-wrap; }
                 Text {
-                    text: root.local-download-progress-visible ? root.local-download-status : "Selected: " + root.local-model-text + ". About 465 MB will be downloaded; Echo verifies the pinned SHA-256 before installing Parakeet and Silero.";
+                    text: root.local-download-progress-visible ? root.local-download-status : root.local-uses-gpu ? root.ultra-download-description : "Selected: " + root.local-model-text + ". About 465 MB will be downloaded; Echo verifies the pinned SHA-256 before installing Parakeet and Silero.";
                     color: #a9c3b2; wrap: word-wrap; font-size: 12px;
                 }
                 if root.local-download-progress-visible : Rectangle {

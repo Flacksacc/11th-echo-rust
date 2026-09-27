@@ -18,62 +18,7 @@ use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
 const SAMPLE_RATE: usize = 16_000;
 const FULL_SESSION_LIMIT_SAMPLES: usize = SAMPLE_RATE * 60 * 3;
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum LocalModel {
-    #[default]
-    ParakeetTdtV2,
-    ParakeetTdtV3,
-}
-
-impl LocalModel {
-    pub fn from_id(value: &str) -> Self {
-        match value.trim() {
-            "parakeet-tdt-0.6b-v3-int8"
-            | "Parakeet TDT 0.6B v3 — 600M parameters, 25 languages, INT8" => Self::ParakeetTdtV3,
-            _ => Self::ParakeetTdtV2,
-        }
-    }
-
-    pub fn id(self) -> &'static str {
-        match self {
-            Self::ParakeetTdtV2 => "parakeet-tdt-0.6b-v2-int8",
-            Self::ParakeetTdtV3 => "parakeet-tdt-0.6b-v3-int8",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::ParakeetTdtV2 => "Parakeet TDT 0.6B v2 — 600M parameters, English, INT8",
-            Self::ParakeetTdtV3 => "Parakeet TDT 0.6B v3 — 600M parameters, 25 languages, INT8",
-        }
-    }
-
-    fn archive_url(self) -> &'static str {
-        match self {
-            Self::ParakeetTdtV2 => "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
-            Self::ParakeetTdtV3 => "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
-        }
-    }
-
-    fn archive_sha256(self) -> &'static str {
-        match self {
-            Self::ParakeetTdtV2 => {
-                "157c157bc51155e03e37d2466522a3a737dd9c72bb25f36eb18912964161e1ad"
-            }
-            Self::ParakeetTdtV3 => {
-                "5793d0fd397c5778d2cf2126994d58e9d56b1be7c04d13c7a15bb1b4eafb16bf"
-            }
-        }
-    }
-
-    fn archive_size(self) -> u64 {
-        match self {
-            Self::ParakeetTdtV2 => 482_468_385,
-            Self::ParakeetTdtV3 => 487_170_055,
-        }
-    }
-}
+use super::LocalModel;
 const SILERO_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -173,7 +118,8 @@ pub enum LocalEngineStatus {
 }
 
 struct EngineBundle {
-    recognizer: Mutex<OfflineRecognizer>,
+    recognizer: Option<Mutex<OfflineRecognizer>>,
+    photon: Option<Arc<super::local_photon::PhotonEngine>>,
     vad_model: PathBuf,
 }
 
@@ -186,7 +132,9 @@ enum EngineState {
 
 struct EngineManager {
     state: Mutex<EngineState>,
+    loading: Mutex<()>,
     changed: Condvar,
+    generation: std::sync::atomic::AtomicU64,
 }
 
 fn manager() -> &'static Arc<EngineManager> {
@@ -194,7 +142,9 @@ fn manager() -> &'static Arc<EngineManager> {
     MANAGER.get_or_init(|| {
         Arc::new(EngineManager {
             state: Mutex::new(EngineState::Unloaded),
+            loading: Mutex::new(()),
             changed: Condvar::new(),
+            generation: std::sync::atomic::AtomicU64::new(0),
         })
     })
 }
@@ -203,23 +153,52 @@ pub fn local_engine_status() -> LocalEngineStatus {
     match &*manager().state.lock().unwrap() {
         EngineState::Unloaded => LocalEngineStatus::Unloaded,
         EngineState::Loading(_) => LocalEngineStatus::Loading,
-        EngineState::Ready(_, _) => LocalEngineStatus::Ready,
+        EngineState::Ready(_, engine) => {
+            if engine
+                .photon
+                .as_ref()
+                .is_some_and(|photon| !photon.is_healthy())
+            {
+                LocalEngineStatus::Unloaded
+            } else {
+                LocalEngineStatus::Ready
+            }
+        }
         EngineState::Failed(message) => LocalEngineStatus::Failed(message.clone()),
     }
 }
 
 pub fn preload_local_engine(config: &LocalSherpaConfig) {
     let config = config.clone().normalized();
-    let key = (config.model, config.num_threads);
+    let key = (
+        config.model,
+        if config.model.uses_gpu() {
+            0
+        } else {
+            config.num_threads
+        },
+    );
     let manager = manager().clone();
+    let generation;
     {
         let mut state = manager.state.lock().unwrap();
         match &*state {
-            EngineState::Loading(loaded) | EngineState::Ready(loaded, _) if *loaded == key => {
+            EngineState::Loading(loaded) if *loaded == key => return,
+            EngineState::Ready(loaded, engine)
+                if *loaded == key
+                    && engine
+                        .photon
+                        .as_ref()
+                        .is_none_or(|engine| engine.is_healthy()) =>
+            {
                 return
             }
             _ => *state = EngineState::Loading(key),
         }
+        generation = manager
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
     }
 
     crate::echo_info!(
@@ -230,6 +209,10 @@ pub fn preload_local_engine(config: &LocalSherpaConfig) {
     );
 
     std::thread::spawn(move || {
+        let _loading = manager.loading.lock().unwrap();
+        if manager.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+            return;
+        }
         let loaded = load_engine(key.0, key.1);
         match &loaded {
             Ok(_) => crate::echo_info!(
@@ -246,7 +229,9 @@ pub fn preload_local_engine(config: &LocalSherpaConfig) {
             ),
         }
         let mut state = manager.state.lock().unwrap();
-        if matches!(&*state, EngineState::Loading(loaded) if *loaded == key) {
+        if manager.generation.load(std::sync::atomic::Ordering::SeqCst) == generation
+            && matches!(&*state, EngineState::Loading(loaded) if *loaded == key)
+        {
             *state = match loaded {
                 Ok(engine) => EngineState::Ready(key, Arc::new(engine)),
                 Err(err) => EngineState::Failed(err),
@@ -258,6 +243,56 @@ pub fn preload_local_engine(config: &LocalSherpaConfig) {
 
 pub fn wait_for_local_engine() -> Result<(), String> {
     engine().map(|_| ())
+}
+
+pub fn unload_local_engine() {
+    let mut state = manager().state.lock().unwrap();
+    manager()
+        .generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    *state = EngineState::Unloaded;
+    manager().changed.notify_all();
+}
+
+pub fn shutdown_local_engine() {
+    let mut state = manager().state.lock().unwrap();
+    manager()
+        .generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let EngineState::Ready(_, engine) = &*state {
+        if let Some(photon) = &engine.photon {
+            photon.shutdown();
+        }
+    }
+    *state = EngineState::Unloaded;
+    manager().changed.notify_all();
+}
+
+pub fn local_engine_status_for(config: &LocalSherpaConfig) -> LocalEngineStatus {
+    let key = (
+        config.model,
+        if config.model.uses_gpu() {
+            0
+        } else {
+            config.num_threads
+        },
+    );
+    match &*manager().state.lock().unwrap() {
+        EngineState::Loading(loaded) if *loaded == key => LocalEngineStatus::Loading,
+        EngineState::Ready(loaded, engine) if *loaded == key => {
+            if engine
+                .photon
+                .as_ref()
+                .is_some_and(|photon| !photon.is_healthy())
+            {
+                LocalEngineStatus::Unloaded
+            } else {
+                LocalEngineStatus::Ready
+            }
+        }
+        EngineState::Failed(message) => LocalEngineStatus::Failed(message.clone()),
+        _ => LocalEngineStatus::Unloaded,
+    }
 }
 
 fn engine() -> Result<Arc<EngineBundle>, String> {
@@ -320,6 +355,9 @@ fn required_models_exist(root: &Path, model: LocalModel) -> bool {
 }
 
 pub fn local_models_available(config: &LocalSherpaConfig) -> bool {
+    if config.model.uses_gpu() {
+        return super::local_photon::available();
+    }
     let model = config.model;
     if let Some(path) = std::env::var_os("ELEVENTH_ECHO_MODEL_DIR") {
         return required_models_exist(&PathBuf::from(path), model);
@@ -340,6 +378,9 @@ pub async fn download_local_models<F>(model: LocalModel, progress: F) -> Result<
 where
     F: Fn(f32, String) + Send + Sync + 'static,
 {
+    if model.uses_gpu() {
+        return super::local_photon::download(progress).await;
+    }
     crate::echo_info!("local_model", "Runtime model download started");
     let progress = Arc::new(progress);
     let base = downloaded_model_root()
@@ -450,17 +491,17 @@ async fn cleanup_stale_downloads(base: &Path) {
     }
 }
 
-struct DownloadSpec<'a> {
-    url: &'a str,
-    destination: &'a Path,
-    expected_hash: &'a str,
-    expected_size: u64,
-    progress_start: f32,
-    progress_span: f32,
-    label: &'a str,
+pub(super) struct DownloadSpec<'a> {
+    pub url: &'a str,
+    pub destination: &'a Path,
+    pub expected_hash: &'a str,
+    pub expected_size: u64,
+    pub progress_start: f32,
+    pub progress_span: f32,
+    pub label: &'a str,
 }
 
-async fn download_verified(
+pub(super) async fn download_verified(
     spec: DownloadSpec<'_>,
     progress: Arc<dyn Fn(f32, String) + Send + Sync>,
 ) -> Result<(), String> {
@@ -739,6 +780,13 @@ fn required_file(path: &Path) -> Result<String, String> {
 }
 
 fn load_engine(model_id: LocalModel, threads: i32) -> Result<EngineBundle, String> {
+    if model_id.uses_gpu() {
+        return Ok(EngineBundle {
+            recognizer: None,
+            photon: Some(Arc::new(super::local_photon::PhotonEngine::load()?)),
+            vad_model: PathBuf::new(),
+        });
+    }
     let root = model_root(model_id)?;
     crate::echo_info!(
         "local_model",
@@ -770,7 +818,8 @@ fn load_engine(model_id: LocalModel, threads: i32) -> Result<EngineBundle, Strin
     let recognizer = OfflineRecognizer::create(&config)
         .ok_or_else(|| "Sherpa ONNX could not initialize the Parakeet model".to_string())?;
     Ok(EngineBundle {
-        recognizer: Mutex::new(recognizer),
+        recognizer: Some(Mutex::new(recognizer)),
+        photon: None,
         vad_model,
     })
 }
@@ -835,7 +884,12 @@ fn decode(engine: &EngineBundle, samples: &[f32]) -> Result<String, String> {
     if samples.is_empty() {
         return Ok(String::new());
     }
-    let recognizer = engine.recognizer.lock().unwrap();
+    let recognizer = engine
+        .recognizer
+        .as_ref()
+        .ok_or("CPU recognizer is unavailable")?
+        .lock()
+        .unwrap();
     let stream = recognizer.create_stream();
     stream.accept_waveform(SAMPLE_RATE as i32, samples);
     recognizer.decode(&stream);
@@ -864,6 +918,13 @@ impl LocalSherpaTranscriber {
         log_tx: UnboundedSender<String>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let engine = tokio::task::spawn_blocking(engine).await??;
+        if let Some(photon) = &engine.photon {
+            let result = photon.run(audio_rx, command_rx, event_tx).await;
+            if result.is_err() {
+                unload_local_engine();
+            }
+            return result;
+        }
         let vad_path = engine.vad_model.to_string_lossy().into_owned();
         let vad_config = VadModelConfig {
             silero_vad: SileroVadModelConfig {

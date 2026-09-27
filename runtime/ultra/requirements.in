@@ -1,0 +1,2 @@
+moondream==2.4.1
+torch @ https://download-r2.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-win_amd64.whl#sha256=ef8beae16d781c3244ef28dc7bee6d8871c26bbde65d5bf66e902cb61972c4ab

@@ -1,3 +1,5 @@
-Echo 0.1.8 fixes final punctuation after dictation stops.
-- When the punctuation model leaves a trailing comma, Echo now replaces it with one final period instead of producing a comma followed by a period.
-- Final punctuation still runs only after Stop and respects the Periods setting.
+Echo 0.1.9 adds Parakeet Ultra for private NVIDIA GPU transcription.
+- Select Ultra under Local — Parakeet and install its optional GPU runtime and model files. Requires an NVIDIA Ampere or newer GPU and a compatible driver.
+- Live previews become eligible after 1.5 seconds of audio and update every second, plus GPU processing time. Echo retains the full-context final transcript after Stop.
+- Source builds discover the latest locally built runtime automatically. Checksum verification is optimized to avoid long debug-build startup stalls.
+- CPU Parakeet V2/V3 models and saved settings remain supported. GPU failures do not inject unfinished previews.

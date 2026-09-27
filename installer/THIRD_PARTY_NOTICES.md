@@ -1,5 +1,7 @@
 # Third-party notices
 
+Optional **Moondream Parakeet Ultra** weights are a post-trained version of NVIDIA Parakeet TDT 0.6B v3, distributed under CC BY 4.0. Model and attribution: https://huggingface.co/moondream/parakeet-ultra. Ultra's separate GPU runtime includes embedded Python (PSF license), PyTorch and its bundled CUDA libraries, and Photon/Kestrel components redistributed under the publisher's M87 Labs agreement. Package notices and supplied licenses are retained in that runtime's `THIRD_PARTY_NOTICES.txt`, `LICENSE.txt`, and `lib/` package directories. Neither the weights nor the GPU runtime is included in the main installer.
+
 Echo can download an ONNX conversion of **NVIDIA Parakeet TDT 0.6B v2** on the user's request. The model is not included in the installer. It is licensed under CC BY 4.0. Original model: `nvidia/parakeet-tdt-0.6b-v2`. ONNX conversion and runtime integration: `k2-fsa/sherpa-onnx`.
 
 The local runtime also contains sherpa-onnx (Apache License 2.0), ONNX Runtime and its transitive native components, and uses Silero VAD (MIT) when its separately downloaded model is enabled. The corresponding license texts are installed alongside this notice.

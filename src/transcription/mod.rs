@@ -2,14 +2,18 @@ use std::error::Error;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
 mod elevenlabs_realtime;
+mod local_model;
+mod local_photon;
 mod local_sherpa;
 mod openai_realtime_whisper;
 
 pub use elevenlabs_realtime::ElevenLabsRealtimeTranscriber;
+pub use local_model::LocalModel;
+pub use local_photon::{ultra_download_description, ultra_gpu_status};
 pub use local_sherpa::{
-    download_local_models, local_engine_status, local_models_available, physical_core_count,
-    preload_local_engine, wait_for_local_engine, LocalEngineStatus, LocalModel, LocalSherpaConfig,
-    LocalSherpaTranscriber,
+    download_local_models, local_engine_status, local_engine_status_for, local_models_available,
+    physical_core_count, preload_local_engine, shutdown_local_engine, unload_local_engine,
+    wait_for_local_engine, LocalEngineStatus, LocalSherpaConfig, LocalSherpaTranscriber,
 };
 pub use openai_realtime_whisper::OpenAiRealtimeWhisperTranscriber;
 
@@ -18,7 +22,7 @@ pub const DEFAULT_PROVIDER_LABEL: &str = "ElevenLabs Realtime";
 pub const OPENAI_REALTIME_WHISPER_PROVIDER_ID: &str = "openai_realtime_whisper";
 pub const OPENAI_REALTIME_WHISPER_PROVIDER_LABEL: &str = "OpenAI Realtime Whisper";
 pub const LOCAL_SHERPA_PROVIDER_ID: &str = "local_sherpa_onnx";
-pub const LOCAL_SHERPA_PROVIDER_LABEL: &str = "Local CPU - Parakeet";
+pub const LOCAL_SHERPA_PROVIDER_LABEL: &str = "Local — Parakeet";
 pub const DEFAULT_ELEVENLABS_REALTIME_MODEL_ID: &str = "scribe_v2_realtime";
 pub const DEFAULT_OPENAI_REALTIME_WHISPER_MODEL_ID: &str = "gpt-realtime-whisper";
 pub const DEFAULT_LANGUAGE_CODE: &str = "en";
@@ -41,7 +45,9 @@ impl TranscriptionProvider {
             OPENAI_REALTIME_WHISPER_PROVIDER_ID | OPENAI_REALTIME_WHISPER_PROVIDER_LABEL => {
                 Self::OpenAiRealtimeWhisper
             }
-            LOCAL_SHERPA_PROVIDER_ID | LOCAL_SHERPA_PROVIDER_LABEL => Self::LocalSherpaOnnx,
+            LOCAL_SHERPA_PROVIDER_ID | LOCAL_SHERPA_PROVIDER_LABEL | "Local CPU - Parakeet" => {
+                Self::LocalSherpaOnnx
+            }
             _ => Self::ElevenLabsRealtime,
         }
     }
