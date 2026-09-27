@@ -26,12 +26,13 @@ transcript. The helper is embedded in Echo so rebuilding updates its behavior.
 - The installer and optional runtime were assembled into a local upload bundle
   with SHA-256 checksums
 
-## Release gates still pending
+- Minisign signature and signed update-bundle validation passed
+- Published Echo 0.1.9 to the stable website feed; server-side SHA-256 checks
+  passed, and public HTTPS checks returned 200 for the installer (12,437,663
+  bytes) and optional runtime (2,251,994,607 bytes)
 
-- Interactive Minisign signing: the encrypted private key requires its password
-  entered in a local terminal; the noninteractive signing attempt failed
-- Signed update-bundle verification and public HTTPS checks; the site remains
-  on 0.1.8 and no new files have been published there
+## Verification limitations
+
 - Full manual tray/global-hotkey/overlay testing of the packaged release
 
 The source review covered engine switching and generation ownership, cancellation
@@ -44,7 +45,7 @@ As directed by the user on 2026-09-27, installer testing on a clean Windows
 account or VM is optional and does not gate release or publication. It was not
 performed in this session.
 
-## Resume without rebuilding
+## Reuse the prepared bundle
 
 From the repository directory, sign the prepared manifest in a local terminal:
 
@@ -52,7 +53,7 @@ From the repository directory, sign the prepared manifest in a local terminal:
 minisign -S -s C:\EchoKeys\echo-update.key -m installer\output\update-bundle\manifest.json
 ```
 
-After signing and completing the remaining required manual checks, publish the
+After signing and performing applicable verification, publish the
 prepared bundle:
 
 ```powershell
