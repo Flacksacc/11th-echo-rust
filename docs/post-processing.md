@@ -56,4 +56,4 @@ $env:SLINT_BACKEND = 'winit-software'
 cargo test post_processing_settings_ui_smoke -- --ignored --nocapture
 ```
 
-Before release, manually exercise real dictation → stop → paste, tooltip hover/focus and scrolling at supported display scaling, tray/hotkey behavior, consent/retry/startup installation, and a clean-account installer. Automated and isolated model/UI tests do not replace those checks.
+Before release, manually exercise real dictation → stop → paste, tooltip hover/focus and scrolling at supported display scaling, tray/hotkey behavior, and consent/retry/startup installation. Automated and isolated model/UI tests do not replace those checks. Installer testing on a clean account or VM is optional, not a publication requirement.

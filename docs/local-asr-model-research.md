@@ -140,7 +140,7 @@ Moonshine's benchmark documentation measures finalization after VAD decides spee
 
 **Vulkan is the first portable prototype I would try.** parakeet.cpp offers Windows CPU, Vulkan, and CUDA packages and a native C interface. That permits testing the existing acoustic model through another runtime. transcribe.cpp documents Windows Vulkan builds and includes Rust bindings, offering one experimental route to several shortlisted families. These are additional native runtimes, not drop-in ONNX files. [^24][^25]
 
-**CUDA through sherpa is possible, but changes packaging.** The existing CPU static package does not become GPU-enabled by changing a string. Sherpa documents Windows CUDA builds; the ONNX Runtime, CUDA, and cuDNN versions must match the packaged binary, with suitable support for the RTX 5080. DLL discovery and a clean Windows install must be tested. [^26][^27]
+**CUDA through sherpa is possible, but changes packaging.** The existing CPU static package does not become GPU-enabled by changing a string. Sherpa documents Windows CUDA builds; the ONNX Runtime, CUDA, and cuDNN versions must match the packaged binary, with suitable support for the RTX 5080. DLL discovery must be tested; testing on a clean Windows account or VM is optional. [^26][^27]
 
 **DirectML is not absent from sherpa.** The pinned 1.13.4 source contains a Windows DirectML execution-provider path behind a build flag. Enabling it requires an appropriate build and deployment, plus performance testing; it is not evidence that the current installer supports it. Microsoft now describes DirectML as being in sustained engineering and recommends Windows ML for new Windows deployments. [^28][^29]
 
@@ -193,7 +193,7 @@ Prototype transcribe.cpp for Granite and, if suitable, additional families. Its 
 
 Do not replace sherpa wholesale before side-by-side tests. A narrower parakeet.cpp integration is also reasonable if the immediate aim is GPU acceleration for Parakeet rather than a larger model catalog.
 
-For any eventual release, run the repository's required formatting, clippy, tests, release build and installer checks, and exercise the main window, settings, tray, hotkey, overlay, model downloads and a clean Windows account. Compilation alone will not validate native-library packaging or interaction behavior.
+For any eventual release, run the repository's required formatting, clippy, tests, release build and installer checks, and exercise the main window, settings, tray, hotkey, overlay and model downloads. Testing on a clean Windows account or VM is optional and does not gate publication. Compilation alone will not validate native-library packaging or interaction behavior.
 
 ## Benchmark that would settle the choice
 

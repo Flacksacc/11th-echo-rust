@@ -38,7 +38,7 @@ If no actionable findings exist, say so and state what was inspected and what co
 ## Windows and packaging
 
 - Compare installer payloads with runtime lookup paths.
-- Verify required native DLLs and model assets on a clean machine.
+- Verify required native DLLs and model assets. A clean Windows account or VM is optional, not a publication gate.
 - Verify install, upgrade, uninstall, startup registration, shortcuts, and process shutdown.
 - Check paths containing spaces and non-ASCII characters, standard-user installs, locked files, and interrupted downloads.
 - Verify version metadata, architecture, license notices, and code-signing readiness.
@@ -48,4 +48,4 @@ If no actionable findings exist, say so and state what was inspected and what co
 - Run format, Clippy, unit tests, release build, and installer compilation.
 - Identify important ignored tests and explain how they will be exercised before release.
 - Prefer behavioral regression tests over implementation-detail assertions.
-- Record manual checks that cannot be automated, including microphone permissions, tray behavior, global hotkeys, overlay placement, and clean-machine installation.
+- Record manual checks that cannot be automated, including microphone permissions, tray behavior, global hotkeys, and overlay placement. Clean-machine installation checks are optional.

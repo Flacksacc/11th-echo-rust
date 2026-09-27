@@ -16,7 +16,9 @@ Before release, run:
 2. `cargo clippy --all-targets --all-features -- -D warnings`
 3. `cargo test`
 4. `cargo build --release`
-5. Build the Inno Setup installer and test it on a clean Windows account or VM.
+5. Build the Inno Setup installer.
+
+Testing on a clean Windows account or VM is optional and is not a release or publication requirement.
 
 Do not treat compilation alone as UI verification. Exercise the main window, every settings page, the tray menu, the global hotkey, the overlay, and local-model download behavior.
 

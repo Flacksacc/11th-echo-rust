@@ -46,4 +46,4 @@ cargo test gpu_runtime_transcribes_fixture -- --ignored --test-threads=1
 python runtime/ultra/smoke_test.py --python PATH/TO/RUNTIME/python.exe --model-dir PATH/TO/WEIGHTS --wav installer/assets/models/parakeet-tdt-0.6b-v2-int8/test_wavs/0.wav
 ```
 
-Real runtime tests must be complemented by microphone/hotkey/overlay/injection checks, multilingual/noisy/long speech, driver and low-memory failure checks, download interruption/repair, and installer testing on a clean Windows account or VM. Do not infer a universal minimum VRAM or consumer-GPU latency from upstream server benchmarks.
+Real runtime tests must be complemented by microphone/hotkey/overlay/injection checks, multilingual/noisy/long speech, driver and low-memory failure checks, and download interruption/repair. Installer testing on a clean Windows account or VM is optional, not a release or publication requirement. Do not infer a universal minimum VRAM or consumer-GPU latency from upstream server benchmarks.

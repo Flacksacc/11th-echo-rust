@@ -32,8 +32,6 @@ transcript. The helper is embedded in Echo so rebuilding updates its behavior.
   entered in a local terminal; the noninteractive signing attempt failed
 - Signed update-bundle verification and public HTTPS checks; the site remains
   on 0.1.8 and no new files have been published there
-- Installation on a clean Windows account or VM; Hyper-V enumeration was denied
-  in the current session
 - Full manual tray/global-hotkey/overlay testing of the packaged release
 
 The source review covered engine switching and generation ownership, cancellation
@@ -41,6 +39,10 @@ and child-process lifetime, final-only injection, HTTPS/hash checks, bounded ZIP
 extraction, offline inference, preserved settings, and runtime publication order.
 No release-blocking source defect was identified in that review. Independent
 review subagents were unavailable in this session.
+
+As directed by the user on 2026-09-27, installer testing on a clean Windows
+account or VM is optional and does not gate release or publication. It was not
+performed in this session.
 
 ## Resume without rebuilding
 
@@ -50,8 +52,8 @@ From the repository directory, sign the prepared manifest in a local terminal:
 minisign -S -s C:\EchoKeys\echo-update.key -m installer\output\update-bundle\manifest.json
 ```
 
-After completing the clean-account/manual installer checks (or receiving an
-explicit waiver), publish the prepared bundle:
+After signing and completing the remaining required manual checks, publish the
+prepared bundle:
 
 ```powershell
 .\installer\build-and-publish.ps1 -SkipBuild
