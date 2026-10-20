@@ -1,0 +1,78 @@
+import { VerticalBox, HorizontalBox, ListView, ComboBox, LineEdit, CheckBox, Button } from "std-widgets.slint";
+export struct CodexConversationRow { title: string, details: string }
+export struct CodexPreviewRow { role: string, text: string }
+export component CodexImportWindow inherits Window {
+    title: "Import Codex conversation";
+    default-font-family: "Arial";
+    preferred-width: 940px; preferred-height: 720px;
+    min-width: 480px; min-height: 520px;
+    background: #171e26;
+    in property <[string]> profiles;
+    in-out property <int> profile-index;
+    in-out property <string> query;
+    in-out property <bool> archived;
+    in property <[CodexConversationRow]> conversations;
+    in property <[CodexPreviewRow]> preview;
+    in property <int> selected-index: -1;
+    in property <bool> busy;
+    in property <bool> importing;
+    in property <bool> more;
+    in property <bool> preview-more;
+    in property <bool> previous;
+    in property <bool> preview-previous;
+    in property <string> status;
+    callback refresh();
+    callback add-profile();
+    callback choose(int);
+    callback page(int);
+    callback preview-page(int);
+    callback import-selected();
+    callback cancel-import();
+    VerticalBox { padding: 12px; spacing: 8px;
+        HorizontalBox {
+            ComboBox { model: root.profiles; current-index <=> root.profile-index;
+                enabled: !root.busy && !root.importing; selected(_) => { root.refresh(); }
+                accessible-label: "Codex profile"; horizontal-stretch: 1; min-width: 100px; }
+            Button { text: "Add profile…"; enabled: !root.busy && !root.importing; clicked => { root.add-profile(); } }
+            Button { text: "Refresh"; enabled: !root.busy && !root.importing; clicked => { root.refresh(); } }
+        }
+        HorizontalBox {
+            LineEdit { text <=> root.query; placeholder-text: "Search title or project"; horizontal-stretch: 1;
+                accessible-label: "Search Codex conversations"; accepted => { root.refresh(); } enabled: !root.importing; }
+            Button { text: "Search"; enabled: !root.busy && !root.importing; clicked => { root.refresh(); } }
+            CheckBox { text: "Archived"; checked <=> root.archived; enabled: !root.busy && !root.importing; toggled => { root.refresh(); } }
+        }
+        Text { text: root.status; color: #b4c4d3; wrap: word-wrap; }
+        ListView { preferred-height: 140px; min-height: 100px; vertical-stretch: 0; horizontal-scrollbar-policy: always-off;
+            accessible-label: "Codex conversations";
+            for row[index] in root.conversations : Rectangle {
+                height: 58px; background: index == root.selected-index ? #294155 : #212d38;
+                border-radius: 5px;
+                Text { x: 8px; y: 6px; width: parent.width - 16px; text: row.title; color: #edf1f5; font-size: 14px; overflow: elide; }
+                Text { x: 8px; y: 30px; width: parent.width - 16px; text: row.details; color: #a7b6c4; font-size: 11px; overflow: elide; }
+                TouchArea { enabled: !root.busy && !root.importing; clicked => { root.choose(index); } }
+            }
+        }
+        HorizontalBox {
+            Button { text: "Previous"; enabled: root.previous && !root.busy && !root.importing; clicked => { root.page(-1); } }
+            Button { text: "Next"; enabled: root.more && !root.busy && !root.importing; clicked => { root.page(1); } }
+            Text { text: "Snapshot copy · continued by Hermes"; color: #a7b6c4; horizontal-stretch: 1; }
+        }
+        ListView { vertical-stretch: 1; horizontal-scrollbar-policy: always-off;
+            accessible-label: "Codex conversation preview";
+            for row in root.preview : Rectangle {
+                height: body.preferred-height + 32px; background: row.role == "user" ? #284157 : #222d37; border-radius: 6px;
+                Text { x: 8px; y: 4px; text: row.role == "user" ? "You" : "Assistant"; color: #a7b6c4; font-size: 11px; }
+                body := Text { x: 8px; y: 22px; width: parent.width - 16px; text: row.text; color: #edf1f5; wrap: word-wrap; }
+            }
+        }
+        HorizontalBox {
+            Button { text: "Earlier preview"; enabled: root.preview-previous && !root.busy && !root.importing; clicked => { root.preview-page(-1); } }
+            Button { text: "Later preview"; enabled: root.preview-more && !root.busy && !root.importing; clicked => { root.preview-page(1); } }
+        }
+        HorizontalBox {
+            Button { text: "Import into new tab"; enabled: root.selected-index >= 0 && !root.busy && !root.importing; horizontal-stretch: 1; clicked => { root.import-selected(); } }
+            Button { text: "Cancel import"; visible: root.importing; clicked => { root.cancel-import(); } }
+        }
+    }
+}

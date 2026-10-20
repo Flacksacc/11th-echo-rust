@@ -1,0 +1,462 @@
+import { GraphCanvas, GraphNodeRow, GraphPortRow, GraphWireRow, GraphSettingRow } from "graph.slint";
+export { GraphNodeRow, GraphPortRow, GraphWireRow, GraphSettingRow }
+import { VerticalBox, HorizontalBox, LineEdit, TextEdit, ComboBox, CheckBox, ScrollView, Button, Slider, Palette } from "std-widgets.slint";
+export struct PipelineRow { id: string, name: string, summary: string, details: string, active: bool, assistant: bool }
+export struct PipelineCard { title: string, summary: string, icon: image, speech: bool }
+export struct PipelinePoolEntry { card: PipelineCard, catalog-index: int }
+export struct PipelinePoolRow { entries: [PipelinePoolEntry] }
+export struct PipelinePoolGroup { title: string, rows: [PipelinePoolRow] }
+component PipelineAction inherits Rectangle {
+    in property <image> symbol;
+    in property <string> action-label;
+    in property <bool> available: true;
+    in property <bool> selected: false;
+    in property <bool> destructive: false;
+    out property <bool> hovered: hit.has-hover;
+    callback clicked();
+    width: 29px; height: 29px; border-radius: 5px;
+    background: root.selected ? #174a31 : hit.has-hover && root.available ? (root.destructive ? #642734 : #254936) : #ffffff0a;
+    border-width: keyboard.has-focus ? 1px : 0px; border-color: root.destructive ? #fda4af : #4ade80;
+    accessible-role: button;
+    accessible-label: root.action-label;
+    accessible-enabled: root.available;
+    accessible-action-default => { if root.available { root.clicked(); } }
+    forward-focus: keyboard;
+    Image { source: root.symbol; width: 15px; height: 15px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; colorize: root.selected ? #4ade80 : root.available ? #edfff2 : #728d7b; }
+    keyboard := FocusScope { key-pressed(event) => { if root.available && (event.text == " " || event.text == "\n") { root.clicked(); return accept; } return reject; } }
+    hit := TouchArea { mouse-cursor: root.available ? pointer : default; clicked => { if root.available { keyboard.focus(); root.clicked(); } } }
+}
+export component PipelineList inherits Rectangle {
+    in property <[PipelineRow]> rows;
+    in property <string> error;
+    callback edit(int);
+    callback use-pipeline(int);
+    callback duplicate(int);
+    callback delete-pipeline(int);
+    callback new-pipeline();
+    callback new-assistant();
+    background: transparent;
+    min-height: list.preferred-height;
+    list := VerticalBox { padding: 0px; spacing: 10px; alignment: start;
+        Text { text: "Pipelines"; color: #edfff2; font-size: 18px; }
+        Text { text: "Each graph has its own optional hotkey. Its wiring determines the output."; color: #a9c3b2; wrap: word-wrap; }
+        if root.error != "" : Text { text: root.error; color: #fda4af; wrap: word-wrap; }
+        for row[index] in root.rows : Rectangle {
+            min-height: 72px; border-radius: 8px; background: #0b2117; border-width: 1px; border-color: row.active ? #4ade80 : #294938;
+            accessible-role: list-item;
+            accessible-label: row.name;
+            accessible-description: row.details;
+            HorizontalBox { padding: 10px; spacing: 10px;
+                VerticalBox { horizontal-stretch: 1; spacing: 5px;
+                    Text { text: row.name; color: #edfff2; font-size: 14px; font-weight: 600; overflow: elide; }
+                    Text { text: row.summary; color: #a9c3b2; font-size: 11px; overflow: elide; }
+                }
+                HorizontalBox { spacing: 4px; alignment: end;
+                    use-action := PipelineAction { symbol: row.active ? @image-url("../assets/icons/pipeline-active.svg") : @image-url("../assets/icons/pipeline-use.svg"); action-label: row.active ? "Active" : "Use"; available: !row.active; selected: row.active; clicked => { root.use-pipeline(index); } }
+                    edit-action := PipelineAction { symbol: @image-url("../assets/icons/pipeline-edit.svg"); action-label: "Edit"; clicked => { root.edit(index); } }
+                    duplicate-action := PipelineAction { symbol: @image-url("../assets/icons/pipeline-duplicate.svg"); action-label: "Duplicate"; clicked => { root.duplicate(index); } }
+                    delete-action := PipelineAction { symbol: @image-url("../assets/icons/pipeline-delete.svg"); action-label: "Delete"; destructive: true; available: !row.active || row.assistant; clicked => { root.delete-pipeline(index); } }
+                }
+            }
+            Tooltip {
+                VerticalBox { padding: 10px; spacing: 6px;
+                    if !(use-action.hovered || edit-action.hovered || duplicate-action.hovered || delete-action.hovered) : VerticalBox {
+                        spacing: 6px;
+                        Text { text: row.name; color: #edfff2; font-weight: 600; font-size: 14px; width: 330px; wrap: word-wrap; }
+                        Text { text: row.details; color: #c5dfcf; font-size: 12px; width: 330px; wrap: word-wrap; }
+                    }
+                    if use-action.hovered || edit-action.hovered || duplicate-action.hovered || delete-action.hovered : Text {
+                        text: use-action.hovered ? use-action.action-label : edit-action.hovered ? "Edit" : duplicate-action.hovered ? "Duplicate" : "Delete";
+                        color: #edfff2;
+                    }
+                }
+            }
+        }
+        Rectangle {
+            min-height: 72px; border-radius: 8px; background: #0b2117;
+            border-width: 1px; border-color: new-focus.has-focus ? #4ade80 : #294938;
+            accessible-role: button; accessible-label: "New pipeline";
+            accessible-action-default => { root.new-pipeline(); }
+            forward-focus: new-focus;
+            Text { text: "+ New graph"; color: #4ade80; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; }
+            new-focus := FocusScope { key-pressed(event) => { if event.text == " " || event.text == "\n" { root.new-pipeline(); return accept; } return reject; } }
+            TouchArea { mouse-cursor: pointer; clicked => { new-focus.focus(); root.new-pipeline(); } }
+        }
+
+    }
+}
+export struct StageEntry { card: PipelineCard, index: int, left: bool, right: bool, change: bool, remove: bool, ordered: bool }
+export struct PipelineStage { title: string, description: string, stage: int, entries: [StageEntry], add: bool }
+component StageCard inherits Rectangle {
+    in property <StageEntry> entry;
+    callback action(int);
+    width: 224px; height: 146px; border-radius: 8px; background: #10291d; border-width: 1px; border-color: #315940;
+    accessible-role: list-item; accessible-label: root.entry.card.title;
+    Rectangle { x: 8px; y: 8px; width: parent.width - 16px; height: 98px;
+        Text { x: 0px; y: 0px; width: parent.width; height: 40px; text: root.entry.card.title; color: #edfff2; font-size: 14px; font-weight: 600; wrap: word-wrap; overflow: elide; }
+        Text { x: 0px; y: 44px; width: parent.width; height: 50px; text: root.entry.card.summary; color: #a9c3b2; font-size: 11px; wrap: word-wrap; overflow: elide; }
+        config-focus := FocusScope { accessible-role: button; accessible-label: "Configure " + root.entry.card.title; accessible-action-default => { root.action(0); } key-pressed(e) => { if e.text == " " || e.text == "\n" { root.action(0); return accept; } return reject; } }
+        TouchArea { mouse-cursor: pointer; clicked => { config-focus.focus(); root.action(0); } }
+    }
+    HorizontalBox { x: 6px; y: 112px; width: parent.width - 12px; height: 28px; padding: 0px; spacing: 3px;
+        if root.entry.ordered : Button { text: "←"; enabled: root.entry.left; accessible-label: "Move " + root.entry.card.title + " left"; clicked => { root.action(1); } }
+        if root.entry.ordered : Button { text: "→"; enabled: root.entry.right; accessible-label: "Move " + root.entry.card.title + " right"; clicked => { root.action(2); } }
+        Button { text: root.entry.index == -3 ? "Change router" : "Change"; enabled: root.entry.change; accessible-label: "Change " + root.entry.card.title; clicked => { root.action(4); } }
+        if root.entry.index != -3 : Button { text: "×"; enabled: root.entry.remove; accessible-label: "Remove " + root.entry.card.title; clicked => { root.action(3); } }
+    }
+}
+component StageLane inherits Rectangle {
+    in property <PipelineStage> stage;
+    in property <int> reveal-index: -1;
+    property <length> add-width: self.width < 450px ? 86px : 150px;
+    callback action(int, int);
+    callback add();
+    height: 216px; min-width: 0px; background: #0b2117; border-radius: 8px; border-width: 1px; border-color: #294938;
+    Text { x: 12px; y: 8px; width: parent.width - 24px; height: 22px; text: root.stage.title; color: #edfff2; font-size: 15px; font-weight: 600; }
+    Text { x: 12px; y: 32px; width: parent.width - 24px; height: 24px; text: root.stage.description; color: #a9c3b2; font-size: 11px; overflow: elide; }
+    scroll := ScrollView { x: 6px; y: 58px; width: parent.width - (root.stage.add ? root.add-width + 18px : 12px); height: 158px;
+        content-x: root.reveal-index < 0 ? 0px : -Math.max(0px, Math.min(root.reveal-index * 260px, self.content-width - self.width));
+        HorizontalBox { padding: 0px; spacing: 8px; alignment: start;
+            for entry[i] in root.stage.entries : HorizontalBox { padding: 0px; spacing: 8px;
+                if i > 0 : Text { text: "→"; color: #4ade80; width: 20px; font-size: 20px; vertical-alignment: center; }
+                StageCard { entry: entry; action(a) => { root.action(entry.index, a); } }
+            }
+        }
+    }
+    if root.stage.add : Button { x: parent.width - root.add-width - 6px; y: 58px; width: root.add-width; height: 146px; text: "+ Add\ncomponent"; accessible-label: "Add component to " + root.stage.title; clicked => { root.add(); } }
+    changed reveal-index => { if root.reveal-index >= 0 { scroll.content-x = -Math.max(0px, Math.min(root.reveal-index * 260px, scroll.content-width - scroll.width)); } }
+}
+export component PipelineEditorWindow inherits Window {
+    default-font-family: "Arial"; icon: @image-url("../eleventhecho.png");
+    init => { Palette.color-scheme = ColorScheme.dark; }
+    title: "Edit pipeline"; preferred-width: 1100px; preferred-height: 900px; min-width: 700px; min-height: 600px; background: #07140e;
+    in property <bool> graph-mode: false;
+    in property <[GraphNodeRow]> graph-nodes;
+    in property <[GraphWireRow]> graph-wires;
+    in property <[string]> graph-router-models;
+    in property <[string]> graph-router-model-ids;
+    in-out property <float> graph-zoom: 1;
+    in-out property <float> graph-pan-x: 30;
+    in-out property <float> graph-pan-y: 30;
+    in-out property <string> graph-selected;
+    in property <[string]> graph-selection;
+    callback graph-select-node(string,bool);
+    callback graph-select-rectangle(float,float,float,float,bool,bool);
+    callback graph-move-selection(float,float);
+    callback graph-copy() -> string;
+    callback graph-paste(string);
+    in-out property <string> graph-hotkey;
+    out property <bool> graph-hotkey-focused;
+    callback capture-graph-hotkey(KeyEvent) -> string;
+    in property <bool> redo-available;
+    out property <float> graph-canvas-width: canvas.width / 1px;
+    out property <float> graph-canvas-height: canvas.height / 1px;
+    callback graph-checkpoint();
+    callback graph-geometry(string,float,float,float,float);
+    callback graph-edit-text(string,string,bool) -> bool;
+    callback graph-voice-in-use(string) -> bool;
+    callback graph-setting-edited(string,string,string,bool) -> bool;
+    callback graph-select-router(string,string);
+    callback graph-start-wire(string,string);
+    callback graph-finish-wire(float,float);
+    callback graph-disconnect(int);
+    callback graph-view(float,float,float);
+    callback graph-delete(string);
+    callback graph-duplicate(string);
+    callback graph-fit();
+    callback redo();
+    in property <[PipelineCard]> cards;
+    in property <[PipelineStage]> stages;
+    in property <PipelineStage> direct-stage;
+    in property <PipelineStage> delegated-stage;
+    in property <[PipelinePoolGroup]> pool-groups;
+    in-out property <string> pool-search;
+    out property <int> pool-columns: 1;
+    in property <bool> assistant-mode: false;
+    in property <string> router-name;
+    in property <bool> decision-router;
+    in property <string> fast-answer-name;
+    in property <string> answer-name;
+    in property <string> voice-name;
+    in-out property <int> configuration-role: -1;
+    in-out property <string> pipeline-name;
+    in-out property <bool> dirty: false;
+    in-out property <bool> close-prompt: false;
+    in property <bool> undo-available;
+    in property <string> error;
+    in-out property <bool> picker-open: false;
+    in-out property <int> picker-stage: 0;
+    in-out property <int> picker-index: -2;
+    in-out property <int> reveal-stage: -1;
+    in-out property <int> reveal-index: -1;
+    callback filter-pool(string, int);
+    callback create-component();
+    callback refresh-pool();
+    callback stage-action(int, int, int);
+    callback open-picker(int, int);
+    callback pick-component(int);
+    callback undo();
+    callback configure(int);
+    callback configure-assistant();
+    callback assign-assistant-model(int, int);
+    callback add(int, int);
+    callback move-step(int, int);
+    callback remove-step(int);
+    callback save();
+    callback cancel();
+    forward-focus: keyboard;
+    keyboard := FocusScope {
+        key-pressed(event) => {
+            if root.graph-mode && event.modifiers.control && event.text.to-lowercase() == "c" { canvas.copy-selection(); return accept; }
+            if root.graph-mode && event.modifiers.control && event.text.to-lowercase() == "v" { canvas.paste-selection(); return accept; }
+            return reject;
+        }
+        capture-key-pressed(event) => { if event.text == Key.Escape && root.picker-open { root.picker-open = false; return accept; } return reject; }
+        VerticalBox { padding: 16px; spacing: 10px;
+            HorizontalBox { padding: 0px; spacing: 12px; vertical-stretch: 0;
+                Text { text: "Pipeline"; color: #a9c3b2; }
+                LineEdit { horizontal-stretch: 1; font-size: 20px; accessible-label: "Pipeline name"; text <=> root.pipeline-name; edited => { root.dirty = true; } }
+            }
+            if !root.graph-mode : Text { text: "Follow the arrows. Each component receives the previous component’s output."; color: #a9c3b2; wrap: word-wrap; vertical-stretch: 0; }
+            if root.assistant-mode : Text { text: "Input → Router → Direct / Delegated → Shared output → Chat"; color: #4ade80; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; }
+            if root.graph-mode : HorizontalBox { vertical-stretch:0;
+                Text { text:"Hotkey";color:#a9c3b2;vertical-alignment:center; }
+                FocusScope {
+                    horizontal-stretch:1; forward-focus:hotkey-field;
+                    capture-key-pressed(event) => {
+                        if event.text==Key.Tab {return reject;}
+                        if event.text==Key.Escape {canvas.focus();return accept;}
+                        if (event.text==Key.Backspace || event.text==Key.Delete) && !event.modifiers.control && !event.modifiers.shift && !event.modifiers.alt && !event.modifiers.meta {root.graph-hotkey="";root.dirty=true;return accept;}
+                        let combo=root.capture-graph-hotkey(event);
+                        if combo!="" {root.graph-hotkey=combo;root.dirty=true;}
+                        return accept;
+                    }
+                    hotkey-field := LineEdit {width:100%;height:100%;text <=> root.graph-hotkey;read-only:true;placeholder-text:"Click and press a shortcut · Backspace clears";accessible-label:"Pipeline hotkey";changed has-focus=>{root.graph-hotkey-focused=self.has-focus;}}
+                }
+            }
+            if root.graph-mode : HorizontalBox {vertical-stretch:0;
+                Button {text:"Add node";clicked=>{root.open-picker(5,-2);}}
+                Button {text:"Replace";enabled:root.graph-selected!="" && root.graph-selection.length <= 1;clicked=>{root.open-picker(5,1);}}
+                Button {text:"Delete";enabled:root.graph-selected!="";clicked=>{root.graph-delete(root.graph-selected);}}
+                Button {text:"Duplicate";enabled:root.graph-selected!="";clicked=>{root.graph-duplicate(root.graph-selected);}}
+                Button {text:"Fit graph";clicked=>{root.graph-fit();}}
+                Button {text:"100%";clicked=>{root.graph-checkpoint();root.graph-view(30,30,1);}}
+                Text {text:Math.round(root.graph-zoom*100)+"%";color:#a9c3b2;vertical-alignment:center;}
+            }
+            canvas := GraphCanvas { visible:root.graph-mode; max-height:root.graph-mode ? 100000px : 0px; min-height:0px; vertical-stretch:root.graph-mode ? 1 : 0;
+                nodes:root.graph-nodes;wires:root.graph-wires;router-models:root.graph-router-models;zoom <=> root.graph-zoom;pan-x <=> root.graph-pan-x;pan-y <=> root.graph-pan-y;selected <=> root.graph-selected;
+                select-node(id,additive)=>{root.graph-select-node(id,additive);}
+                select-rectangle(x1,y1,x2,y2,additive,begin)=>{root.graph-select-rectangle(x1,y1,x2,y2,additive,begin);}
+                move-selection(x,y)=>{root.graph-move-selection(x,y);}
+                copy-nodes=>{return root.graph-copy();} paste-nodes(text)=>{root.graph-paste(text);}
+                checkpoint=>{root.graph-checkpoint();} geometry(id,x,y,w,h)=>{root.graph-geometry(id,x,y,w,h);}
+                edit-text(id,text,begin)=>{return root.graph-edit-text(id,text,begin);}
+                select-router(id,value)=>{root.graph-select-router(id,value);}
+                start-wire(id,p)=>{root.graph-start-wire(id,p);} finish-wire(x,y)=>{root.graph-finish-wire(x,y);}
+                setting-edited(id,key,value,begin)=>{return root.graph-setting-edited(id,key,value,begin);}
+                disconnect(i)=>{root.graph-disconnect(i);} view-changed(x,y,z)=>{root.graph-view(x,y,z);}
+                delete-node(id)=>{root.graph-delete(id);} duplicate-node(id)=>{root.graph-duplicate(id);} add-node=>{root.open-picker(5,-2);}
+                undo=>{root.undo();} redo=>{root.redo();}
+            }
+            if !root.graph-mode : ScrollView { vertical-stretch: 1;
+                VerticalBox { padding: 0px; spacing: 6px; alignment: start;
+                    for stage in root.stages : VerticalBox { visible: stage.stage != 2 && stage.stage != 3; padding: 0px; spacing: 6px;
+                        if stage.stage == 1 : Text { text: "↓ Input text enters the router"; color: #4ade80; font-size: 13px; horizontal-alignment: center; }
+                        if stage.stage == 4 && root.assistant-mode : Rectangle { height: 30px;
+                            Rectangle { x: parent.width / 4; y: 0px; width: 2px; height: 14px; background: #4ade80; }
+                            Rectangle { x: parent.width * 3 / 4; y: 0px; width: 2px; height: 14px; background: #4ade80; }
+                            Rectangle { x: parent.width / 4; y: 12px; width: parent.width / 2; height: 2px; background: #4ade80; }
+                            Rectangle { x: parent.width / 2; y: 12px; width: 2px; height: 8px; background: #4ade80; }
+                            Text { x: parent.width / 2 - 8px; y: 16px; width: 18px; height: 14px; text: "↓"; color: #4ade80; horizontal-alignment: center; }
+                        }
+                        if stage.stage == 4 && !root.assistant-mode : Text { text: "↓ Final text"; color: #4ade80; font-size: 13px; horizontal-alignment: center; }
+                        StageLane { stage: stage; reveal-index: root.reveal-stage == stage.stage ? root.reveal-index : -1;
+                            action(index, a) => { root.stage-action(stage.stage, index, a); }
+                            add => { root.open-picker(stage.stage, -2); }
+                        }
+                        if stage.stage == 1 : VerticalBox { padding: 0px; spacing: 6px;
+                            Rectangle { height: 30px;
+                                Rectangle { x: parent.width / 2; y: 0px; width: 2px; height: 14px; background: #4ade80; }
+                                Rectangle { x: parent.width / 4; y: 12px; width: parent.width / 2; height: 2px; background: #4ade80; }
+                                Rectangle { x: parent.width / 4; y: 12px; width: 2px; height: 8px; background: #4ade80; }
+                                Rectangle { x: parent.width * 3 / 4; y: 12px; width: 2px; height: 8px; background: #4ade80; }
+                                Text { x: parent.width / 4 - 8px; y: 16px; width: 18px; height: 14px; text: "↓"; color: #4ade80; horizontal-alignment: center; }
+                                Text { x: parent.width * 3 / 4 - 8px; y: 16px; width: 18px; height: 14px; text: "↓"; color: #4ade80; horizontal-alignment: center; }
+                            }
+                            HorizontalBox { padding: 0px; spacing: 10px;
+                                StageLane { stage: root.direct-stage; horizontal-stretch: 1; reveal-index: root.reveal-stage == 2 ? root.reveal-index : -1;
+                                    action(index,a) => { root.stage-action(2,index,a); } add => { root.open-picker(2,-2); }
+                                }
+                                StageLane { stage: root.delegated-stage; horizontal-stretch: 1; reveal-index: root.reveal-stage == 3 ? root.reveal-index : -1;
+                                    action(index,a) => { root.stage-action(3,index,a); } add => { root.open-picker(3,-2); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if root.error != "" : Text { text: root.error; color: #fda4af; wrap: word-wrap; vertical-stretch: 0; }
+            HorizontalBox { padding: 0px; vertical-stretch: 0; spacing: 8px;
+                Text { text: root.dirty ? "Unsaved changes" : "Saved"; color: #a9c3b2; horizontal-stretch: 1; }
+                Button { text: "Undo"; enabled: root.undo-available; clicked => { root.undo(); } }
+                if root.graph-mode : Button { text:"Redo";enabled:root.redo-available;clicked=>{root.redo();} }
+                Button { text: "Cancel"; clicked => { root.cancel(); } }
+                Button { text: "Save"; clicked => { root.save(); } }
+            }
+        }
+        if root.picker-open : Rectangle {
+            width: parent.width; height: parent.height; background: #00000090;
+            TouchArea { clicked => { root.picker-open = false; } }
+            Rectangle { x: (parent.width - self.width) / 2; y: 70px; width: Math.min(540px, parent.width - 40px); height: Math.min(600px, parent.height - 110px);
+                background: #10291d; border-radius: 10px; border-width: 1px; border-color: #4ade80;
+                TouchArea {}
+                VerticalBox { padding: 16px; spacing: 10px;
+                    Text { text: root.picker-index == -2 ? "Add component" : "Change component"; color: #edfff2; font-size: 20px; }
+                    picker-search := LineEdit { init => { self.focus(); } placeholder-text: "Search compatible components"; accessible-label: "Search compatible components"; text <=> root.pool-search; edited => { root.filter-pool(root.pool-search, 1); } }
+                    ScrollView { vertical-stretch: 1;
+                        VerticalBox { padding: 0px; spacing: 6px; alignment: start;
+                            if root.pool-groups.length == 0 : Text { text: "No compatible components found"; color: #a9c3b2; }
+                            for group in root.pool-groups : VerticalBox { padding: 0px; spacing: 6px;
+                                Text { text: group.title; color: #a9c3b2; font-size: 12px; }
+                                for row in group.rows : VerticalBox { padding: 0px; spacing: 6px;
+                                    for entry in row.entries : Button { height: 54px; text: entry.card.title + "\n" + entry.card.summary; clicked => { root.pick-component(entry.catalog-index); } }
+                                }
+                            }
+                        }
+                    }
+                    Button { text: "Create model component"; clicked => { root.create-component(); } }
+                    Text { text: "Click outside this menu to close it."; color: #a9c3b2; font-size: 11px; }
+                }
+            }
+        }
+        if root.close-prompt : Rectangle { width: parent.width; height: parent.height; background: #000000c0; TouchArea {}
+            Rectangle { x: 80px; y: 160px; width: parent.width - 160px; height: 160px; background: #10291d;
+                VerticalBox { padding: 20px; Text { text: "Save changes before closing?"; color: #edfff2; }
+                    HorizontalBox { Button { text: "Save"; clicked => { root.save(); } } Button { text: "Discard"; clicked => { root.cancel(); } } Button { text: "Keep editing"; clicked => { root.close-prompt = false; } } }
+                }
+            }
+        }
+    }
+}
+export component PipelineStepWindow inherits Window {
+    default-font-family: "Arial";
+    icon: @image-url("../eleventhecho.png");
+    init => { Palette.color-scheme = ColorScheme.dark; }
+    title: "Configure component"; width: 620px; height: 720px; background: #07140e;
+    in property <int> kind;
+    in property <string> component-title;
+    in property <string> error;
+    in-out property <string> model;
+    in-out property <string> language;
+    in-out property <bool> no-verbatim;
+    in property <bool> supports-preload: false;
+    in-out property <bool> preload-on-start: false;
+    in-out property <[string]> presets;
+    in-out property <string> preset;
+    in-out property <string> prompt;
+    in-out property <string> max-tokens;
+    in-out property <string> temperature;
+    in-out property <string> timeout-seconds;
+    in-out property <float> cpu-threads;
+    in-out property <float> vad-threshold;
+    in-out property <float> silence-ms;
+    in-out property <float> pre-roll-ms;
+    in-out property <float> post-roll-ms;
+    in-out property <float> min-speech-ms;
+    in-out property <float> max-segment-seconds;
+    in-out property <float> partial-interval-ms;
+    in-out property <bool> redecode-full-session;
+    in-out property <bool> numbers;
+    in-out property <bool> digits;
+    in-out property <bool> whole;
+    in-out property <bool> ordinals;
+    in-out property <bool> decimals;
+    in-out property <bool> money;
+    in-out property <bool> measurements;
+    in-out property <bool> dates;
+    in-out property <bool> times;
+    in-out property <bool> identifiers;
+    in-out property <bool> addresses;
+    in-out property <bool> punctuation;
+    in-out property <bool> capitalization;
+    in-out property <bool> commas;
+    in-out property <bool> periods;
+    in-out property <bool> questions;
+    in-out property <string> protected-phrases;
+    in-out property <string> replacements;
+    callback apply();
+    callback cancel();
+    VerticalBox { padding: 16px; spacing: 10px;
+        Text { text: root.component-title; color: #edfff2; font-size: 18px; }
+        ScrollView { VerticalBox { padding: 0px; spacing: 8px; alignment: start;
+            if root.supports-preload && (root.kind != 4 || root.punctuation) : CheckBox { text: "Load selected local model when Echo starts"; checked <=> root.preload-on-start; }
+            if root.kind <= 2 : VerticalBox { padding: 0px; spacing: 8px;
+                Text { text: "Model"; color: #a9c3b2; }
+                LineEdit { text <=> root.model; enabled: root.kind != 1; }
+                if root.kind != 2 : VerticalBox { padding: 0px; spacing: 8px;
+                    Text { text: "Language code"; color: #a9c3b2; }
+                    LineEdit { text <=> root.language; enabled: root.kind != 1; }
+                    if root.kind == 0 : CheckBox { text: "Clean filler words and disfluencies"; checked <=> root.no-verbatim; }
+                }
+                if root.kind == 2 : VerticalBox { padding: 0px; spacing: 8px;
+                    Text { text: "Rewrite style"; color: #a9c3b2; }
+                    ComboBox { model: root.presets; current-value <=> root.preset; }
+                    if root.preset == "Custom" : TextEdit { height: 150px; text <=> root.prompt; }
+                }
+                if root.kind == 1 : VerticalBox { padding: 0px; spacing: 8px;
+                    Text { text: "Model is chosen from the pool. Advanced CPU/segmentation options:"; color: #a9c3b2; wrap: word-wrap; }
+                    Text { text: "CPU threads: " + root.cpu-threads; color: #a9c3b2; } Slider { minimum: 1; maximum: 32; value <=> root.cpu-threads; }
+                    Text { text: "VAD threshold: " + root.vad-threshold; color: #a9c3b2; } Slider { minimum: 0.1; maximum: 0.9; value <=> root.vad-threshold; }
+                    Text { text: "Silence milliseconds: " + root.silence-ms; color: #a9c3b2; } Slider { minimum: 200; maximum: 10000; value <=> root.silence-ms; }
+                    Text { text: "Pre-roll milliseconds: " + root.pre-roll-ms; color: #a9c3b2; } Slider { minimum: 0; maximum: 1000; value <=> root.pre-roll-ms; }
+                    Text { text: "Post-roll milliseconds: " + root.post-roll-ms; color: #a9c3b2; } Slider { minimum: 0; maximum: 1000; value <=> root.post-roll-ms; }
+                    Text { text: "Minimum speech milliseconds: " + root.min-speech-ms; color: #a9c3b2; } Slider { minimum: 50; maximum: 2000; value <=> root.min-speech-ms; }
+                    Text { text: "Maximum segment seconds: " + root.max-segment-seconds; color: #a9c3b2; } Slider { minimum: 5; maximum: 120; value <=> root.max-segment-seconds; }
+                    Text { text: "Preview interval milliseconds: " + root.partial-interval-ms; color: #a9c3b2; } Slider { minimum: 250; maximum: 5000; value <=> root.partial-interval-ms; }
+                    CheckBox { text: "Re-decode full session after Stop"; checked <=> root.redecode-full-session; }
+                }
+            }
+            if root.kind == 5 : VerticalBox { padding: 0px; spacing: 8px;
+                Text { text: "Instructions for this pipeline component"; color: #a9c3b2; }
+                TextEdit { height: 160px; text <=> root.prompt; }
+                Text { text: "Output tokens"; color: #a9c3b2; }
+                LineEdit { text <=> root.max-tokens; }
+                Text { text: "Temperature (optional)"; color: #a9c3b2; }
+                LineEdit { text <=> root.temperature; }
+                Text { text: "Timeout in seconds (5–600)"; color: #a9c3b2; }
+                LineEdit { text <=> root.timeout-seconds; }
+            }
+            if root.kind == 3 : VerticalBox { padding: 0px; spacing: 6px;
+                Text { text: "Numbers and quantities"; color: #a9c3b2; }
+                CheckBox { text: "Convert ordinary spoken numbers"; checked <=> root.numbers; }
+                CheckBox { text: "Prefer digits for small counts"; checked <=> root.digits; enabled: root.numbers; }
+                CheckBox { text: "Whole numbers · twenty three → 23"; checked <=> root.whole; enabled: root.numbers; }
+                CheckBox { text: "Ordinals · twenty first → 21st"; checked <=> root.ordinals; enabled: root.numbers; }
+                CheckBox { text: "Decimals and signed quantities"; checked <=> root.decimals; enabled: root.numbers; }
+                CheckBox { text: "Currency · twelve dollars → $12"; checked <=> root.money; }
+                CheckBox { text: "Measurements and percentages"; checked <=> root.measurements; }
+                Text { text: "Dates, times, and addresses"; color: #a9c3b2; }
+                CheckBox { text: "Named-month dates"; checked <=> root.dates; }
+                CheckBox { text: "Times with AM, PM, or o'clock"; checked <=> root.times; }
+                CheckBox { text: "Phone numbers and identifiers"; checked <=> root.identifiers; }
+                CheckBox { text: "Email and web addresses"; checked <=> root.addresses; }
+                Text { text: "Replacements · one spoken => written entry per line"; color: #a9c3b2; }
+                TextEdit { height: 90px; text <=> root.replacements; }
+            }
+            if root.kind == 4 : VerticalBox { padding: 0px; spacing: 6px;
+                CheckBox { text: "Rebuild punctuation using the local model"; checked <=> root.punctuation; }
+                CheckBox { text: "Capitalization"; checked <=> root.capitalization; }
+                CheckBox { text: "Commas"; checked <=> root.commas; enabled: root.punctuation; }
+                CheckBox { text: "Periods"; checked <=> root.periods; enabled: root.punctuation; }
+                CheckBox { text: "Question marks"; checked <=> root.questions; enabled: root.punctuation; }
+            }
+            if root.kind >= 3 : VerticalBox { padding: 0px; spacing: 6px;
+                Text { text: "Protected phrases · one per line"; color: #a9c3b2; }
+                Text { text: "Leave these phrases unchanged in this step (for example: one of a kind). Gemini follows its own prompt."; color: #a9c3b2; wrap: word-wrap; }
+                TextEdit { height: 90px; text <=> root.protected-phrases; }
+            }
+        } }
+        Text { text: root.error; color: #fda4af; wrap: word-wrap; }
+        HorizontalBox { Button { text: "Cancel"; clicked => { root.cancel(); } } Button { text: "Apply to draft"; clicked => { root.apply(); } } }
+    }
+}

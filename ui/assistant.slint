@@ -1,0 +1,550 @@
+import { GraphRunRow, GraphRunProgress } from "graph_progress.slint";
+import { AssistantSpeechBubble } from "avatar_playground.slint";
+import { AgentTab, RichMessageBlock, HermesConversationPanel, ConversationTabs } from "hermes.slint";
+import { VerticalBox, HorizontalBox, ScrollView, ListView, LineEdit, TextEdit, ComboBox, Button, CheckBox, Slider, Palette } from "std-widgets.slint";
+
+export struct AssistantFile { id: string, name: string }
+export struct AssistantMessage {
+    text: string,
+    from-user: bool,
+    state: string,
+    files: [AssistantFile],
+}
+
+export component AssistantChatWindow inherits Window {
+    default-font-family: "Arial";
+    init => { Palette.color-scheme = ColorScheme.dark; }
+    title: "Echo Assistant";
+    icon: @image-url("../eleventhecho.png");
+    in-out property <int> window-width: 980;
+    in-out property <int> window-height: 720;
+    private property <bool> compact-layout: root.window-height < 600;
+    changed height => { root.compact-layout = root.height < 600px; }
+    preferred-width: root.window-width * 1px;
+    preferred-height: root.window-height * 1px;
+    min-width: 380px;
+    min-height: 520px;
+    background: #151d25;
+    in property <image> avatar: @image-url("../eleventhecho.png");
+    in property <string> assistant-state: "Ready";
+    in property <string> live-transcript: "";
+    in property <bool> listening: false;
+    changed listening => { if root.listening { root.native-scroll-bottom(); root.scroll-bottom(); } }
+    in property <[GraphRunRow]> graph-run-nodes;
+    in property <[GraphRunRow]> graph-progress-nodes;
+    in property <int> graph-step;
+    in property <string> speech-status;
+    in property <string> speech-model-status;
+    in property <bool> speech-model-ready: false;
+    in property <string> spoken-text;
+    in-out property <bool> show-spoken-text: true;
+    callback spoken-visibility-changed(bool);
+    in property <string> tool-activity;
+    callback open-file(string);
+    callback save-file(string);
+    callback show-file(string);
+    callback clear-files();
+    in property <[AssistantMessage]> messages;
+    in property <bool> hermes-mode;
+    in property <bool> hermes-ready;
+    in property <[AgentTab]> agent-tabs;
+    in property <[RichMessageBlock]> rich-blocks;
+    in property <string> selected-tab-id;
+    in property <int> selected-tab-index;
+    in property <string> task-title;
+    in property <string> tab-name;
+    in property <bool> selected-priority;
+    in property <bool> has-task;
+    in property <bool> can-retry;
+    in property <bool> can-load-older;
+    in property <bool> viewing-older;
+    in property <bool> loading-history;
+    in-out property <bool> show-output;
+    in-out property <length> hermes-scroll-position;
+    out property <bool> hermes-at-bottom: native-chat.at-bottom;
+    callback select-tab(string);
+    callback new-conversation();
+    callback import-codex();
+    callback open-reminders();
+    callback rename-tab(string);
+    callback priority-changed(bool);
+    callback hide-tab();
+    callback list-hidden();
+    callback stop-task();
+    callback stop-activity(string);
+    callback retry-task();
+    callback load-older();
+    callback load-latest();
+    callback view-changed(bool);
+    callback open-link(string);
+    callback hermes-settings();
+    callback tab-settings();
+    callback history-tools();
+    callback native-scroll-bottom();
+    native-scroll-bottom() => { native-chat.scroll-bottom(); }
+    in-out property <string> draft;
+    in-out property <float> playback-speed: 1.0;
+    in-out property <float> output-volume: 1.0;
+    callback volume-changed(float);
+    in property <[string]> graph-options;
+    in-out property <string> selected-graph;
+    callback graph-selected(string);
+    callback edit-graph();
+    callback submit(string);
+    callback new-chat();
+    callback start-listening();
+    callback speed-changed(float);
+    callback choose-avatar();
+    callback show-avatar();
+    callback desktop-avatar-settings();
+    callback scroll-bottom();
+    out property <bool> chat-at-bottom: chat-scroll.content-y <= chat-scroll.visible-height - chat-scroll.content-height + 12px;
+    out property <length> chat-scroll-position: chat-scroll.content-y;
+    scroll-bottom() => { chat-scroll.content-y = -Math.max(0px, chat-scroll.content-height - chat-scroll.visible-height); }
+
+    FocusScope {
+      capture-key-pressed(event) => {
+        if event.modifiers.control {
+          if event.text == "1" && root.agent-tabs.length > 0 { root.select-tab(root.agent-tabs[0].id); return accept; }
+          if event.text == "2" && root.agent-tabs.length > 1 { root.select-tab(root.agent-tabs[1].id); return accept; }
+          if event.text == "3" && root.agent-tabs.length > 2 { root.select-tab(root.agent-tabs[2].id); return accept; }
+          if event.text == "4" && root.agent-tabs.length > 3 { root.select-tab(root.agent-tabs[3].id); return accept; }
+          if event.text == "5" && root.agent-tabs.length > 4 { root.select-tab(root.agent-tabs[4].id); return accept; }
+          if event.text == "6" && root.agent-tabs.length > 5 { root.select-tab(root.agent-tabs[5].id); return accept; }
+          if event.text == "7" && root.agent-tabs.length > 6 { root.select-tab(root.agent-tabs[6].id); return accept; }
+          if event.text == "8" && root.agent-tabs.length > 7 { root.select-tab(root.agent-tabs[7].id); return accept; }
+          if event.text == "9" && root.agent-tabs.length > 8 { root.select-tab(root.agent-tabs[8].id); return accept; }
+        }
+        return reject;
+      }
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+        Rectangle {
+            height: 32px;
+            settings-anchor := Rectangle {
+                x: parent.width - self.width; y: parent.height - self.height;
+                width: 32px; height: 32px; background: #1c2630; border-radius: 6px;
+                assistant-settings := Button {
+                    width: 100%; height: 100%; icon: @image-url("../assets/icons/settings.svg");
+                    accessible-label: "Assistant settings";
+                    clicked => { settings-popup.show(); }
+                }
+            }
+            settings-popup := PopupWindow {
+                x: settings-anchor.x + settings-anchor.width - self.width;
+                y: settings-anchor.y + settings-anchor.height + 6px;
+                width: 300px; height: settings-layout.preferred-height;
+                close-policy: close-on-click-outside;
+                Rectangle {
+                    background: #151e28; border-radius: 12px; border-width: 1px; border-color: #39485b;
+                    settings-layout := VerticalBox {
+                        padding: 14px; spacing: 8px;
+                        Text { text: "Speech"; color: #edf1f5; font-size: 14px; font-weight: 700; }
+                        HorizontalLayout { height: 20px;
+                            Text { text: "Volume"; color: #a9c3b2; horizontal-stretch: 1; vertical-alignment: center; }
+                            Text { text: round(root.output-volume * 100) + "%"; color: #edf1f5; vertical-alignment: center; }
+                        }
+                        volume-slider := Slider { height: 28px; minimum: 0; maximum: 100; value: root.output-volume * 100;
+                            accessible-label: "Speech volume";
+                            changed(value) => { root.output-volume = round(value) / 100; root.volume-changed(root.output-volume); }
+                        }
+                        HorizontalLayout { height: 32px; spacing: 8px;
+                            Text { text: "Sentence speed"; color: #a9c3b2; vertical-alignment: center; horizontal-stretch: 1; }
+                            slower := Button { text: "−"; width: 32px; accessible-label: "Slower speech"; enabled: root.playback-speed > 0.75;
+                                clicked => { root.playback-speed = Math.max(0.75, root.playback-speed - 0.25); root.speed-changed(root.playback-speed); }
+                            }
+                            Text { text: root.playback-speed + "×"; color: #edf1f5; width: 36px; horizontal-alignment: center; vertical-alignment: center; }
+                            faster := Button { text: "+"; width: 32px; accessible-label: "Faster speech"; enabled: root.playback-speed < 2.;
+                                clicked => { root.playback-speed = Math.min(2., root.playback-speed + 0.25); root.speed-changed(root.playback-speed); }
+                            }
+                        }
+                        spoken-toggle := CheckBox { text: "Show spoken text"; checked <=> root.show-spoken-text;
+                            toggled => { root.spoken-visibility-changed(self.checked); }
+                        }
+                        if root.speech-status != "" : Text { text: root.speech-status; color: #a9c3b2; font-size: 12px; wrap: word-wrap; }
+                        if root.speech-model-status != "" : Text { text: root.speech-model-status; color: #a9c3b2; font-size: 12px; wrap: word-wrap; }
+                        Button { text: "Show desktop avatar"; clicked => { settings-popup.close(); root.show-avatar(); } }
+                        Button { text: "Desktop avatar settings…"; clicked => { settings-popup.close(); root.desktop-avatar-settings(); } }
+                        Button { text: "Avatar playground…"; clicked => { settings-popup.close(); root.choose-avatar(); } }
+                        Button { text: "Hermes assistant…"; clicked => { settings-popup.close(); root.hermes-settings(); } }
+                        if root.hermes-mode : Button { text: "Conversation settings…"; clicked => { settings-popup.close(); root.tab-settings(); } }
+                        if root.hermes-mode : Button { text: "Conversation history…"; clicked => { settings-popup.close(); root.history-tools(); } }
+                        if root.hermes-mode : Button { text: "Conversations…"; clicked => { settings-popup.close(); root.list-hidden(); } }
+                        if root.hermes-mode : Button { text: "Import Codex conversation…"; clicked => { root.import-codex(); settings-popup.close(); } }
+                        Button { text: "Calendar & reminders…"; clicked => {root.open-reminders(); settings-popup.close();} }
+                        Button { text: "Hide assistant"; clicked => { settings-popup.close(); root.close(); } }
+                    }
+                }
+            }
+        }
+        if root.speech-model-status != "" && !root.speech-model-ready : Rectangle {
+            height: model-status-text.preferred-height + 12px;
+            border-radius: 8px; background: #1c2630ee;
+            model-status-text := Text {
+                x: 8px; y: 6px; width: parent.width - 16px;
+                text: root.speech-model-status;
+                color: root.speech-model-ready ? #59dcd5 : #f6d58a;
+                font-size: 12px; wrap: word-wrap;
+            }
+        }
+        if root.assistant-state != "Ready" && root.assistant-state != "" : Rectangle {
+            height: state-text.preferred-height + 12px; border-radius: 8px; background: #222d37;
+            WindowMoveArea {
+                state-text := Text { x: 8px; y: 6px; width: parent.width - 16px;
+                    text: root.assistant-state; color: #59dcd5; font-size: 12px; wrap: word-wrap;
+                }
+            }
+        }
+        if root.tool-activity != "" : Rectangle {
+            height: activity-text.preferred-height + 12px; border-radius: 8px; background: #1c2630ee;
+            activity-text := Text { x: 8px; y: 6px; width: parent.width - 16px;
+                text: root.tool-activity; color: #a9c3b2; font-size: 12px; wrap: word-wrap;
+            }
+        }
+        if !root.hermes-mode && root.graph-run-nodes.length > 0 : GraphRunProgress { nodes: root.graph-progress-nodes; }
+        native-chat := HermesConversationPanel {
+            visible: root.hermes-mode;
+            min-height: root.hermes-mode ? 100px : 0px;
+            max-height: root.hermes-mode ? 1000000px : 0px;
+            vertical-stretch: root.hermes-mode ? 1 : 0;
+            tabs: root.agent-tabs; blocks: root.rich-blocks; selected-id: root.selected-tab-id;
+            selected-index: root.selected-tab-index;
+            can-create: root.hermes-ready && !root.listening;
+            task-title: root.task-title; tab-name: root.tab-name;
+            listening: root.listening; live-transcript: root.live-transcript;
+            selected-priority: root.selected-priority; has-task: root.has-task; can-retry: root.can-retry;
+            can-load-older: root.can-load-older; loading-history: root.loading-history;
+            viewing-older: root.viewing-older;
+            show-output <=> root.show-output; scroll-position <=> root.hermes-scroll-position;
+            select-tab(id) => { root.select-tab(id); }
+            new-conversation => { root.new-conversation(); }
+            rename-tab(name) => { root.rename-tab(name); }
+            priority-changed(value) => { root.priority-changed(value); }
+            hide-tab => { root.hide-tab(); }
+            list-hidden => { root.list-hidden(); }
+            stop-task => { root.stop-task(); }
+            stop-activity(target) => { root.stop-activity(target); }
+            retry-task => { root.retry-task(); }
+            load-older => { root.load-older(); }
+            load-latest => { root.load-latest(); }
+            view-changed(value) => { root.view-changed(value); }
+            open-link(url) => { root.open-link(url); }
+        }
+        chat-scroll := ListView {
+            visible: !root.hermes-mode;
+            max-height: root.hermes-mode ? 0px : 1000000px;
+            vertical-stretch: root.hermes-mode ? 0 : 1;
+            min-height: root.hermes-mode ? 0px : 100px;
+            content-width: self.visible-width;
+            horizontal-scrollbar-policy: always-off;
+            vertical-scrollbar-policy: always-on;
+            changed content-height => { if root.listening || root.live-transcript != "" { root.scroll-bottom(); } }
+                for index in root.messages.length + (root.listening || root.live-transcript != "" ? 1 : 0) : Rectangle {
+                    property <bool> live: index == root.messages.length;
+                    property <AssistantMessage> message: live ? { text: root.live-transcript == "" ? "Listening…" : root.live-transcript, from-user: true, state: "", files: [] } : root.messages[index];
+                    height: Math.max(52px, bubble-text.preferred-height + 30px) + message.files.length * 40px;
+                    border-radius: 10px;
+                    background: message.from-user ? #284157 : #1c2630;
+                    border-width: 1px;
+                    border-color: message.from-user ? #3c586e : #39485b;
+                    Text { x: 12px; y: 5px; text: message.from-user ? "You" : message.state == "Interrupted" ? "Assistant · Interrupted" : "Assistant"; color: #a7b6c4; font-size: 10px; font-weight: 700; }
+                    bubble-text := Text { x: 12px; y: 20px; width: parent.width - 24px; text: message.text == "" ? message.state : message.text; color: #edf1f5; font-size: 14px; wrap: word-wrap;
+                        accessible-label: parent.live ? "Your live message" : self.text; }
+                    for file[i] in message.files : HorizontalLayout {
+                        x: 12px; y: Math.max(52px, bubble-text.preferred-height + 30px) + i * 40px; width: parent.width - 24px; height: 32px; spacing: 4px;
+                        Button { text: file.name; horizontal-stretch: 1; clicked => { root.open-file(file.id); } }
+                        Button { text: "Save as"; clicked => { root.save-file(file.id); } }
+                        Button { text: "Folder"; clicked => { root.show-file(file.id); } }
+                    }
+                }
+        }
+        Rectangle { height: 48px; background: #222d37; border-radius: 6px;
+            HorizontalLayout { spacing: 8px;
+                message-input := LineEdit { horizontal-stretch: 1; text <=> root.draft;
+                    placeholder-text: "Ask or type a command…"; accessible-label: "Message Echo";
+                    accepted => { if (root.draft != "" && (!root.hermes-mode || root.hermes-ready)) { root.submit(root.draft); root.draft = ""; } }
+                }
+                Button { text: "Send"; enabled: !root.hermes-mode || root.hermes-ready; clicked => { if (root.draft != "") { root.submit(root.draft); root.draft = ""; } } }
+            }
+        }
+            if root.hermes-mode : ConversationTabs {
+            tabs: root.agent-tabs; can-create: root.hermes-ready && !root.listening;
+            selected-id: root.selected-tab-id; selected-index: root.selected-tab-index;
+            select-tab(id) => { root.select-tab(id); }
+            new-conversation => { root.new-conversation(); }
+        }
+    }
+  }
+}
+
+export component AgentApprovalWindow inherits Window {
+    default-font-family: "Arial";
+    title: "Echo action approval";
+    preferred-width: 540px; preferred-height: 420px; min-width: 400px; min-height: 300px;
+    in property <string> action-text;
+    in property <string> scope-label;
+    callback decide(bool,bool);
+    VerticalBox { padding: 16px; spacing: 10px;
+        Text { text: "Review assistant action"; font-size: 18px; }
+        action-scroll := ScrollView { content-width: self.visible-width;
+            Text { x: 0; y: 0; width: action-scroll.visible-width; text: root.action-text; wrap: word-wrap; }
+        }
+        if root.scope-label != "" : Button { text: "Allow this tool and target for this turn"; clicked => { root.decide(true,true); } }
+        if root.scope-label != "" : Text { text: root.scope-label; wrap: word-wrap; }
+        HorizontalBox { Button { text: "Deny"; clicked => { root.decide(false,false); } } Button { text: "Approve action"; clicked => { root.decide(true,false); } } }
+    }
+}
+
+export component AssistantPipelineWindow inherits Window {
+    default-font-family: "Arial";
+    init => { Palette.color-scheme = ColorScheme.dark; }
+    title: root.configuration-role == 6 ? "Edit voice" : root.configuration-role == 4 ? "Voice library — Pocket TTS" : root.configuration-role == 5 ? "Configure Assistant chat" : "Configure assistant component";
+    icon: @image-url("../eleventhecho.png");
+    preferred-width: root.configuration-role == 4 ? 820px : 560px;
+    min-width: root.configuration-role == 4 ? 720px : 480px;
+    min-height: root.configuration-role == 4 ? 520px : root.configuration-role == 6 ? 520px : root.configuration-role == 5 ? 230px : 420px;
+    preferred-height: root.configuration-role == -1 ? 690px : root.configuration-role == 5 ? 230px : root.configuration-role == 4 ? 520px : root.configuration-role == 6 ? 550px : 420px;
+    background: #07140e;
+    in-out property <string> router-name;
+    in-out property <string> answer-name;
+    in-out property <string> fast-answer-name;
+    in property <bool> decision-router;
+    in property <int> configuration-role: -1;
+    in property <[string]> answer-model-options;
+    in-out property <bool> preload-router-on-start;
+    in-out property <bool> preload-answer-on-start;
+    in-out property <bool> preload-voice-on-start;
+    in property <bool> router-local-model;
+    in property <bool> answer-local-model;
+    in-out property <string> instructions;
+    in-out property <string> voice-path;
+    in property <[string]> voice-options;
+    in property <[string]> voice-option-paths;
+    in-out property <string> selected-voice;
+    in-out property <string> voice-name;
+    in property <bool> importing-voice: false;
+    in property <bool> editing-voice: false;
+    in property <bool> creating-voice: false;
+    in property <bool> sayings-open: false;
+    callback manage-sayings();
+    callback new-voice();
+    callback edit-voice();
+    callback select-voice(string);
+    callback rename-voice();
+    callback export-voice();
+    callback delete-voice();
+    in-out property <string> voice-test-text: "Hello. This is your Echo assistant voice.";
+    in-out property <string> voice-status: "";
+    in property <bool> recording-voice: false;
+    in property <bool> installing-voice: false;
+    in property <bool> testing-voice: false;
+    in property <[string]> model-options;
+    in property <string> error;
+    callback save();
+    callback cancel();
+    callback import-voice();
+    callback record-voice();
+    callback install-voice-model();
+    in-out property <bool> default-voice-settings: false;
+    callback test-voice();
+    callback open-mcp-manager();
+    callback model-selection-changed();
+    VerticalBox { spacing: 0px;
+      ScrollView {
+        VerticalBox { padding: 18px; spacing: 9px; alignment: start;
+        Text { text: root.configuration-role == 1 ? "Router" : root.configuration-role == 2 ? "Direct answer" : root.configuration-role == 3 ? "Delegated answer" : root.configuration-role == 6 ? "Edit voice" : root.configuration-role == 4 ? "Voice library" : root.configuration-role == 5 ? "Assistant chat" : "Assistant configuration"; font-size: 20px; color: #e6fff0; }
+        Text { text: root.configuration-role == 6 ? "Rename a saved voice, import a recording, or record a new voice." : root.configuration-role == 4 ? "Select a voice to try it, then choose your default." : root.configuration-role == 5 ? "Receives the final text from the connected pipeline." : root.decision-router ? "The decision model selects a branch; text models generate the replies." : "The fast model answers directly or routes to the stronger model."; font-size: 12px; color: #a9c3b2; wrap: word-wrap; }
+        if root.configuration-role == -1 || root.configuration-role == 1 : VerticalBox { padding: 0px; spacing: 8px;
+        Text { text: "Fast router model"; color: #a9c3b2; }
+        ComboBox { model: root.model-options; current-value <=> root.router-name; selected(value) => { root.model-selection-changed(); } }
+        if root.router-local-model : CheckBox { text: "Load fast model when Echo starts"; checked <=> root.preload-router-on-start; }
+        }
+        if root.decision-router && (root.configuration-role == -1 || root.configuration-role == 2) : VerticalBox { padding: 0px; spacing: 8px;
+            Text { text: "Direct answer model"; color: #a9c3b2; }
+            ComboBox { model: root.answer-model-options; current-value <=> root.fast-answer-name; }
+        }
+        if root.configuration-role == -1 || root.configuration-role == 3 : VerticalBox { padding: 0px; spacing: 8px;
+        Text { text: "Stronger answer model"; color: #a9c3b2; }
+        ComboBox { model: root.answer-model-options; current-value <=> root.answer-name; selected(value) => { root.model-selection-changed(); } }
+        if root.answer-local-model : CheckBox { text: "Load answer model when Echo starts"; checked <=> root.preload-answer-on-start; }
+        }
+        if root.configuration-role < 4 : VerticalBox { padding: 0px; spacing: 8px;
+        Text { text: "Assistant instructions (shared)"; color: #a9c3b2; }
+        LineEdit { text <=> root.instructions; }
+        }
+        if root.configuration-role == -1 || root.configuration-role == 4 : HorizontalBox {
+            padding: 0px; spacing: 20px;
+            VerticalBox { padding: 0px; spacing: 8px; min-width: 240px; horizontal-stretch: 1;
+                Text { text: "Voices"; color: #a9c3b2; }
+                ListView { height: 210px;
+                    for voice in root.voice-options : Button {
+                        text: voice; primary: voice == root.selected-voice;
+                        enabled: !root.editing-voice && !root.testing-voice;
+                        clicked => { root.select-voice(voice); }
+                    }
+                }
+                HorizontalBox { padding: 0px; spacing: 8px;
+                    Button { text: "New voice"; primary: true; enabled: !root.testing-voice && !root.editing-voice && !root.installing-voice; clicked => { root.new-voice(); } }
+                    Button { text: "Edit voice"; enabled: !root.testing-voice && !root.editing-voice && !root.installing-voice; clicked => { root.edit-voice(); } }
+                }
+                Button { text: "Sayings…"; enabled: !root.testing-voice && !root.editing-voice && !root.installing-voice; clicked => { root.manage-sayings(); } }
+            }
+            VerticalBox { padding: 0px; spacing: 8px; horizontal-stretch: 2;
+                Text { text: root.selected-voice; font-size: 16px; color: #e6fff0; wrap: word-wrap; }
+                Text { text: "Test phrase"; color: #a9c3b2; }
+                TextEdit { height: 100px; text <=> root.voice-test-text; wrap: word-wrap; enabled: !root.testing-voice; accessible-label: "TTS test phrase"; }
+                Button { text: root.testing-voice ? "Playing preview…" : "Test voice"; enabled: !root.editing-voice && !root.testing-voice && root.voice-test-text != ""; clicked => { root.test-voice(); } }
+                Button { text: root.default-voice-settings ? "Use as default voice" : "Apply to pipeline"; enabled: !root.editing-voice && !root.testing-voice; clicked => { root.save(); } }
+                CheckBox { text: "Load voice model when Echo starts"; checked <=> root.preload-voice-on-start; }
+                Button { text: root.installing-voice ? "Installing…" : "Install Pocket TTS"; enabled: !root.installing-voice && !root.editing-voice && !root.testing-voice; clicked => { root.install-voice-model(); } }
+            }
+        }
+        if root.configuration-role == 6 : VerticalBox { padding: 0px; spacing: 10px;
+            Text { text: root.creating-voice ? "New voice" : "Selected voice: \{root.selected-voice}"; color: #e6fff0; wrap: word-wrap; }
+            Text { text: "Voice name"; color: #a9c3b2; }
+            LineEdit { text <=> root.voice-name; placeholder-text: "Select a custom voice to rename"; accessible-label: "Voice name"; enabled: root.voice-path != "" && !root.importing-voice && !root.recording-voice && !root.sayings-open; }
+            HorizontalBox { spacing: 8px;
+                Button { text: "Rename"; enabled: root.voice-path != "" && !root.importing-voice && !root.recording-voice && !root.sayings-open; clicked => { root.rename-voice(); } }
+                Button { text: "Export"; enabled: root.voice-path != "" && !root.importing-voice && !root.recording-voice && !root.sayings-open; clicked => { root.export-voice(); } }
+                Button { text: "Delete"; enabled: root.voice-path != "" && !root.importing-voice && !root.recording-voice && !root.sayings-open; clicked => { root.delete-voice(); } }
+            }
+            Button { text: "Sayings…"; enabled: !root.creating-voice && !root.sayings-open && !root.importing-voice && !root.recording-voice; clicked => { root.manage-sayings(); } }
+            Text { text: "Add a voice"; color: #a9c3b2; }
+            Button { text: root.importing-voice ? "Converting voice…" : "Import WAV / MP3 / safetensors"; enabled: !root.importing-voice && !root.recording-voice && !root.sayings-open; clicked => { root.import-voice(); } }
+            Button { text: root.recording-voice ? "Stop recording" : "Record voice"; enabled: !root.importing-voice && !root.sayings-open; clicked => { root.record-voice(); } }
+            Text { text: "Import WAV or MP3 recordings up to 30 seconds, or a safetensors voice prompt. Recordings are converted locally with Pocket TTS."; color: #a9c3b2; wrap: word-wrap; font-size: 12px; }
+        }
+        if root.voice-status != "" && (root.configuration-role == 4 || root.configuration-role == 6 || root.configuration-role == -1) : Text { text: root.voice-status; color: #a7f3d0; wrap: word-wrap; }
+        if root.configuration-role == 5 : Text { text: "Displays the text produced by its connected upstream component."; wrap: word-wrap; color: #a9c3b2; }
+        if root.error != "" : Text { text: root.error; color: #fda4af; wrap: word-wrap; }
+        }
+      }
+      Rectangle { height: 1px; background: #294636; }
+      HorizontalBox { padding: 12px; spacing: 8px;
+          if root.configuration-role < 4 : Button { text: "MCP servers"; clicked => { root.open-mcp-manager(); } }
+          if root.configuration-role != 4 && root.configuration-role != 6 : Button { text: root.default-voice-settings ? "Use as default voice" : "Apply to pipeline"; enabled: !root.recording-voice && !root.importing-voice; clicked => { root.save(); } }
+          Button { text: root.configuration-role == 4 ? "Close" : root.configuration-role == 6 ? "Done" : "Cancel"; enabled: !root.importing-voice && !root.editing-voice && !root.sayings-open; clicked => { root.cancel(); } }
+      }
+    }
+}
+
+export component McpManagerWindow inherits Window {
+    default-font-family: "Arial";
+    init => { Palette.color-scheme = ColorScheme.dark; }
+    title: "Assistant MCP servers";
+    icon: @image-url("../eleventhecho.png");
+    width: 540px;
+    height: 540px;
+    background: #07140e;
+    in property <[string]> server-options;
+    in-out property <string> selected-server;
+    in-out property <string> server-name;
+    in-out property <string> transport-name: "Stdio";
+    in-out property <string> command-text;
+    in-out property <string> args-text;
+    in-out property <string> url-text;
+    in-out property <bool> server-enabled: true;
+    in property <string> status-text;
+    in-out property <string> environment-text: "{}";
+    in-out property <string> headers-text: "{}";
+    in-out property <string> brave-key;
+    callback manage-components();
+    callback save-brave();
+    callback select-server(string);
+    callback new-server();
+    callback save-server();
+    callback remove-server();
+    callback test-server();
+    ScrollView {
+      VerticalBox { padding: 18px; spacing: 9px; alignment: start;
+        Text { text: "MCP servers"; font-size: 20px; color: #e6fff0; }
+        Text { text: "Connect servers, discover tools, and select them on Agent nodes."; color: #a9c3b2; wrap: word-wrap; }
+        Button { text: "Install or manage components"; clicked => { root.manage-components(); } }
+        Text { text: "Brave Search API key"; color: #a9c3b2; }
+        LineEdit { text <=> root.brave-key; input-type: password; }
+        Button { text: "Save search key"; clicked => { root.save-brave(); } }
+        HorizontalBox { spacing: 8px;
+            ComboBox { horizontal-stretch: 1; model: root.server-options; current-value <=> root.selected-server; selected(value) => { root.select-server(value); } }
+            Button { text: "New"; clicked => { root.new-server(); } }
+        }
+        Text { text: "Server name"; color: #a9c3b2; }
+        LineEdit { text <=> root.server-name; }
+        Text { text: "Transport"; color: #a9c3b2; }
+        ComboBox { model: ["Stdio", "Streamable HTTP"]; current-value <=> root.transport-name; }
+        if root.transport-name == "Stdio" : VerticalBox { spacing: 8px;
+            Text { text: "Executable path"; color: #a9c3b2; }
+            LineEdit { text <=> root.command-text; }
+            Text { text: "Arguments (one per line)"; color: #a9c3b2; }
+            TextEdit { text <=> root.args-text; height: 80px; }
+            Text { text: "Environment variables (JSON; stored protected)"; color: #a9c3b2; }
+            TextEdit { text <=> root.environment-text; height: 64px; }
+        }
+        if root.transport-name == "Streamable HTTP" : VerticalBox { spacing: 8px;
+            Text { text: "MCP endpoint URL"; color: #a9c3b2; }
+            LineEdit { text <=> root.url-text; }
+            Text { text: "Authentication headers (JSON; stored protected)"; color: #a9c3b2; }
+            TextEdit { text <=> root.headers-text; height: 64px; }
+        }
+        HorizontalBox { spacing: 8px;
+            CheckBox { checked <=> root.server-enabled; }
+            Text { text: "Enabled"; color: #a9c3b2; vertical-alignment: center; }
+        }
+        HorizontalBox { spacing: 8px;
+            Button { text: "Save server"; clicked => { root.save-server(); } }
+            Button { text: "Connect & list tools"; clicked => { root.test-server(); } }
+            Button { text: "Remove"; clicked => { root.remove-server(); } }
+        }
+        if root.status-text != "" : Text { text: root.status-text; color: #a7f3d0; wrap: word-wrap; }
+      }
+    }
+}
+
+export struct ComponentChoice { id: string, title: string, description: string, tradeoff: string, download: string, selected: bool, installed: bool }
+export component ComponentSetupWindow inherits Window {
+    default-font-family: "Arial";
+    title: "Echo setup and components";
+    preferred-width: 620px; preferred-height: 580px; min-width: 480px; min-height: 440px;
+    in-out property <int> page: 0;
+    in property <[ComponentChoice]> choices;
+    in property <string> status;
+    in property <bool> installing;
+    in-out property <string> brave-key;
+    in-out property <string> hf-token;
+    callback select-component(string,bool);
+    callback change-page(int);
+    callback install-selected();
+    callback remove-component(string);
+    callback configure-models();
+    callback close-setup();
+    VerticalBox { padding: 18px; spacing: 12px;
+        Text { text: ["Core transcription", "Other transcription models", "Assistant voice and decisions", "Computer and browser tools", "Connections", "Review and install"][root.page]; font-size: 20px; font-weight: 700; }
+        Text { text: "Step " + (root.page + 1) + " of 6"; }
+        ScrollView { VerticalBox { spacing: 14px; alignment: start;
+            for choice in root.choices : VerticalBox { spacing: 3px; vertical-stretch: 0; alignment: start;
+                CheckBox { text: choice.title; checked: choice.selected; enabled: !root.installing; toggled => { root.select-component(choice.id,self.checked); } }
+                Text { text: choice.description; wrap: word-wrap; }
+                Text { text: choice.tradeoff; wrap: word-wrap; }
+                Text { text: "Download: " + choice.download; wrap: word-wrap; }
+                if choice.installed : Button { text: "Remove downloaded component"; enabled: !root.installing; clicked => { root.remove-component(choice.id); } }
+            }
+            if root.page == 4 : VerticalBox { spacing: 6px; vertical-stretch: 0; alignment: start;
+                Text { text: "Optional: connect a language model and configure search."; wrap: word-wrap; }
+                Button { text: "Connect a language model"; enabled: !root.installing; clicked => { root.configure-models(); } }
+                Text { text: "Brave Search API key"; }
+                LineEdit { text <=> root.brave-key; input-type: password; }
+                Text { text: "Hugging Face token — only needed for custom voice import"; wrap: word-wrap; }
+                LineEdit { text <=> root.hf-token; input-type: password; }
+            }
+            if root.page == 5 : Text { text: "Selected components above will be installed or repaired. Existing settings and graphs are preserved. You can retry downloads here later."; wrap: word-wrap; }
+        } }
+        Text { text: root.status; wrap: word-wrap; }
+        HorizontalBox {
+            Button { text: "Back"; enabled: root.page > 0 && !root.installing; clicked => { root.change-page(root.page - 1); } }
+            if root.page < 5 : Button { text: "Next"; enabled: !root.installing; clicked => { root.change-page(root.page + 1); } }
+            if root.page == 5 : Button { text: "Install / repair selected"; enabled: !root.installing; clicked => { root.install-selected(); } }
+            Button { text: "Close"; enabled: !root.installing; clicked => { root.close-setup(); } }
+        }
+    }
+}
+

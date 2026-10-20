@@ -1,0 +1,80 @@
+import { VerticalBox, HorizontalBox, Button, LineEdit, Slider, CheckBox, ListView } from "std-widgets.slint";
+
+export struct AvatarSpeechBlock { text: string }
+
+export component DesktopAvatarWindow inherits Window {
+    default-font-family: "Arial";
+    title: "Echo desktop avatar";
+    no-frame: true; always-on-top: true; background: transparent;
+    width: 640px * root.avatar-scale; height: 360px * root.avatar-scale;
+    in property <image> avatar;
+    in property <bool> portrait-visible: true;
+    in property <string> spoken;
+    in property <[AvatarSpeechBlock]> speech-blocks;
+    in property <length> bubble-height: 90px;
+    in property <string> activity: "Ready";
+    in property <bool> show-spoken: true;
+    in property <bool> placement-mode;
+    in property <bool> sitting;
+    in property <float> avatar-scale: 1.0;
+    callback open-workspace(); callback open-settings(); callback hide-avatar();
+    callback toggle-placement(); callback toggle-sitting(); callback dismiss-speech();
+    ContextMenuArea {
+        Menu { title: "Echo avatar";
+            MenuItem { title: "Open conversations"; activated => { root.open-workspace(); } }
+            MenuItem { title: "Avatar settings…"; activated => { root.open-settings(); } }
+            MenuItem { title: root.placement-mode ? "Finish placement" : "Place ledge…"; activated => { root.toggle-placement(); } }
+            MenuItem { title: root.sitting ? "Stand" : "Sit"; activated => { root.toggle-sitting(); } }
+            MenuItem { title: "Dismiss speech"; activated => { root.dismiss-speech(); } }
+            MenuItem { title: "Hide avatar"; activated => { root.hide-avatar(); } }
+        }
+        WindowMoveArea {
+            x: 0px; y: 0px; width: 180px * root.avatar-scale; height: 292px * root.avatar-scale;
+            Image { visible: root.portrait-visible; source: root.avatar; image-fit: contain; width: 100%; height: 100%; }
+        }
+        if root.show-spoken && root.spoken != "" : Rectangle {
+            x: 190px * root.avatar-scale; y: 12px * root.avatar-scale; width: parent.width - 202px * root.avatar-scale; height: root.bubble-height * root.avatar-scale;
+            background: #202c36; border-radius: 14px; border-width: 1px; border-color: #4bbab5;
+            Path { x: -14px; y: 30px; width: 16px; height: 18px;
+                commands: "M 16 0 L 0 9 L 16 18"; fill: #202c36; stroke: #4bbab5; stroke-width: 1px; }
+            ListView { x: 12px; y: 12px; width: parent.width - 24px; height: parent.height - 24px;
+                content-width: self.visible-width; horizontal-scrollbar-policy: always-off;
+                for block in root.speech-blocks : Text { width: parent.width; text: block.text; wrap: word-wrap; color: #edf1f5; font-size: 14px; }
+            }
+        }
+        Rectangle {
+            x: 190px * root.avatar-scale; y: 264px * root.avatar-scale; width: parent.width - 202px * root.avatar-scale; height: 28px * root.avatar-scale;
+            background: #202c36ee; border-radius: 10px;
+            Text { x: 10px; width: parent.width - 20px; height: 100%; text: root.activity;
+                color: #edf1f5; font-size: 12px; vertical-alignment: center; overflow: elide; }
+        }
+        if root.placement-mode : Rectangle {
+            y: 296px * root.avatar-scale; height: 2px; background: #36d7cf;
+            Text { y: 8px; text: "Invisible ledge · drag the avatar to position · right-click to finish"; color: #edf1f5; font-size: 12px; }
+        }
+    }
+}
+
+export component DesktopAvatarSettingsWindow inherits Window {
+    default-font-family: "Arial"; title: "Desktop avatar settings";
+    preferred-width: 560px; preferred-height: 470px; min-width: 440px; min-height: 440px;
+    in-out property <string> runtime; in-out property <string> pack;
+    in-out property <float> avatar-scale: 1.0; in-out property <float> ledge-width: 420;
+    in-out property <bool> sitting; in property <string> status;
+    callback browse-runtime(); callback browse-pack(); callback save(); callback place();
+    VerticalBox { padding: 16px; spacing: 8px;
+        Text { text: "Independent desktop companion"; font-size: 20px; }
+        Text { text: "Unreal companion executable (optional)"; font-size: 12px; }
+        HorizontalBox { LineEdit { text <=> root.runtime; horizontal-stretch: 1; } Button { text: "Browse…"; clicked => { root.browse-runtime(); } } }
+        Text { text: "Prepared avatar pack (.pak)"; font-size: 12px; }
+        HorizontalBox { LineEdit { text <=> root.pack; horizontal-stretch: 1; } Button { text: "Browse…"; clicked => { root.browse-pack(); } } }
+        Text { text: "Character scale: " + round(root.avatar-scale * 100) + "%"; font-size: 12px; }
+        Slider { minimum: 0.5; maximum: 2; value <=> root.avatar-scale; }
+        Text { text: "Walking ledge width: " + round(root.ledge-width) + " px"; font-size: 12px; }
+        Slider { minimum: 160; maximum: 1600; value <=> root.ledge-width; }
+        CheckBox { text: "Sit on ledge"; checked <=> root.sitting; }
+        Text { text: "No Unreal runtime configured: use your existing PNG portrait. 3D requires a compatible cooked character pack."; wrap: word-wrap; font-size: 12px; }
+        Text { text: root.status; wrap: word-wrap; vertical-stretch: 1; }
+        HorizontalBox { Button { text: "Place ledge…"; clicked => { root.place(); } } Button { text: "Save and show"; clicked => { root.save(); } } }
+    }
+}

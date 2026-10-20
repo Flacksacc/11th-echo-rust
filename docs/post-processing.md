@@ -1,12 +1,16 @@
 # Native Windows post-processing
 
+Configuration now lives in [pipeline components](pipelines.md). This page describes
+the underlying formatter; the former enable/disable settings pages have been replaced.
+
+
 Echo uses Rust English written-form rules (`text2num` 2.8.0) and the sherpa-onnx 1.13.4 Edge-Punct-Casing INT8 model, on CPU with one inference thread. The model jointly restores sentence punctuation and predicts word casing. No Python, WSL, external ONNX installation, or new cloud service is required. Optional Gemini rewriting remains a separate existing feature.
 
 ## Workflow
 
 The overlay remains the raw speech transcript. Committed provider fragments accumulate without post-processing. After manual stop and provider drain, Echo processes the entire session once: optional Gemini, source sentence-punctuation stripping, written rules, then punctuation inference. Only the final result is sent to the original injection target and added to history. Formatting runs off the UI/async executor thread. Stale sessions cannot paste; if formatting settings change during processing, source text is retained with a warning.
 
-If the model is missing, invalid, or changes words, written rules still run against the original source punctuation and an actionable warning is shown. No transcript text is logged by the formatter. Long transcripts use 96-atom windows with 16 atoms of context on each side and deterministic boundary ownership.
+If the model is missing, invalid, or changes words, written rules still run against the original source punctuation and an actionable warning is shown. No transcript text is logged by the formatter. After transcription finishes, Echo submits the complete text in one punctuation request, without splitting it into word windows. The pinned Sherpa runtime still encodes this model's input into sequences of up to 200 subword tokens internally; a complete request does not remove that model/runtime context limit. See [the version-matched implementation](https://github.com/k2-fsa/sherpa-onnx/blob/v1.13.4/sherpa-onnx/csrc/online-punctuation-cnn-bilstm-impl.h).
 
 ## Settings
 

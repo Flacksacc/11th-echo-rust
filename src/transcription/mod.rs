@@ -11,9 +11,9 @@ pub use elevenlabs_realtime::ElevenLabsRealtimeTranscriber;
 pub use local_model::LocalModel;
 pub use local_photon::{ultra_download_description, ultra_gpu_status};
 pub use local_sherpa::{
-    download_local_models, local_engine_status, local_engine_status_for, local_models_available,
-    physical_core_count, preload_local_engine, shutdown_local_engine, unload_local_engine,
-    wait_for_local_engine, LocalEngineStatus, LocalSherpaConfig, LocalSherpaTranscriber,
+    download_local_models, local_engine_status_for, local_models_available, physical_core_count,
+    preload_local_engine, shutdown_local_engine, wait_for_local_engine, LocalEngineStatus,
+    LocalSherpaConfig, LocalSherpaTranscriber,
 };
 pub use openai_realtime_whisper::OpenAiRealtimeWhisperTranscriber;
 

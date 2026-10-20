@@ -2,6 +2,8 @@ fn main() {
     println!("cargo:rerun-if-changed=runtime/ultra/dependencies.json");
     println!("cargo:rerun-if-env-changed=ECHO_UPDATE_FEED_URL");
     println!("cargo:rerun-if-env-changed=ECHO_UPDATE_PUBLIC_KEY");
+    println!("cargo:rerun-if-env-changed=SLINT_EMIT_DEBUG_INFO");
+    println!("cargo:rerun-if-env-changed=SLINT_LIVE_PREVIEW");
     slint_build::compile("ui/appwindow.slint").unwrap();
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {

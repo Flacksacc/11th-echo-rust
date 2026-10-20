@@ -124,7 +124,7 @@ impl TranscriptHistoryEntry {
 }
 
 #[cfg(target_os = "windows")]
-fn protect_secret(secret: &str) -> Result<String, String> {
+pub(crate) fn protect_secret(secret: &str) -> Result<String, String> {
     if secret.is_empty() {
         return Ok(secret.to_string());
     }
@@ -154,12 +154,12 @@ fn protect_secret(secret: &str) -> Result<String, String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn protect_secret(_secret: &str) -> Result<String, String> {
+pub(crate) fn protect_secret(_secret: &str) -> Result<String, String> {
     Err("Secure credential storage is only implemented on Windows".to_string())
 }
 
 #[cfg(target_os = "windows")]
-fn unprotect_secret(stored: &str) -> Result<String, String> {
+pub(crate) fn unprotect_secret(stored: &str) -> Result<String, String> {
     let Some(encoded) = stored.strip_prefix(PROTECTED_SECRET_PREFIX) else {
         return Ok(stored.to_string());
     };
@@ -191,24 +191,43 @@ fn unprotect_secret(stored: &str) -> Result<String, String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn unprotect_secret(stored: &str) -> Result<String, String> {
+pub(crate) fn unprotect_secret(stored: &str) -> Result<String, String> {
     Ok(stored.to_string())
 }
 
 fn protect_settings_secrets(settings: &mut AppSettings) -> Result<(), String> {
+    settings.hermes.token = protect_secret(&settings.hermes.token)?;
+    settings.brave_api_key = protect_secret(&settings.brave_api_key)?;
     settings.api_key = protect_secret(&settings.api_key)?;
     settings.elevenlabs_api_key = protect_secret(&settings.elevenlabs_api_key)?;
     settings.openai_api_key = protect_secret(&settings.openai_api_key)?;
     settings.gemini_api_key = protect_secret(&settings.gemini_api_key)?;
+    settings.hugging_face_token = protect_secret(&settings.hugging_face_token)?;
+    for server in &mut settings.assistant_mcp_servers {
+        for secret in server
+            .environment
+            .values_mut()
+            .chain(server.headers.values_mut())
+        {
+            *secret = protect_secret(secret)?;
+        }
+    }
+    for connection in &mut settings.model_registry.connections {
+        connection.api_key = protect_secret(&connection.api_key)?;
+        connection.custom_header_value = protect_secret(&connection.custom_header_value)?;
+    }
     Ok(())
 }
 
 fn unprotect_settings_secrets(settings: &mut AppSettings) {
     for (label, value) in [
+        ("Hermes local authentication", &mut settings.hermes.token),
         ("legacy ElevenLabs", &mut settings.api_key),
         ("ElevenLabs", &mut settings.elevenlabs_api_key),
         ("OpenAI", &mut settings.openai_api_key),
         ("Gemini", &mut settings.gemini_api_key),
+        ("Hugging Face", &mut settings.hugging_face_token),
+        ("Brave Search", &mut settings.brave_api_key),
     ] {
         match unprotect_secret(value) {
             Ok(secret) => *value = secret,
@@ -218,6 +237,31 @@ fn unprotect_settings_secrets(settings: &mut AppSettings) {
                     "Failed to decrypt {label} API credential: {err}"
                 );
                 value.clear();
+            }
+        }
+    }
+    for server in &mut settings.assistant_mcp_servers {
+        for secret in server
+            .environment
+            .values_mut()
+            .chain(server.headers.values_mut())
+        {
+            *secret = unprotect_secret(secret).unwrap_or_default();
+        }
+    }
+    for connection in &mut settings.model_registry.connections {
+        match unprotect_secret(&connection.api_key) {
+            Ok(secret) => connection.api_key = secret,
+            Err(_) => {
+                connection.api_key.clear();
+                crate::echo_error!("settings", "Failed to decrypt a model credential");
+            }
+        }
+        match unprotect_secret(&connection.custom_header_value) {
+            Ok(secret) => connection.custom_header_value = secret,
+            Err(_) => {
+                connection.custom_header_value.clear();
+                crate::echo_error!("settings", "Failed to decrypt a model header credential");
             }
         }
     }
@@ -273,8 +317,43 @@ fn atomic_replace(temp_path: &Path, destination: &Path) -> Result<(), String> {
     fs::rename(temp_path, destination).map_err(|err| err.to_string())
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
+    #[serde(default)]
+    pub hermes: crate::hermes::Config,
+    #[serde(default)]
+    pub component_selection: Option<Vec<String>>,
+    #[serde(default)]
+    pub installed_components: Vec<String>,
+    #[serde(default = "default_transcription_no_verbatim")]
+    pub assistant_show_spoken_text: bool,
+    #[serde(default)]
+    pub brave_api_key: String,
+    #[serde(default)]
+    pub assistant_mcp_servers: Vec<crate::assistant_mcp::McpServer>,
+    #[serde(default)]
+    pub hugging_face_token: String,
+    #[serde(default)]
+    pub tts_voice_path: String,
+    #[serde(default)]
+    pub tts_preload: bool,
+    #[serde(default)]
+    pub assistant_avatar_path: String,
+    #[serde(default)]
+    pub desktop_avatar: crate::assistant_presentation::AvatarConfig,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::assistant::AssistantPipelineSet::is_empty"
+    )]
+    pub assistant_pipelines: crate::assistant::AssistantPipelineSet,
+    #[serde(default = "default_assistant_hotkey")]
+    pub assistant_hotkey_text: String,
+    #[serde(default)]
+    pub model_registry: crate::models::ModelRegistry,
+    #[serde(skip)]
+    pub pipeline_migration_save_failed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipelines: Option<crate::pipelines::PipelineSet>,
     #[serde(default)]
     pub api_key: String,
     #[serde(default = "default_transcription_provider")]
@@ -301,6 +380,12 @@ pub struct AppSettings {
     pub transcription_no_verbatim: bool,
     pub selected_microphone: String,
     pub use_default_microphone: bool,
+    #[serde(default)]
+    pub selected_speaker: String,
+    #[serde(default = "default_use_default_speaker")]
+    pub use_default_speaker: bool,
+    #[serde(default = "default_output_volume")]
+    pub output_volume: f32,
     #[serde(default)]
     pub keep_microphone_ready: bool,
     pub hotkey_text: String,
@@ -332,9 +417,34 @@ pub struct AppSettings {
     pub post_processing: PostProcessingSettings,
 }
 
+impl std::fmt::Debug for AppSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppSettings")
+            .field("transcription_provider", &self.transcription_provider)
+            .field("local_sherpa", &self.local_sherpa)
+            .field("credentials", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            hermes: crate::hermes::Config::default(),
+            component_selection: None,
+            installed_components: Vec::new(),
+            assistant_show_spoken_text: true,
+            brave_api_key: String::new(),
+            assistant_mcp_servers: Vec::new(),
+            hugging_face_token: String::new(),
+            tts_voice_path: String::new(),
+            tts_preload: false,
+            assistant_avatar_path: String::new(),
+            desktop_avatar: crate::assistant_presentation::AvatarConfig::default(),
+            assistant_pipelines: crate::assistant::AssistantPipelineSet::default(),
+            assistant_hotkey_text: default_assistant_hotkey(),
+            model_registry: crate::models::ModelRegistry::default(),
+            pipeline_migration_save_failed: false,
+            pipelines: None,
             api_key: String::new(),
             transcription_provider: default_transcription_provider(),
             elevenlabs_api_key: String::new(),
@@ -349,6 +459,9 @@ impl Default for AppSettings {
             transcription_no_verbatim: true,
             selected_microphone: String::new(),
             use_default_microphone: true,
+            selected_speaker: String::new(),
+            use_default_speaker: true,
+            output_volume: default_output_volume(),
             keep_microphone_ready: false,
             hotkey_text: "Ctrl+Space".to_string(),
             start_with_windows: false,
@@ -377,6 +490,17 @@ impl Default for AppSettings {
 
 fn default_update_checks_enabled() -> bool {
     true
+}
+
+fn default_use_default_speaker() -> bool {
+    true
+}
+fn default_output_volume() -> f32 {
+    1.0
+}
+
+fn default_assistant_hotkey() -> String {
+    "Ctrl+Shift+Space".to_string()
 }
 
 impl AppSettings {
@@ -619,10 +743,47 @@ pub fn load_settings_from_path(path: &Path) -> AppSettings {
         if let Ok(mut settings) = serde_json::from_str::<AppSettings>(&contents) {
             unprotect_settings_secrets(&mut settings);
             settings.normalize_transcription_settings();
+            let previous_pipelines = settings.pipelines.clone();
+            let previous_assistant_pipelines = settings.assistant_pipelines.clone();
+            let previous_registry = settings.model_registry.clone();
+            if settings.pipelines.is_none() {
+                settings.pipelines = Some(crate::pipelines::migrate(&settings));
+            }
+            crate::pipelines::upgrade_models(&mut settings);
+            match crate::pipelines::import_assistants(&settings) {
+                Ok(Some(set)) => {
+                    settings.pipelines = Some(set);
+                    settings.assistant_pipelines =
+                        crate::assistant::AssistantPipelineSet::default();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    crate::echo_warn!("settings", "Assistant pipeline import failed: {error}");
+                    settings.pipeline_migration_save_failed = true;
+                }
+            }
+            if let Some(set) = settings.pipelines.as_mut() {
+                crate::pipelines::upgrade_preload_defaults(set);
+            }
+            crate::graph_ui::upgrade(&mut settings);
+            if (settings.pipelines != previous_pipelines
+                || settings.assistant_pipelines != previous_assistant_pipelines
+                || settings.model_registry != previous_registry)
+                && !save_settings_to_path(path, &settings)
+            {
+                settings.pipeline_migration_save_failed = true;
+                crate::echo_warn!(
+                    "settings",
+                    "Pipeline migration is active in memory but could not be saved."
+                );
+            }
             return settings;
         }
     }
-    AppSettings::default()
+    let mut settings = AppSettings::default();
+    settings.pipelines = Some(crate::pipelines::migrate(&settings));
+    crate::graph_ui::upgrade(&mut settings);
+    settings
 }
 
 pub fn save_settings(settings: &AppSettings) -> bool {
@@ -699,6 +860,22 @@ mod tests {
     fn roundtrip_persists_values() {
         let path = unique_path();
         let expected = AppSettings {
+            hermes: crate::hermes::Config::default(),
+            component_selection: None,
+            installed_components: Vec::new(),
+            assistant_show_spoken_text: true,
+            brave_api_key: String::new(),
+            assistant_mcp_servers: Vec::new(),
+            hugging_face_token: String::new(),
+            tts_voice_path: "C:/Echo/voice.wav".into(),
+            tts_preload: true,
+            assistant_avatar_path: String::new(),
+            desktop_avatar: crate::assistant_presentation::AvatarConfig::default(),
+            assistant_pipelines: crate::assistant::AssistantPipelineSet::default(),
+            assistant_hotkey_text: "Ctrl+Shift+Space".to_string(),
+            model_registry: crate::models::ModelRegistry::default(),
+            pipeline_migration_save_failed: false,
+            pipelines: None,
             api_key: "sk_test".to_string(),
             transcription_provider: "elevenlabs_realtime".to_string(),
             elevenlabs_api_key: "sk_test".to_string(),
@@ -713,6 +890,9 @@ mod tests {
             transcription_no_verbatim: true,
             selected_microphone: "Mic A".to_string(),
             use_default_microphone: false,
+            selected_speaker: "Speakers A".into(),
+            use_default_speaker: false,
+            output_volume: 0.35,
             keep_microphone_ready: true,
             hotkey_text: "Ctrl+Shift+F8".to_string(),
             start_with_windows: false,
@@ -739,6 +919,8 @@ mod tests {
         save_settings_to_path(&path, &expected);
         let loaded = load_settings_from_path(&path);
         let _ = fs::remove_file(&path);
+        assert_eq!(loaded.tts_voice_path, expected.tts_voice_path);
+        assert_eq!(loaded.tts_preload, expected.tts_preload);
         assert_eq!(loaded.api_key, expected.api_key);
         assert_eq!(loaded.elevenlabs_api_key, expected.elevenlabs_api_key);
         assert_eq!(loaded.elevenlabs_model, expected.elevenlabs_model);
@@ -767,6 +949,9 @@ mod tests {
             expected.transcription_no_verbatim
         );
         assert_eq!(loaded.selected_microphone, expected.selected_microphone);
+        assert_eq!(loaded.selected_speaker, expected.selected_speaker);
+        assert_eq!(loaded.use_default_speaker, expected.use_default_speaker);
+        assert_eq!(loaded.output_volume, expected.output_volume);
         assert_eq!(
             loaded.use_default_microphone,
             expected.use_default_microphone
@@ -774,6 +959,87 @@ mod tests {
         assert_eq!(loaded.keep_microphone_ready, expected.keep_microphone_ready);
         assert_eq!(loaded.hotkey_text, expected.hotkey_text);
         assert_eq!(loaded.start_with_windows, expected.start_with_windows);
+    }
+
+    #[test]
+    fn pipeline_migration_is_persisted_once_and_keeps_user_pipelines() {
+        let path = unique_path();
+        let mut legacy = AppSettings {
+            gemini_enabled: true,
+            gemini_prompt_preset: "Sound like a pirate".into(),
+            ..Default::default()
+        };
+        legacy.local_sherpa.silence_ms = 9500;
+        legacy.post_processing.custom_replacements = vec!["echo app => Echo".into()];
+        assert!(save_settings_to_path(&path, &legacy));
+        let first = load_settings_from_path(&path);
+        let set = first.pipelines.as_ref().unwrap();
+        assert_eq!(set.pipelines.len(), 1);
+        assert_eq!(set.active().unwrap().name, "Current setup");
+        let saved = fs::read(&path).unwrap();
+        let second = load_settings_from_path(&path);
+        assert_eq!(first.pipelines, second.pipelines);
+        assert_eq!(saved, fs::read(&path).unwrap());
+        let mut custom = second;
+        let mut other = custom.pipelines.as_ref().unwrap().active().unwrap().clone();
+        other.id = crate::pipelines::new_id();
+        other.name = "My custom pipeline".into();
+        let set = custom.pipelines.as_mut().unwrap();
+        set.active_id = other.id.clone();
+        set.pipelines.push(other);
+        assert!(save_settings_to_path(&path, &custom));
+        let reloaded = load_settings_from_path(&path);
+        assert_eq!(custom.pipelines, reloaded.pipelines);
+        assert_eq!(
+            reloaded.pipelines.as_ref().unwrap().active().unwrap().name,
+            "My custom pipeline"
+        );
+        let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn legacy_assistant_pipelines_move_into_shared_settings_once() {
+        let path = unique_path();
+        let mut old = AppSettings::default();
+        old.pipelines = Some(crate::pipelines::migrate(&old));
+        let speech_id = old.pipelines.as_ref().unwrap().active_id.clone();
+        old.assistant_pipelines.active_id = "assistant-legacy".into();
+        old.assistant_pipelines
+            .pipelines
+            .push(crate::assistant::AssistantPipeline {
+                id: "assistant-legacy".into(),
+                name: "Legacy assistant".into(),
+                speech_pipeline_id: speech_id,
+                router_model_id: "fast".into(),
+                answer_model_id: "strong".into(),
+                instructions: "Be brief".into(),
+                voice_id: "voice.wav".into(),
+                enabled_tools: vec![],
+                fast_answer_model_id: String::new(),
+                processing_steps: vec![],
+                direct_steps: vec![],
+                delegated_steps: vec![],
+                output_steps: vec![],
+            });
+        assert!(save_settings_to_path(&path, &old));
+        let migrated = load_settings_from_path(&path);
+        assert_eq!(migrated.pipelines.as_ref().unwrap().pipelines.len(), 2);
+        assert_eq!(
+            migrated
+                .pipelines
+                .as_ref()
+                .unwrap()
+                .active_assistant()
+                .unwrap()
+                .name,
+            "Legacy assistant"
+        );
+        assert!(migrated.assistant_pipelines.is_empty());
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("assistant_pipelines"));
+        let loaded_again = load_settings_from_path(&path);
+        assert_eq!(migrated.pipelines, loaded_again.pipelines);
+        assert_eq!(saved, fs::read_to_string(&path).unwrap());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -813,9 +1079,13 @@ mod tests {
         let object = value.as_object_mut().unwrap();
         object.remove("update_checks_enabled");
         object.remove("keep_microphone_ready");
+        object.remove("tts_voice_path");
+        object.remove("tts_preload");
         let loaded: AppSettings = serde_json::from_value(value).unwrap();
         assert!(loaded.update_checks_enabled);
         assert!(!loaded.keep_microphone_ready);
+        assert!(loaded.tts_voice_path.is_empty());
+        assert!(!loaded.tts_preload);
     }
 
     #[test]
@@ -897,6 +1167,39 @@ mod tests {
             elevenlabs_api_key: "eleven-secret-value".to_string(),
             openai_api_key: "dpapi:literal-openai-secret-value".to_string(),
             gemini_api_key: "gemini-secret-value".to_string(),
+            hugging_face_token: "hf-secret-value".to_string(),
+            brave_api_key: "brave-secret-value".into(),
+            assistant_mcp_servers: vec![crate::assistant_mcp::McpServer {
+                id: "test-mcp".into(),
+                name: "Test MCP".into(),
+                enabled: true,
+                transport: crate::assistant_mcp::McpTransport::Http {
+                    url: "https://example.com/mcp".into(),
+                },
+                discovered_tools: vec![],
+                environment: std::collections::BTreeMap::from([(
+                    "PRIVATE_TOKEN".into(),
+                    "env-secret-value".into(),
+                )]),
+                headers: std::collections::BTreeMap::from([(
+                    "Authorization".into(),
+                    "Bearer mcp-secret-value".into(),
+                )]),
+            }],
+            model_registry: crate::models::ModelRegistry {
+                version: 1,
+                connections: vec![crate::models::ModelConnection {
+                    id: "test-connection".into(),
+                    provider: "openrouter".into(),
+                    endpoint: String::new(),
+                    api_version: String::new(),
+                    custom_header_name: "X-API-Key".into(),
+                    custom_header_value: "header-secret-value".into(),
+                    api_key: "custom-model-secret-value".into(),
+                    allow_lan_http: false,
+                }],
+                models: vec![],
+            },
             ..Default::default()
         };
 
@@ -907,6 +1210,12 @@ mod tests {
         assert!(!stored.contains("eleven-secret-value"));
         assert!(!stored.contains("literal-openai-secret-value"));
         assert!(!stored.contains("gemini-secret-value"));
+        assert!(!stored.contains("hf-secret-value"));
+        for secret in ["brave-secret-value", "env-secret-value", "mcp-secret-value"] {
+            assert!(!stored.contains(secret));
+        }
+        assert!(!stored.contains("custom-model-secret-value"));
+        assert!(!stored.contains("header-secret-value"));
 
         let loaded = load_settings_from_path(&path);
         let _ = fs::remove_file(&path);
@@ -914,6 +1223,17 @@ mod tests {
         assert_eq!(loaded.elevenlabs_api_key, settings.elevenlabs_api_key);
         assert_eq!(loaded.openai_api_key, settings.openai_api_key);
         assert_eq!(loaded.gemini_api_key, settings.gemini_api_key);
+        assert_eq!(loaded.hugging_face_token, settings.hugging_face_token);
+        assert_eq!(loaded.brave_api_key, settings.brave_api_key);
+        assert_eq!(loaded.assistant_mcp_servers, settings.assistant_mcp_servers);
+        assert_eq!(
+            loaded.model_registry.connections[0].api_key,
+            "custom-model-secret-value"
+        );
+        assert_eq!(
+            loaded.model_registry.connections[0].custom_header_value,
+            "header-secret-value"
+        );
     }
 
     #[test]
@@ -936,7 +1256,12 @@ mod tests {
         assert!(loaded.transcription_no_verbatim);
         assert!(loaded.selected_microphone.is_empty());
         assert!(loaded.use_default_microphone);
+        assert!(loaded.selected_speaker.is_empty());
+        assert!(loaded.use_default_speaker);
+        assert_eq!(loaded.output_volume, 1.0);
         assert!(!loaded.keep_microphone_ready);
+        assert!(loaded.tts_voice_path.is_empty());
+        assert!(!loaded.tts_preload);
         assert_eq!(loaded.hotkey_text, "Ctrl+Space");
         assert!(!loaded.start_with_windows);
         assert!((loaded.overlay_opacity - 0.85).abs() < f32::EPSILON);

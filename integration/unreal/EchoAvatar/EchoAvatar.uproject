@@ -1,0 +1,31 @@
+{
+  "FileVersion": 3,
+  "EngineAssociation": "5.8",
+  "Category": "Echo",
+  "Description": "Optional local desktop avatar",
+  "Modules": [
+    {
+      "Name": "EchoAvatar",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "MetaHumanLiveLink",
+      "Enabled": true
+    },
+    {
+      "Name": "LiveLink",
+      "Enabled": true
+    },
+    {
+      "Name": "MetaHumanCoreTech",
+      "Enabled": true
+    },
+    {
+      "Name": "StreamingADA",
+      "Enabled": true
+    }
+  ]
+}

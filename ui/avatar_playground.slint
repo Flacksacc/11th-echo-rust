@@ -1,0 +1,104 @@
+import { VerticalBox, HorizontalBox, ComboBox, TextEdit, Button, CheckBox, ScrollView, Palette } from "std-widgets.slint";
+
+export component AssistantSpeechBubble inherits Rectangle {
+    in property <string> text;
+    in property <bool> point-left: false;
+    in property <length> max-body-height: 112px;
+    height: Math.min(root.max-body-height, spoken.preferred-height + 24px) + 16px;
+    // The pointer sits above the floating card, directly below the portrait.
+    Rectangle { x: 2px; y: 19px; width: parent.width - 4px; height: parent.height - 18px;
+        background: #00000040; border-radius: 16px;
+    }
+    Rectangle { y: 14px; width: 100%; height: parent.height - 18px;
+        background: #202c36; border-radius: 14px;
+        border-width: 1px; border-color: #4bbab5;
+    }
+    Path { x: root.point-left ? -14px : (parent.width - 24px) / 2; y: root.point-left ? 32px : 0px; width: 24px; height: 16px;
+        commands: root.point-left ? "M 24 0 L 0 8 L 24 16" : "M 0 16 L 12 0 L 24 16";
+        fill: #202c36; stroke: #4bbab5; stroke-width: 1px;
+    }
+    spoken-scroll := ScrollView {
+        x: 12px; y: 25px; width: parent.width - 24px; height: parent.height - 37px;
+        content-width: self.visible-width;
+        horizontal-scrollbar-policy: always-off;
+        spoken := Text { x: 0; y: 0; width: spoken-scroll.visible-width;
+            text: root.text; wrap: word-wrap; color: #edf1f5; font-size: 14px;
+            accessible-label: root.text;
+        }
+    }
+}
+
+export component AvatarPlaygroundWindow inherits Window {
+    default-font-family: "Arial";
+    init => { Palette.color-scheme = ColorScheme.dark; }
+    title: "Avatar creation & playground";
+    icon: @image-url("../eleventhecho.png");
+    preferred-width: 820px; preferred-height: 640px;
+    min-width: 660px; min-height: 540px;
+    background: #07140e;
+    in property <image> avatar: @image-url("../eleventhecho.png");
+    in property <string> avatar-name: "Current assistant avatar";
+    in property <[string]> voice-options;
+    in-out property <string> selected-voice;
+    in-out property <int> voice-index: 0;
+    in-out property <string> voice-path;
+    in-out property <string> test-text: "Hello. This is your Echo assistant. How can I help you today?";
+    in-out property <bool> show-bubble: true;
+    in-out property <bool> light-background: false;
+    in property <bool> testing-voice: false;
+    in property <string> status-text: "Upload a transparent PNG and try a voice.";
+    callback upload-avatar();
+    callback apply-avatar();
+    callback manage-voices();
+    callback select-voice(string);
+    callback test-voice();
+    callback stop-voice();
+    callback close-window();
+    VerticalBox { padding: 16px; spacing: 12px;
+        Text { text: "Avatar creation & playground"; color: #e6fff0; font-size: 20px; font-weight: 700; }
+        Text { text: "Try your portrait, speech bubbles, and voices together."; color: #a9c3b2; font-size: 12px; wrap: word-wrap; }
+        HorizontalLayout { spacing: 16px; vertical-stretch: 1;
+            controls := ScrollView { width: 270px; horizontal-stretch: 0; content-width: self.visible-width;
+                VerticalBox { padding: 0px; spacing: 8px; alignment: start;
+                    Text { text: "Avatar"; color: #a9c3b2; font-size: 12px; }
+                    Button { text: "Upload avatar PNG…"; clicked => { root.upload-avatar(); } }
+                    Text { text: root.avatar-name; color: #e6fff0; font-size: 12px; wrap: word-wrap; }
+                    Text { text: "Transparent PNGs keep the portrait floating without a background."; color: #91aa9b; font-size: 12px; wrap: word-wrap; }
+                    Button { text: "Use avatar in assistant"; clicked => { root.apply-avatar(); } }
+                    Text { text: "Voice"; color: #a9c3b2; font-size: 12px; }
+                    ComboBox { model: root.voice-options; current-index <=> root.voice-index;
+                        enabled: !root.testing-voice; accessible-label: "Playground voice";
+                        selected(value) => { root.select-voice(value); }
+                    }
+                    Button { text: "Set up voices…"; clicked => { root.manage-voices(); } }
+                    Text { text: "Test phrase / speech bubble"; color: #a9c3b2; font-size: 12px; }
+                    TextEdit { height: 100px; text <=> root.test-text; wrap: word-wrap;
+                        accessible-label: "Playground test phrase";
+                    }
+                    HorizontalLayout { height: 32px; spacing: 8px;
+                        Button { text: root.testing-voice ? "Playing…" : "Test voice"; enabled: !root.testing-voice && root.test-text != "";
+                            clicked => { root.test-voice(); }
+                        }
+                        Button { text: "Stop"; enabled: root.testing-voice; clicked => { root.stop-voice(); } }
+                    }
+                    CheckBox { text: "Show speech bubble"; checked <=> root.show-bubble; }
+                    CheckBox { text: "Light preview background"; checked <=> root.light-background; }
+                }
+            }
+            preview := Rectangle { vertical-stretch: 1; horizontal-stretch: 1;
+                background: root.light-background ? #e8eee9 : #101c17;
+                border-radius: 10px; border-width: 1px; border-color: #356047;
+                VerticalBox { padding: 16px; spacing: 12px;
+                    Text { text: "Assistant preview"; color: root.light-background ? #356047 : #a9c3b2; font-size: 12px; }
+                    Image { height: 220px; source: root.avatar; image-fit: contain; }
+                    if root.show-bubble && root.test-text != "" : AssistantSpeechBubble { text: root.test-text; }
+                    Rectangle { vertical-stretch: 1; }
+                }
+            }
+        }
+        Text { text: root.status-text; color: #a9c3b2; font-size: 12px; wrap: word-wrap; }
+        HorizontalLayout { height: 32px; Rectangle { horizontal-stretch: 1; }
+            Button { text: "Close"; clicked => { root.close-window(); } }
+        }
+    }
+}

@@ -1,0 +1,126 @@
+import { VerticalBox, HorizontalBox, ListView, ScrollView, ComboBox, LineEdit, CheckBox, SpinBox, Button } from "std-widgets.slint";
+export struct CalendarAccountRow { id:string, name:string, status:string }
+export struct CalendarSourceRow { id:string, name:string, enabled:bool }
+export struct ReminderEventRow { id:string, title:string, detail:string, status:string, active:bool }
+export component CalendarRemindersWindow inherits Window {
+    title:"Calendar & Reminders"; default-font-family:"Arial";
+    preferred-width:900px; preferred-height:820px; min-width:520px; min-height:600px; background:#171e26;
+    in property <[CalendarAccountRow]> accounts;
+    in property <[CalendarSourceRow]> calendars;
+    in property <[ReminderEventRow]> events;
+    in property <[string]> voices;
+    in-out property <int> voice-index;
+    in-out property <string> client-id;
+    in property <bool> busy;
+    in property <string> status;
+    in property <string> scope-title:"Global defaults";
+    in property <bool> previous;
+    in property <bool> more;
+    in-out property <string> offsets:"60, 15, 5, 0";
+    in-out property <int> repeat-minutes:5;
+    in-out property <bool> repeat-enabled:true;
+    in property <bool> rule-loading;
+    in property <string> rule-scope;
+    in-out property <int> snooze-minutes:10;
+    in-out property <string> all-day-time:"09:00";
+    in-out property <bool> enabled:true;
+    in-out property <bool> spoken:true;
+    in-out property <bool> quiet;
+    in-out property <string> quiet-start:"22:00";
+    in-out property <string> quiet-end:"08:00";
+    in-out property <string> timezone:"local";
+    in-out property <int> scope-index;
+    callback connect(); callback refresh(); callback save-rule(); callback inherit-rule();
+    callback disconnect(string); callback toggle-calendar(string,bool);
+    callback select-event(string); callback scope-changed(); callback page(int);
+    callback dismiss(string); callback snooze(string); callback enable-event(string);
+    ScrollView { horizontal-scrollbar-policy:always-off;
+    VerticalBox { padding:12px; spacing:6px;
+        HorizontalBox {
+            Text { text:"Microsoft application ID"; color:#c4d0dc; vertical-alignment:center; }
+            LineEdit { text <=> root.client-id; placeholder-text:"Public application (client) ID"; horizontal-stretch:1; accessible-label:"Microsoft application ID"; enabled:!root.busy; }
+        }
+        HorizontalBox {
+            Button { text:"Connect Microsoft account…"; enabled:!root.busy; clicked => { root.connect(); } }
+            Button { text:"Refresh"; enabled:!root.busy; clicked => { root.refresh(); } }
+            Text { text:"Read-only Outlook calendars"; color:#a7b6c4; horizontal-stretch:1; vertical-alignment:center; }
+        }
+        Text { text:root.status; color:#b4c4d3; wrap:word-wrap; }
+        ListView { preferred-height:65px; min-height:35px; vertical-stretch:0; horizontal-scrollbar-policy:always-off;
+            for a in root.accounts: HorizontalBox { height:48px;
+                Text { text:a.name+" · "+a.status; color:#c4d0dc; horizontal-stretch:1; wrap:word-wrap; }
+                Button { text:"Disconnect"; clicked => {root.disconnect(a.id);} enabled:!root.busy; }
+            }
+        }
+        ListView { preferred-height:65px; min-height:35px; vertical-stretch:0; horizontal-scrollbar-policy:always-off;
+            for c in root.calendars: CheckBox { text:c.name; checked:c.enabled; toggled => {root.toggle-calendar(c.id,self.checked);} }
+        }
+        Text { text:"Upcoming events and outstanding reminders"; color:#edf1f5; font-size:14px; font-weight:600; }
+        ListView { preferred-height:180px; min-height:90px; vertical-stretch:0; horizontal-scrollbar-policy:always-off;
+            for e in root.events: Rectangle { height:92px; background:e.active?#284157:#212d38; border-radius:6px;
+                VerticalBox { padding:6px; spacing:2px;
+                    Button { text:e.title; clicked => {root.select-event(e.id);} }
+                    Text { text:e.detail+" · "+e.status; color:#b4c4d3; overflow:elide; }
+                    HorizontalBox {
+                        if e.active: Button { text:"Dismiss"; clicked => {root.dismiss(e.id);} }
+                        if e.active: Button { text:"Snooze"; clicked => {root.snooze(e.id);} }
+                        if e.status=="Dismissed": Button { text:"Enable reminder"; clicked => {root.enable-event(e.id);} }
+                    }
+                }
+            }
+        }
+        HorizontalBox {
+            Button {text:"Previous"; enabled:root.previous; clicked => {root.page(-1);} }
+            Button {text:"Next"; enabled:root.more; clicked => {root.page(1);} }
+            Text { text:root.scope-title; color:#b4c4d3; horizontal-stretch:1; overflow:elide; vertical-alignment:center; }
+        }
+        HorizontalBox {
+            ComboBox { model:["Global defaults","Selected calendar","Selected recurring series","Selected occurrence"]; current-index <=> root.scope-index; selected(_) => {root.scope-changed();} horizontal-stretch:1; }
+            CheckBox {text:"Enabled"; checked <=> root.enabled;}
+            CheckBox {text:"Speak"; checked <=> root.spoken;}
+        }
+        HorizontalBox {
+            Text {text:"Minutes before"; color:#b4c4d3; vertical-alignment:center;}
+            LineEdit {text <=> root.offsets; horizontal-stretch:1; accessible-label:"Reminder offsets";}
+        }
+        HorizontalBox {
+            Text {text:"Repeat / snooze (min)"; color:#b4c4d3; vertical-alignment:center;}
+            CheckBox {text:"Repeat"; checked <=> root.repeat-enabled;}
+            SpinBox {value <=> root.repeat-minutes; minimum:1; maximum:10080; accessible-label:"Repeat minutes";}
+            SpinBox {value <=> root.snooze-minutes; minimum:1; maximum:10080; accessible-label:"Snooze minutes";}
+        }
+        HorizontalBox {
+            Text {text:"All-day time"; color:#b4c4d3; vertical-alignment:center;}
+            LineEdit {text <=> root.all-day-time; preferred-width:75px; accessible-label:"All-day reminder time";}
+            LineEdit {text <=> root.timezone; placeholder-text:"local or IANA timezone"; horizontal-stretch:1; accessible-label:"Reminder timezone";}
+        }
+        HorizontalBox {
+            CheckBox {text:"Quiet hours"; checked <=> root.quiet;}
+            LineEdit {text <=> root.quiet-start; preferred-width:75px; accessible-label:"Quiet start";}
+            LineEdit {text <=> root.quiet-end; preferred-width:75px; accessible-label:"Quiet end";}
+            ComboBox {model:root.voices; current-index <=> root.voice-index; horizontal-stretch:1; accessible-label:"Reminder voice";}
+        }
+        HorizontalBox {
+            Button {text:"Save reminder settings"; enabled:!root.rule-loading; clicked => {root.save-rule();} horizontal-stretch:1;}
+            Button {text:"Inherit defaults"; enabled:!root.rule-loading; clicked => {root.inherit-rule();}}
+        }
+    }
+    }
+}
+export component ReminderPopover inherits Window {
+    title:"Echo reminder"; default-font-family:"Arial"; no-frame:true; always-on-top:true;
+    preferred-width:420px; preferred-height:180px; background:#212d38;
+    in property <string> text;
+    in property <string> detail;
+    callback dismiss(); callback snooze(); callback open-reminders();
+    VerticalBox { padding:14px; spacing:8px;
+        Text {text:"Reminder"; color:#b4c4d3; font-size:12px;}
+        Text {text:root.text; color:#edf1f5; wrap:word-wrap; vertical-stretch:1;}
+        Text {text:root.detail; color:#b4c4d3; overflow:elide;}
+        HorizontalBox {
+            Button {text:"Dismiss"; clicked => {root.dismiss();} }
+            Button {text:"Snooze"; clicked => {root.snooze();} }
+            Button {text:"Reminders…"; clicked => {root.open-reminders();} }
+        }
+    }
+}

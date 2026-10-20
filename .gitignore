@@ -4,3 +4,9 @@
 /installer/assets
 /installer/update-config.local.json
 /installer/update-config.json
+
+# Unreal companion generated artifacts
+integration/unreal/**/Binaries/
+integration/unreal/**/Intermediate/
+integration/unreal/**/Saved/
+integration/unreal/**/DerivedDataCache/

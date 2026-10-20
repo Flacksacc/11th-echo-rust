@@ -41,7 +41,7 @@ Source: "..\target\release\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversio
 Source: "..\eleventhecho.png"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\eleventhecho.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; Local speech models are deliberately absent. The application downloads and
-; verifies them in the user's local app-data directory when local speech is used.
+; verifies them through the shared optional-component setup and Settings wizard.
 Source: "THIRD_PARTY_NOTICES.md"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "licenses\*.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 
@@ -53,6 +53,7 @@ Name: "{autodesktop}\Echo"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Echo"; ValueData: """{app}\{#AppExeName}"" --startup"; Flags: uninsdeletevalue; Tasks: startup
 
 [Run]
+Filename: "{app}\{#AppExeName}"; Parameters: "--component-setup"; Flags: waituntilterminated skipifsilent; Check: NeedsComponentSetup
 Filename: "{app}\{#AppExeName}"; Description: "Launch Echo"; Flags: nowait postinstall skipifsilent
 Filename: "{app}\{#AppExeName}"; Flags: nowait skipifnotsilent; Check: IsUpdateInstall
 
@@ -78,6 +79,11 @@ begin
       Exit;
     end;
   end;
+end;
+
+function NeedsComponentSetup(): Boolean;
+begin
+  Result := not IsUpdateInstall();
 end;
 
 function GetAppMutex(Param: String): String;
@@ -122,10 +128,14 @@ begin
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '11th Echo');
 
     if (not UninstallSilent) and
-       DirExists(ExpandConstant('{localappdata}\11th_echo')) and
+       (DirExists(ExpandConstant('{localappdata}\11th_echo')) or
+        DirExists(ExpandConstant('{userappdata}\11th_echo'))) and
        (MsgBox(
          'Remove Echo settings, transcript history, diagnostic logs, and downloaded speech models too?',
          mbConfirmation, MB_YESNO) = IDYES) then
+    begin
       DelTree(ExpandConstant('{localappdata}\11th_echo'), True, True, True);
+      DelTree(ExpandConstant('{userappdata}\11th_echo'), True, True, True);
+    end;
   end;
 end;

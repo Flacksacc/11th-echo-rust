@@ -1,0 +1,288 @@
+import { VerticalBox, HorizontalBox, ListView, ScrollView, LineEdit, TextEdit, Button, CheckBox, ComboBox } from "std-widgets.slint";
+
+export struct AgentTab {
+    id: string, name: string, title: string, activity: string,
+    unread: int, priority: bool, task-id: string,
+}
+export struct RichTableRow { cells: [styled-text], header: bool }
+export struct RichMessageBlock {
+    id: string, message-id: string, text: styled-text, plain-text: string,
+    from-user: bool, first: bool, last: bool, kind: int,
+    table-rows: [RichTableRow],
+    activity-kind: int, activity-target: string, stop-target: string,
+}
+
+export component ConversationTabs inherits Rectangle {
+    in property <[AgentTab]> tabs;
+    in property <bool> can-create;
+    in property <string> selected-id;
+    in property <int> selected-index;
+    callback select-tab(string);
+    callback new-conversation();
+    height: 64px;
+    background: #171e26;
+    private property <length> tab-viewport-width: tab-scroll.visible-width;
+    private property <length> tab-content-width: tab-scroll.content-width;
+    changed selected-index => { root.reveal-selected-tab(); }
+    changed tab-viewport-width => { root.reveal-selected-tab(); }
+    changed tab-content-width => { root.reveal-selected-tab(); }
+    function reveal-selected-tab() {
+        if root.selected-index * 144px + tab-scroll.content-x < 0px {
+            tab-scroll.content-x = -root.selected-index * 144px;
+        } else if root.selected-index * 144px + 140px + tab-scroll.content-x > tab-scroll.visible-width {
+            tab-scroll.content-x = tab-scroll.visible-width - root.selected-index * 144px - 140px;
+        }
+    }
+    HorizontalLayout { height: 64px; spacing: 6px;
+      tab-scroll := ScrollView {
+        horizontal-stretch: 1; min-width: 0px;
+        content-width: Math.max(self.visible-width, root.tabs.length * 144px - 4px);
+        content-height: 60px; vertical-scrollbar-policy: always-off;
+        HorizontalLayout { spacing: 4px;
+            for tab in root.tabs : Rectangle {
+                width: 140px; height: 58px;
+                border-radius: 6px;
+                background: tab.id == root.selected-id ? #293a4a : tab-touch.has-hover ? #24313d : #171e26;
+                border-width: 1px; border-color: tab.id == root.selected-id ? #36d7cf : #34434f;
+                accessible-role: AccessibleRole.tab; accessible-label: tab.name;
+                tab-label := Text {
+                    x: 10px; y: 10px; width: parent.width - 20px;
+                    text: tab.name + (tab.unread > 0 ? " · " + tab.unread : "") + (tab.activity == "Completed" ? " · ✓" : tab.activity == "Ready" || tab.activity == "Stopped" ? "" : " · ●");
+                    color: #edf1f5; font-size: 12px;
+                    overflow: elide;
+                }
+                if tab.id == root.selected-id : Rectangle { x: 0px; y: 0px; width: 100%; height: 2px; background: #36d7cf; }
+                Text { x: 10px; y: 34px; width: parent.width - 20px; text: tab.activity; color: #9baeba; font-size: 10px; overflow: elide; }
+                tab-touch := TouchArea { mouse-cursor: pointer; clicked => { root.select-tab(tab.id); } }
+            }
+        }
+      }
+      new-tab := Button { text: "+"; width: 44px; height: 58px;
+        accessible-label: "New conversation"; enabled: root.can-create;
+        clicked => { root.new-conversation(); }
+      }
+    }
+ }
+
+export component HermesConversationPanel inherits VerticalBox {
+    in property <bool> listening;
+    in property <string> live-transcript;
+    in property <[AgentTab]> tabs;
+    in property <bool> can-create;
+    in property <string> selected-id;
+    in property <int> selected-index;
+    in property <string> task-title;
+    in property <string> tab-name;
+    in property <bool> selected-priority;
+    in property <bool> has-task;
+    in property <bool> can-retry;
+    in property <[RichMessageBlock]> blocks;
+    in property <bool> can-load-older;
+    in property <bool> loading-history;
+    in property <bool> viewing-older;
+    in-out property <bool> show-output;
+    in-out property <length> scroll-position;
+    out property <bool> at-bottom: history.content-y <= history.visible-height - history.content-height + 12px;
+    callback select-tab(string);
+    callback new-conversation();
+    callback rename-tab(string);
+    callback priority-changed(bool);
+    callback hide-tab();
+    callback list-hidden();
+    callback stop-task();
+    callback stop-activity(string);
+    callback retry-task();
+    callback load-older();
+    callback load-latest();
+    callback view-changed(bool);
+    callback open-link(string);
+    callback scroll-bottom();
+    scroll-bottom() => { history.content-y = -Math.max(0px, history.content-height - history.visible-height); }
+    padding: 0;
+    spacing: 5px;
+
+    if root.has-task || root.can-retry : HorizontalLayout { height: 28px; spacing: 4px;
+        if root.has-task : CheckBox { text: "Priority"; checked: root.selected-priority; toggled => { root.priority-changed(self.checked); } }
+        if root.has-task : Button { text: "Stop task"; clicked => { root.stop-task(); } }
+        if root.can-retry : Button { text: "Retry"; clicked => { root.retry-task(); } }
+        if root.has-task : Button { text: "Hide"; clicked => { root.hide-tab(); } }
+    }
+    if root.can-load-older || root.viewing-older : HorizontalLayout { spacing: 4px;
+        if root.can-load-older : Button { text: root.loading-history ? "Loading history…" : "Earlier messages"; enabled: !root.loading-history; clicked => { root.load-older(); } }
+        if root.viewing-older : Button { text: "Latest"; enabled: !root.loading-history; clicked => { root.load-latest(); } }
+    }
+    history := ListView {
+        vertical-stretch: 1; min-height: 70px;
+        content-width: self.visible-width;
+        horizontal-scrollbar-policy: always-off;
+        vertical-scrollbar-policy: always-on;
+        accessible-label: root.show-output ? "Conversation output" : "Conversation updates";
+        content-y <=> root.scroll-position;
+        changed content-height => { if root.listening || root.live-transcript != "" { root.scroll-bottom(); } }
+        for index in root.blocks.length + (root.listening || root.live-transcript != "" ? 1 : 0) : Rectangle {
+            property <bool> live: index == root.blocks.length;
+            property <RichMessageBlock> block: root.blocks[index];
+            property <bool> from-user: live || block.from-user;
+            property <bool> first: live || block.first;
+            property <bool> last: live || block.last;
+            height: Math.max(26px, (live ? live-body.preferred-height : block.kind == 3 ? table.preferred-height : body.preferred-height) + (first ? 22px : 2px) + (last ? 10px : 2px));
+            card := Rectangle {
+                x: from-user ? parent.width * 0.12 : 0px;
+                width: parent.width * 0.88 - 14px; height: parent.height - 6px;
+                background: from-user ? #284157 : block.kind == 2 ? #101720 : #252f39;
+                border-radius: 8px;
+            }
+            border-radius: first || last ? 8px : 0px;
+            if first : Text {
+                x: card.x + 12px; y: 4px; text: from-user ? "You" : "Assistant";
+                color: #a7b6c4; font-size: 10px;
+            }
+            body := StyledText {
+                visible: !live && block.kind != 3;
+                x: card.x + 12px; y: block.first ? 20px : 1px; width: card.width - 24px;
+                text: block.text; default-color: #edf1f5;
+                default-font-size: block.kind == 1 ? 18px : 14px;
+                default-font-family: block.kind == 2 ? "Consolas" : "Arial";
+                link-color: #59dcd5;
+                link-clicked(url) => { root.open-link(url); }
+            }
+            if !live && block.stop-target!="" : Button {
+                x:card.x+card.width - 30px;y:1px;width:26px;height:20px;text:"×";
+                accessible-label:"Stop this activity";
+                clicked=>{root.stop-activity(block.stop-target);}
+            }
+            live-body := Text {
+                visible: live; x: card.x + 12px; y: 20px; width: card.width - 24px;
+                text: root.live-transcript == "" ? "Listening…" : root.live-transcript;
+                color: #edf1f5; font-size: 14px; wrap: word-wrap;
+                accessible-label: live ? "Your live message" : "";
+            }
+            table := VerticalLayout {
+                visible: !live && block.kind == 3;
+                x: card.x + 12px; y: block.first ? 20px : 1px; width: card.width - 24px;
+                height: self.preferred-height; spacing: 4px;
+                for row in block.table-rows : HorizontalLayout {
+                    spacing: 6px;
+                    for cell in row.cells : StyledText {
+                        width: (parent.width - Math.max(0, row.cells.length - 1) * 6px) / Math.max(1, row.cells.length);
+                        text: cell; default-color: row.header ? #59dcd5 : #edf1f5; default-font-size: 13px;
+                        link-color: #59dcd5; link-clicked(url) => { root.open-link(url); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component HermesSettingsWindow inherits Window {
+    title: "Hermes assistant"; default-font-family: "Arial";
+    preferred-width: 520px; preferred-height: 430px; min-width: 420px; min-height: 350px;
+    in-out property <bool> enabled;
+    in property <[string]> models;
+    in-out property <string> selected-model;
+    in-out property <string> worker-model;
+    in-out property <bool> phrases-enabled: true;
+    in property <string> status;
+    in property <bool> busy;
+    in property <string> login-url;
+    callback open-login();
+    callback install();
+    callback update();
+    callback save();
+    callback connect();
+    callback login();
+    callback stop-all();
+    callback prepare-phrases();
+    VerticalBox { padding: 14px; spacing: 8px;
+        fields := ScrollView {
+            vertical-stretch: 1; content-width: self.visible-width;
+            VerticalBox { width: fields.visible-width; padding: 0; spacing: 8px;
+                Text { text: "Hermes assistant backend"; font-size: 18px; }
+                CheckBox { text: "Use Hermes for assistant conversations"; checked <=> root.enabled; }
+                Text { text: "Fast conversation model"; font-size: 12px; }
+                ComboBox { model: root.models; current-value <=> root.selected-model; }
+                Text { text: "Codex worker model · blank uses Codex default"; font-size: 12px; }
+                LineEdit { text <=> root.worker-model; }
+                CheckBox { text: "Use cached voice phrases"; checked <=> root.phrases-enabled; }
+                Button { text: "Prepare voice phrases"; enabled: !root.busy; clicked => { root.prepare-phrases(); } }
+                Text { text: "Latest official source version · conversations and tasks must be idle. A backup is kept before updating."; font-size: 12px; wrap: word-wrap; }
+                if root.login-url != "" : Button { text: "Open ChatGPT sign-in"; clicked => { root.open-login(); } }
+            }
+        }
+        Text { text: root.status; wrap: word-wrap; }
+        Button { text: "Update Hermes"; enabled: !root.busy; clicked => { root.update(); } }
+        HorizontalBox {
+            Button { text: "Install / repair"; enabled: !root.busy; clicked => { root.install(); } }
+            Button { text: "Codex login"; enabled: !root.busy; clicked => { root.login(); } }
+            Button { text: "Connect"; enabled: !root.busy; clicked => { root.connect(); } }
+        }
+        HorizontalBox {
+            Button { text: "Stop all tasks"; clicked => { root.stop-all(); } }
+            Button { text: "Save"; enabled: !root.busy; clicked => { root.save(); } }
+        }
+    }
+}
+
+export component HermesTabSettingsWindow inherits Window {
+    title: "Conversation settings"; default-font-family: "Arial";
+    preferred-width: 500px; preferred-height: 410px; min-width: 400px; min-height: 360px;
+    in property <bool> has-task;
+    in property <[string]> voices;
+    in-out property <string> selected-voice;
+    in-out property <string> worker-model;
+    in-out property <string> workspace;
+    in property <string> status;
+    callback save(); callback approve-workspace();
+    VerticalBox { padding: 14px; spacing: 8px;
+        Text { text: "Voice"; font-size: 12px; }
+        ComboBox { model: root.voices; current-value <=> root.selected-voice; }
+        if root.has-task : Text { text: "Codex worker model · applies to the next attempt"; font-size: 12px; }
+        if root.has-task : LineEdit { text <=> root.worker-model; placeholder-text: "Use default"; }
+        if root.has-task : Text { text: "Workspace write access"; font-size: 12px; }
+        if root.has-task : LineEdit { text <=> root.workspace; placeholder-text: "Absolute project folder"; }
+        if root.has-task : Text { text: "Only a blocked task can receive access. Git projects get a separate worktree. Shared folders allow one writer. Network and desktop actions stay disabled."; wrap: word-wrap; }
+        Text { text: root.status; wrap: word-wrap; vertical-stretch: 1; }
+        HorizontalBox {
+            if root.has-task : Button { text: "Approve workspace and start"; clicked => { root.approve-workspace(); } }
+            Button { text: "Save"; clicked => { root.save(); } }
+        }
+    }
+}
+
+export component HermesHiddenTabsWindow inherits Window {
+    title: "Hidden conversations"; default-font-family: "Arial";
+    preferred-width: 420px; preferred-height: 320px; min-width: 320px; min-height: 240px;
+    in property <[AgentTab]> tabs;
+    callback reopen(string);
+    VerticalBox { padding: 12px; spacing: 6px;
+        Text { text: "Hidden conversations keep working."; }
+        if root.tabs.length == 0 : Text { text: "No hidden conversations."; }
+        ListView { for tab in root.tabs : Button { text: tab.name + " · " + tab.activity; clicked => { root.reopen(tab.id); } } }
+    }
+}
+
+export struct HistorySearchResult { message: string, offset: string, preview: string }
+export component HermesHistoryWindow inherits Window {
+    title: "Conversation history"; default-font-family: "Arial";
+    preferred-width: 560px; preferred-height: 440px; min-width: 400px; min-height: 320px;
+    in-out property <string> query;
+    in property <[HistorySearchResult]> results;
+    in property <string> status;
+    in property <bool> busy;
+    callback find(string); callback show-result(string,string); callback copy-displayed(); callback export-conversation();
+    VerticalBox { padding: 12px; spacing: 6px;
+        Text { text: "Find text · case sensitive"; font-size: 12px; }
+        HorizontalBox {
+            LineEdit { text <=> root.query; horizontal-stretch: 1; accepted => { root.find(root.query); } }
+            Button { text: "Find"; enabled: !root.busy; clicked => { root.find(root.query); } }
+        }
+        Text { text: root.status; wrap: word-wrap; }
+        ListView { vertical-stretch: 1;
+            for result in root.results : Button { text: result.preview; clicked => { root.show-result(result.message,result.offset); } }
+        }
+        HorizontalBox {
+            Button { text: "Copy displayed text"; clicked => { root.copy-displayed(); } }
+            Button { text: "Export conversation…"; enabled: !root.busy; clicked => { root.export-conversation(); } }
+        }
+    }
+}

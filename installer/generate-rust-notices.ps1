@@ -34,7 +34,7 @@ $dependencyPackages = $dependencyPackages | Sort-Object name, version
 foreach ($package in $dependencyPackages) {
     $sections.Add("------------------------------------------------------------------------")
     $sections.Add("$($package.name) $($package.version)")
-    $sections.Add("License expression: $($package.license)")
+    $sections.Add("License expression: $(if ($package.license) { $package.license } else { 'not declared in package metadata' })")
     $sections.Add("Source: $($package.source)")
     $sections.Add("")
 

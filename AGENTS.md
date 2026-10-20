@@ -43,3 +43,24 @@ The primary agent must deduplicate findings, verify high-severity claims, and pr
 - Keep the program usable without Python, a separately installed ONNX runtime, or developer tools.
 - Startup behavior must remain per-user and reversible.
 - Installer contents must match the runtime's asset and DLL discovery rules.
+
+## Text rendering
+
+- Use the Skia renderer for normal desktop operation. Keep FemtoVG disabled in
+  Cargo features: its glyph-atlas rendering produces uneven small text on
+  Windows, including component names in newly added windows.
+- Set `default-font-family: "Arial"` on new top-level windows.
+- Verify text visually with the production Skia renderer at 100%, 125%, and
+  150% display scaling. Software-renderer screenshots alone do not verify the
+  renderer used by the application. See `docs/text-rendering.md`.
+
+## GUI development
+
+- Use the official Slint skill and version-matched Slint documentation for UI work.
+- For changes to UI appearance or interaction, run a development build with
+  `scripts/gui-dev.ps1 -Mode mcp`, inspect the live Slint element tree, exercise
+  the affected controls, and review screenshots before declaring the work done.
+- Use `scripts/gui-dev.ps1 -Mode preview` for rapid visual iteration. Check
+  relevant windows at minimum and normal sizes, including 100%, 125%, and 150%
+  display scaling when text or clipping is involved. Keep MCP and live preview
+  features out of release builds.

@@ -1,0 +1,20 @@
+export struct GraphRunRow { id: string, title: string, state: string }
+export component GraphRunProgress inherits Rectangle {
+    in property <[GraphRunRow]> nodes;
+    height: 38px; vertical-stretch: 0; clip: true;
+        for node[index] in root.nodes : Rectangle {
+            x: index * ((root.width - 18px) / 4 + 6px);
+            width: (root.width - 18px) / 4; height: 36px;
+            border-radius: 5px; border-width: 1px;
+            background: node.state == "Running" ? #205837 : #14251c;
+            border-color: node.state == "Failed" || node.state == "Blocked" ? #fb7185 : node.state == "Running" ? #4ade80 : #356047;
+            accessible-role: list-item; accessible-label: node.title + " · " + node.state;
+            Text { x: 6px; y: 2px; width: parent.width - 12px; height: 16px;
+                text: node.title; color: #e6fff0; font-size: 11px; overflow: elide; vertical-alignment: center;
+            }
+            Text { x: 6px; y: 18px; width: parent.width - 12px; height: 14px;
+                text: node.state; font-size: 10px; vertical-alignment: center; overflow: elide;
+                color: node.state == "Failed" || node.state == "Blocked" ? #fda4af : node.state == "Skipped" ? #91aa9b : #4ade80;
+            }
+        }
+}

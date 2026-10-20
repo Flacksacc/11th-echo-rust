@@ -117,20 +117,10 @@ fn process_with(
         });
         clean.push(atom.clone());
     }
-    let mut predictions = (0..clean.len())
-        .map(|_| WordPrediction {
-            punctuation: String::new(),
-            casing: String::new(),
-        })
-        .collect::<Vec<_>>();
-    // Bounded windows with context overlap. Each boundary has one owner.
-    for start in (0..clean.len()).step_by(96) {
-        let end = (start + 96).min(clean.len());
-        let left = start.saturating_sub(16);
-        let right = (end + 16).min(clean.len());
-        let output = match infer(&projection[left..right].join(" "))
-            .and_then(|out| word_predictions(&projection[left..right], &out))
-        {
+    // Submit the entire completed transcript once. Do not introduce word-window
+    // boundaries in Echo; the installed model/runtime owns its context limits.
+    let predictions =
+        match infer(&projection.join(" ")).and_then(|out| word_predictions(&projection, &out)) {
             Ok(output) => output,
             Err(warning) => {
                 return ProcessedText {
@@ -143,8 +133,6 @@ fn process_with(
                 }
             }
         };
-        predictions[start..end].clone_from_slice(&output[(start - left)..(end - left)]);
-    }
     let mut sentence_start = true;
     let mut text = String::new();
     for (atom, prediction) in clean.iter().zip(predictions) {
@@ -308,6 +296,9 @@ pub fn punctuation_model_available() -> bool {
         && vocabulary_path()
             .metadata()
             .is_ok_and(|m| m.len() == VOCABULARY_SIZE)
+}
+pub fn unload_punctuation() {
+    *PUNCTUATOR.lock().unwrap() = None;
 }
 fn load(model_path: &Path, vocabulary_path: &Path) -> Result<OnlinePunctuation, String> {
     if !model_path.is_file() || !vocabulary_path.is_file() {
@@ -800,20 +791,53 @@ mod tests {
     }
 
     #[test]
-    fn windows_have_single_boundary_ownership_without_word_loss() {
+    fn complete_transcript_is_submitted_once_without_word_loss() {
         let input = std::iter::repeat_n("ordinary", 350)
             .collect::<Vec<_>>()
             .join(" ");
         let calls = std::cell::Cell::new(0);
         let r = process_with(&input, &PostProcessingSettings::default(), |text| {
             calls.set(calls.get() + 1);
-            assert!(text.split_whitespace().count() <= 128);
+            assert_eq!(text, input);
             Ok(format!("{text}."))
         });
-        assert_eq!(calls.get(), 4);
+        assert_eq!(calls.get(), 1);
         assert_eq!(r.text.split_whitespace().count(), 350);
         assert_eq!(r.text.matches('.').count(), 1);
         assert!(r.warning.is_none());
+    }
+
+    #[test]
+    #[ignore = "uses installed verified punctuation weights; synthetic text, no downloads"]
+    fn installed_model_processes_complete_long_transcript_without_word_loss() {
+        let model = load(&punctuation_path(), &vocabulary_path()).unwrap();
+        let input = std::iter::repeat_n(
+            "we discussed the meeting and the project today can you send the report tomorrow",
+            30,
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
+        let calls = std::cell::Cell::new(0);
+        let start = Instant::now();
+        let result = process_with(&input, &PostProcessingSettings::default(), |text| {
+            calls.set(calls.get() + 1);
+            assert_eq!(text, input);
+            model.add_punctuation(text).ok_or("inference failed".into())
+        });
+        assert!(result.warning.is_none(), "{:?}", result.warning);
+        assert_eq!(calls.get(), 1);
+        let restored = result
+            .text
+            .split_whitespace()
+            .map(|word| word.trim_end_matches([',', '.', '?', '!']).to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(restored, input);
+        eprintln!(
+            "Whole-transcript punctuation: {} words in {:?}",
+            input.split_whitespace().count(),
+            start.elapsed()
+        );
     }
 
     #[test]

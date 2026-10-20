@@ -1,0 +1,261 @@
+import { VerticalBox, HorizontalBox, LineEdit, TextEdit, CheckBox, ComboBox, Palette, ScrollView } from "std-widgets.slint";
+export struct GraphSettingRow { key: string, label: string, kind: int, value: string, checked: bool, choices: [string], choice-values: [string], wired: bool }
+export struct GraphPortRow { id: string, label: string }
+export struct GraphNodeRow { id: string, title: string, detail: string, editable-text: bool, router: bool, router-model: string, settings: [GraphSettingRow], selected: bool, state: string, x: float, y: float, w: float, h: float, inputs: [GraphPortRow], outputs: [GraphPortRow] }
+export struct GraphWireRow { index: int, x1: float, y1: float, x2: float, y2: float }
+export component GraphCanvas inherits Rectangle {
+    in property <[GraphNodeRow]> nodes;
+    in property <[GraphWireRow]> wires;
+    in property <[string]> router-models;
+    in-out property <float> zoom: 1;
+    in-out property <float> pan-x: 30;
+    in-out property <float> pan-y: 30;
+    in-out property <string> selected;
+    private property <bool> wiring: false;
+    private property <float> wire-start-x;
+    private property <float> wire-start-y;
+    private property <float> wire-x;
+    private property <float> wire-y;
+    private property <bool> space-held: false;
+    private property <string> focused-text-node;
+    private property <bool> selecting: false;
+    private property <float> selection-x1;
+    private property <float> selection-y1;
+    private property <float> selection-x2;
+    private property <float> selection-y2;
+    private property <bool> additive-selection;
+    callback select-node(string, bool);
+    callback select-rectangle(float,float,float,float,bool,bool);
+    callback move-selection(float,float);
+    callback copy-nodes() -> string;
+    callback paste-nodes(string);
+    clipboard-input := TextInput { visible: false; }
+    public function copy-selection() {
+        let payload = root.copy-nodes();
+        if payload != "" { clipboard-input.text = payload; clipboard-input.select-all(); clipboard-input.copy(); }
+    }
+    public function paste-selection() {
+        clipboard-input.text = "";
+        clipboard-input.paste();
+        root.paste-nodes(clipboard-input.text);
+    }
+    callback checkpoint();
+    callback geometry(string, float, float, float, float);
+    callback setting-edited(string,string,string,bool) -> bool;
+    callback select-router(string, string);
+    callback edit-text(string, string, bool) -> bool;
+    callback start-wire(string, string);
+    callback finish-wire(float, float);
+    callback disconnect(int);
+    callback view-changed(float, float, float);
+    callback delete-node(string);
+    callback duplicate-node(string);
+    callback add-node();
+    callback undo();
+    callback redo();
+    background: #091b13; clip: true; border-width: 1px; border-color: #294938;
+    forward-focus: keys;
+    keys := FocusScope {
+        capture-key-pressed(e) => {
+            if root.focused-text-node == "" && e.modifiers.control {
+                if e.text.to-lowercase() == "c" { root.copy-selection(); return accept; }
+                if e.text.to-lowercase() == "v" { root.paste-selection(); return accept; }
+            }
+            return reject;
+        }
+        key-pressed(e) => {
+            if e.text == " " { root.space-held = true; return accept; }
+            if e.text == Key.Delete && root.selected != "" { root.delete-node(root.selected); return accept; }
+            if e.modifiers.control && e.text.to-lowercase() == "z" { if e.modifiers.shift { root.redo(); } else { root.undo(); } return accept; }
+            if e.modifiers.control && e.text.to-lowercase() == "d" { root.duplicate-node(root.selected); return accept; }
+            if e.text == Key.Escape { root.wiring = false; root.selecting = false; return accept; }
+            return reject;
+        }
+        key-released(e) => { if e.text == " " { root.space-held = false; return accept; } return reject; }
+        ContextMenuArea {
+            Menu {
+                MenuItem { title:"Add node…";activated=>{root.add-node();} }
+                MenuItem { title:"Copy nodes"; activated=>{root.copy-selection();} }
+                MenuItem { title:"Paste nodes"; activated=>{root.paste-selection();} }
+                MenuItem { title:"Undo";activated=>{root.undo();} }
+                MenuItem { title:"Redo";activated=>{root.redo();} }
+            }
+        }
+        background-hit := TouchArea {
+            private property <bool> panning: false;
+            private property <float> old-x;
+            private property <float> old-y;
+            private property <length> start-x;
+            private property <length> start-y;
+            pointer-event(e) => {
+                if e.kind == PointerEventKind.down {
+                    keys.focus(); root.focused-text-node = "";
+                    self.panning = e.button == PointerEventButton.middle || (e.button == PointerEventButton.left && root.space-held);
+                    self.old-x=root.pan-x; self.old-y=root.pan-y; self.start-x=self.mouse-x; self.start-y=self.mouse-y;
+                    if self.panning { root.checkpoint(); }
+                    if e.button == PointerEventButton.left && !self.panning {
+                        root.selecting=true; root.additive-selection=e.modifiers.control || e.modifiers.shift;
+                        root.selection-x1=self.mouse-x/1px;root.selection-y1=self.mouse-y/1px;
+                        root.selection-x2=root.selection-x1;root.selection-y2=root.selection-y1;
+                        root.select-rectangle((root.selection-x1 - root.pan-x)/root.zoom,(root.selection-y1 - root.pan-y)/root.zoom,(root.selection-x2 - root.pan-x)/root.zoom,(root.selection-y2 - root.pan-y)/root.zoom,root.additive-selection,true);
+                    }
+                }
+                if e.kind == PointerEventKind.up {
+                    if root.selecting && Math.abs(root.selection-x2 - root.selection-x1) < 3 && Math.abs(root.selection-y2 - root.selection-y1) < 3 { root.select-node("",false); }
+                    if self.panning || root.selecting { keys.focus(); root.focused-text-node = ""; }
+                    if self.panning { root.view-changed(root.pan-x,root.pan-y,root.zoom); }
+                    self.panning=false;root.selecting=false;
+                }
+            }
+            moved => {
+                if self.panning { root.pan-x=self.old-x+(self.mouse-x - self.start-x)/1px; root.pan-y=self.old-y+(self.mouse-y - self.start-y)/1px; }
+                if root.selecting {
+                    root.selection-x2=self.mouse-x/1px;root.selection-y2=self.mouse-y/1px;
+                    root.select-rectangle((root.selection-x1 - root.pan-x)/root.zoom,(root.selection-y1 - root.pan-y)/root.zoom,(root.selection-x2 - root.pan-x)/root.zoom,(root.selection-y2 - root.pan-y)/root.zoom,root.additive-selection,false);
+                }
+            }
+            scroll-event(e) => {
+                if !root.wiring && !root.selecting { root.checkpoint();
+                    root.pan-x = self.mouse-x / 1px - (self.mouse-x / 1px - root.pan-x) * Math.max(0.25,Math.min(2,root.zoom * (e.delta-y > 0px ? 1.1 : 1/1.1))) / root.zoom;
+                    root.pan-y = self.mouse-y / 1px - (self.mouse-y / 1px - root.pan-y) * Math.max(0.25,Math.min(2,root.zoom * (e.delta-y > 0px ? 1.1 : 1/1.1))) / root.zoom;
+                    root.zoom=Math.max(0.25,Math.min(2,root.zoom*(e.delta-y > 0px ? 1.1 : 1/1.1)));
+                    root.view-changed(root.pan-x,root.pan-y,root.zoom);
+                } return accept;
+            }
+            double-clicked => { root.add-node(); }
+        }
+        for wire in root.wires : Path {
+            width: root.width; height: root.height; viewbox-width: root.width / 1px; viewbox-height: root.height / 1px; stroke: #66caa0; stroke-width: 2px;
+            MoveTo { x: wire.x1*root.zoom+root.pan-x; y: wire.y1*root.zoom+root.pan-y; }
+            CubicTo { x: wire.x2*root.zoom+root.pan-x; y: wire.y2*root.zoom+root.pan-y;
+                control-1-x: (wire.x1+Math.max(60,Math.abs(wire.x2 - wire.x1)/2))*root.zoom+root.pan-x; control-1-y: wire.y1*root.zoom+root.pan-y;
+                control-2-x: (wire.x2 - Math.max(60,Math.abs(wire.x2 - wire.x1)/2))*root.zoom+root.pan-x; control-2-y: wire.y2*root.zoom+root.pan-y;
+            }
+        }
+        for wire in root.wires : Rectangle {
+            x: ((wire.x1+wire.x2)/2*root.zoom+root.pan-x)*1px-7px;
+            y: ((wire.y1+wire.y2)/2*root.zoom+root.pan-y)*1px-7px;
+            width: 14px; height: 14px; border-radius: 7px; background: wire-hit.has-hover ? #9c384e : #173b2b;
+            Text { text: "×"; color: #a9c3b2; horizontal-alignment: center; vertical-alignment: center; }
+            wire-hit := TouchArea { mouse-cursor: pointer; clicked => { root.disconnect(wire.index); } }
+        }
+        for node in root.nodes : box := Rectangle {
+            x: (node.x*root.zoom+root.pan-x)*1px; y: (node.y*root.zoom+root.pan-y)*1px;
+            width: node.w*root.zoom*1px; height: node.h*root.zoom*1px;
+            background: #10291d; border-radius: 8px*root.zoom; border-width: node.selected ? 2px : 1px; border-color: node.state == "Failed" || node.state == "Blocked" ? #fb7185 : node.selected || node.state == "Running" ? #4ade80 : #315940;
+            accessible-role: list-item; accessible-label: node.title; accessible-value: node.selected ? "Selected" : "";
+            TouchArea { pointer-event(e) => { if e.kind == PointerEventKind.down && e.button == PointerEventButton.left { keys.focus(); root.focused-text-node = ""; root.select-node(node.id,e.modifiers.control || e.modifiers.shift); } } }
+
+            Rectangle {
+                x:0px;y:0px;height: 24px*root.zoom; width: parent.width; background: #204331; border-radius: 6px*root.zoom;
+                Text { x: 10px*root.zoom; width: parent.width - 20px*root.zoom; height: parent.height; text: node.title; color: #edfff2; font-size: 12px*root.zoom; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                header := TouchArea {
+                    private property <length> last-x; private property <length> last-y;
+                    private property <bool> dragging: false;
+                    pointer-event(e) => {
+                        if e.kind == PointerEventKind.down && e.button == PointerEventButton.left {
+                            keys.focus(); root.focused-text-node = ""; root.select-node(node.id,e.modifiers.control || e.modifiers.shift); root.checkpoint(); self.dragging=true;
+                            self.last-x=self.mouse-x+self.absolute-position.x;self.last-y=self.mouse-y+self.absolute-position.y;
+                        }
+                        if e.kind == PointerEventKind.up {self.dragging=false;}
+                    }
+                    moved => { if self.pressed && self.dragging && node.selected {
+                        let dx=(self.mouse-x+self.absolute-position.x - self.last-x)/root.zoom/1px;
+                        let dy=(self.mouse-y+self.absolute-position.y - self.last-y)/root.zoom/1px;
+                        self.last-x=self.mouse-x+self.absolute-position.x;self.last-y=self.mouse-y+self.absolute-position.y;
+                        root.move-selection(dx,dy);
+                    } }
+                    mouse-cursor: grab;
+                }
+            }
+
+            if node.editable-text : TextEdit {
+                x: 10px*root.zoom; y: 62px*root.zoom;
+                width: parent.width - 20px*root.zoom;
+                height: (node.h - 70)*root.zoom*1px;
+                font-size: 12px*root.zoom; wrap: word-wrap;
+                placeholder-text: "Enter text…";
+                accessible-label: "Text node content";
+                text <=> node.detail;
+                private property <bool> editing: false;
+                changed has-focus => {
+                    if self.has-focus { root.focused-text-node = node.id; }
+                    else {
+                        if root.focused-text-node == node.id { root.focused-text-node = ""; }
+                        self.editing = false;
+                    }
+                }
+                edited(value) => {
+                    root.select-node(node.id,false);
+                    if root.edit-text(node.id, value, !self.editing) { self.editing = true; }
+                }
+            }
+            for port[i] in node.inputs : Rectangle {
+                accessible-role: button;accessible-label:node.title+" input "+port.label;
+                x: -7px*root.zoom; y: (40+i*20)*root.zoom*1px-7px*root.zoom; width: 14px*root.zoom; height: 14px*root.zoom; border-radius: 7px*root.zoom;
+                background: root.wiring ? #4ade80 : #68b5dc; border-width: 1px; border-color: #d0f8ff;
+                Text { x: 19px*root.zoom; y: -3px*root.zoom; width: (node.w/2-20)*root.zoom*1px; height: 20px*root.zoom; text: port.label; color: #d5eadd; font-size: 10px*root.zoom; overflow: elide; vertical-alignment: center; }
+            }
+            for port[i] in node.outputs : Rectangle {
+                accessible-role: button;accessible-label:node.title+" output "+port.label;
+                x: parent.width - 7px*root.zoom; y: (40+(i+(node.router ? 1 : 0))*20)*root.zoom*1px-7px*root.zoom; width: 14px*root.zoom; height: 14px*root.zoom; border-radius: 7px*root.zoom;
+                background: #68b5dc; border-width: 1px; border-color: #d0f8ff;
+                Text { x: -(node.w/2-8)*root.zoom*1px; y: -3px*root.zoom; width: (node.w/2-20)*root.zoom*1px; height: 20px*root.zoom; text: port.label; color: #d5eadd; font-size: 10px*root.zoom; overflow: elide; horizontal-alignment: right; vertical-alignment: center; }
+                socket := TouchArea {
+                    mouse-cursor: crosshair;
+                    pointer-event(e) => {
+                        if e.kind == PointerEventKind.down { root.wiring=true; root.start-wire(node.id,port.id); root.wire-start-x=node.x+node.w; root.wire-start-y=node.y+40+(i+(node.router ? 1 : 0))*20; root.wire-x=root.wire-start-x;root.wire-y=root.wire-start-y; }
+                        if e.kind == PointerEventKind.up && root.wiring { root.finish-wire(root.wire-x,root.wire-y); root.wiring=false; }
+                    }
+                    moved => { root.wire-x=node.x+node.w+(self.mouse-x/1px/root.zoom - 7);root.wire-y=node.y+40+(i+(node.router ? 1 : 0))*20+(self.mouse-y/1px/root.zoom - 7); }
+                }
+            }
+            if !node.editable-text && node.settings.length > 0 : ScrollView {
+                x: 10px*root.zoom; y: (60 + Math.max(node.inputs.length,node.outputs.length)*20)*root.zoom*1px;
+                width: parent.width - 20px*root.zoom;
+                height: parent.height - self.y - 12px*root.zoom;
+                VerticalBox { padding: 0px; spacing: 2px; alignment: start;
+                    for field in node.settings : VerticalBox { padding: 0px; spacing: 1px;
+                        if field.kind != 1 : Text { text: field.label; color: #a9c3b2; font-size: 10px*root.zoom; wrap: word-wrap; }
+                        if field.kind == 1 : CheckBox { text: field.label; accessible-label: field.label; checked <=> field.checked; min-width: 0px; min-height: 22px; font-size: 11px*root.zoom;
+                            toggled => { root.setting-edited(node.id,field.key,self.checked ? "true" : "false",true); }
+                        }
+                        if field.kind == 2 || field.kind == 4 : ComboBox { model: field.choices; current-value <=> field.value; min-width: 0px; min-height: 24px;
+                            accessible-label: field.label;
+                            selected(value) => { root.setting-edited(node.id,field.key,value,true); }
+                        }
+                        if field.kind == 0 && !field.wired : LineEdit { text <=> field.value; accessible-label: field.label; min-width: 0px; min-height: 22px; font-size: 11px*root.zoom;
+                            private property <bool> editing: false;
+                            changed has-focus => { root.focused-text-node = self.has-focus ? node.id : ""; if !self.has-focus { self.editing = false; } }
+                            edited(value) => { if root.setting-edited(node.id,field.key,value,!self.editing) { self.editing = true; } }
+                        }
+                        if field.kind == 3 && !field.wired : TextEdit { height: 48px*root.zoom; min-width: 0px; text <=> field.value; accessible-label: field.label; wrap: word-wrap; font-size: 12px*root.zoom;
+                            private property <bool> editing: false;
+                            changed has-focus => { root.focused-text-node = self.has-focus ? node.id : ""; if !self.has-focus { self.editing = false; } }
+                            edited(value) => { if root.setting-edited(node.id,field.key,value,!self.editing) { self.editing = true; } }
+                        }
+                    }
+
+                }
+            }
+            if !node.editable-text : Text {x:10px*root.zoom;y:parent.height - 24px*root.zoom;width:parent.width - 35px*root.zoom;height:20px*root.zoom;text:node.state;color:#4ade80;font-size:10px*root.zoom;overflow:elide;vertical-alignment:center;}
+            resize-hit := TouchArea {
+                x: parent.width - 18px; y: parent.height - 18px; width:18px; height:18px; mouse-cursor: se-resize;
+                private property <length> start-x; private property <length> start-y;
+                private property <float> original-width;private property <float> original-height;
+                pointer-event(e) => { if e.kind == PointerEventKind.down { root.checkpoint(); self.start-x=self.mouse-x+self.absolute-position.x;self.start-y=self.mouse-y+self.absolute-position.y;self.original-width=node.w;self.original-height=node.h; } }
+                moved => { if self.pressed { root.geometry(node.id,node.x,node.y,Math.max(220,self.original-width+(self.mouse-x+self.absolute-position.x - self.start-x)/root.zoom/1px),Math.max(node.editable-text ? 120 : 90,self.original-height+(self.mouse-y+self.absolute-position.y - self.start-y)/root.zoom/1px)); } }
+            }
+        }
+        if root.selecting : Rectangle {
+            x: Math.min(root.selection-x1,root.selection-x2)*1px; y: Math.min(root.selection-y1,root.selection-y2)*1px;
+            width: Math.abs(root.selection-x2 - root.selection-x1)*1px; height: Math.abs(root.selection-y2 - root.selection-y1)*1px;
+            background: #4ade8020; border-color: #4ade80; border-width: 1px;
+        }
+        if root.wiring : Path {
+            width: root.width; height: root.height; viewbox-width: root.width / 1px; viewbox-height: root.height / 1px; stroke: #4ade80; stroke-width: 2px;
+            MoveTo { x: root.wire-start-x*root.zoom+root.pan-x; y: root.wire-start-y*root.zoom+root.pan-y; }
+            LineTo { x: root.wire-x*root.zoom+root.pan-x; y: root.wire-y*root.zoom+root.pan-y; }
+        }
+    }
+}

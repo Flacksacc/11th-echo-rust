@@ -14,6 +14,56 @@ pub struct HotkeySpec {
     pub meta: bool,
     pub key: HotkeyKey,
 }
+pub fn captured_combo(event: &slint::language::KeyEvent) -> String {
+    use slint::platform::Key;
+    let text = event.text.as_str();
+    let key = if text == " " {
+        "Space".to_owned()
+    } else if event.modifiers.shift && text.len() == 1 && "!@#$%^&*()".contains(text) {
+        let index = "!@#$%^&*()".find(text).unwrap();
+        format!("{}", (index + 1) % 10)
+    } else if text.len() == 1 && text.as_bytes()[0].is_ascii_alphanumeric() {
+        text.to_ascii_uppercase()
+    } else {
+        let functions = [
+            Key::F1,
+            Key::F2,
+            Key::F3,
+            Key::F4,
+            Key::F5,
+            Key::F6,
+            Key::F7,
+            Key::F8,
+            Key::F9,
+            Key::F10,
+            Key::F11,
+            Key::F12,
+        ];
+        let Some(index) = functions
+            .into_iter()
+            .position(|key| slint::SharedString::from(key) == event.text)
+        else {
+            return String::new();
+        };
+        format!("F{}", index + 1)
+    };
+    let m = event.modifiers;
+    let mut parts = Vec::new();
+    if m.control {
+        parts.push("Ctrl".to_owned());
+    }
+    if m.shift {
+        parts.push("Shift".to_owned());
+    }
+    if m.alt {
+        parts.push("Alt".to_owned());
+    }
+    if m.meta {
+        parts.push("Win".to_owned());
+    }
+    parts.push(key);
+    parts.join("+")
+}
 
 pub fn parse_hotkey_spec(input: &str) -> Result<HotkeySpec, String> {
     let mut ctrl = false;
@@ -95,6 +145,45 @@ pub fn parse_hotkey_spec(input: &str) -> Result<HotkeySpec, String> {
 #[cfg(test)]
 mod tests {
     use super::{parse_hotkey_spec, HotkeyKey};
+    #[test]
+    fn captures_supported_combinations_and_ignores_modifier_only_or_navigation() {
+        use slint::{
+            language::{KeyEvent, KeyboardModifiers},
+            platform::Key,
+        };
+        let mut m = KeyboardModifiers::default();
+        m.control = true;
+        m.shift = true;
+        m.alt = true;
+        m.meta = true;
+        for (text, expected) in [
+            (slint::SharedString::from(Key::F8), "Ctrl+Shift+Alt+Win+F8"),
+            ("k".into(), "Ctrl+Shift+Alt+Win+K"),
+            (" ".into(), "Ctrl+Shift+Alt+Win+Space"),
+            ("!".into(), "Ctrl+Shift+Alt+Win+1"),
+        ] {
+            let mut event = KeyEvent::default();
+            event.text = text;
+            event.modifiers = m;
+            let value = super::captured_combo(&event);
+            assert_eq!(value, expected);
+            assert!(parse_hotkey_spec(&value).is_ok());
+        }
+        for key in [
+            Key::Control,
+            Key::Shift,
+            Key::Alt,
+            Key::Meta,
+            Key::Tab,
+            Key::Escape,
+            Key::LeftArrow,
+        ] {
+            let mut event = KeyEvent::default();
+            event.text = key.into();
+            event.modifiers = m;
+            assert!(super::captured_combo(&event).is_empty());
+        }
+    }
 
     #[test]
     fn parse_letters_digits_and_function_keys() {

@@ -1,0 +1,134 @@
+import { VerticalBox, HorizontalBox, ListView, ScrollView, TextEdit, LineEdit, Button, Palette, ProgressIndicator } from "std-widgets.slint";
+export struct SayingRow { heading: bool, id: string, category: string, text: string, state: string }
+export component VoiceSayingsWindow inherits Window {
+    default-font-family: "Arial";
+    init => { Palette.color-scheme = ColorScheme.dark; }
+    title: "Sayings — " + root.voice-label;
+    icon: @image-url("../eleventhecho.png");
+    preferred-width: 1000px; preferred-height: 700px;
+    min-width: 820px; min-height: 600px;
+    background: #07140e;
+    in property <string> voice-label;
+    in property <[SayingRow]> sayings;
+    in property <string> selected-id;
+    in property <string> category;
+    in property <string> audio-state;
+    in property <int> total;
+    in property <bool> busy;
+    in property <bool> playing;
+    in property <bool> dirty;
+    in property <string> status;
+    in property <int> generated-count;
+    in property <int> generation-total;
+    in property <string> current-saying;
+    in property <bool> confirm-changes;
+    in property <string> confirm-error;
+    in-out property <string> wording;
+    in-out property <string> search;
+    callback select-saying(string);
+    callback search-changed();
+    callback wording-changed();
+    callback save-words();
+    callback restore-words();
+    callback generate(bool);
+    callback play();
+    callback stop();
+    callback dismiss();
+    callback resolve-changes(int);
+    VerticalBox { padding: 20px; spacing: 12px;
+        Text { text: "Sayings · \{root.voice-label}"; font-size: 22px; color: #e6fff0; wrap: word-wrap; }
+        Text { text: "\{root.total} sayings in 24 situations. Each section groups alternative clips for the same trigger."; color: #a9c3b2; wrap: word-wrap; }
+        Text { text: "Echo chooses one available option when a trigger occurs and spoken status updates are enabled. Playback waits for quiet moments."; color: #a9c3b2; wrap: word-wrap; font-size: 12px; }
+        HorizontalBox { padding: 0px; spacing: 20px;
+            VerticalBox { padding: 0px; spacing: 8px; min-width: 310px; max-width: 400px; horizontal-stretch: 1;
+                LineEdit { text <=> root.search; placeholder-text: "Find a saying or situation"; accessible-label: "Find sayings"; enabled: !root.busy && !root.dirty && !root.confirm-changes;
+                    edited => { root.search-changed(); }
+                }
+                ListView { for saying in root.sayings : Rectangle {
+                    height: saying.heading ? 112px : 58px; min-width: 0px;
+                    if saying.heading : VerticalBox {
+                        padding: 10px; spacing: 6px; alignment: start;
+                        Text { text: saying.category; font-size: 15px; font-weight: 600; color: #e6fff0; wrap: word-wrap; }
+                        Text { text: saying.text; height: 60px; font-size: 12px; color: #a9c3b2; wrap: word-wrap; }
+                    }
+                    if !saying.heading : Button {
+                        width: parent.width; height: parent.height;
+                        accessible-label: "Saying: " + saying.text;
+                        primary: saying.id == root.selected-id;
+                        enabled: !root.busy && !root.confirm-changes;
+                        clicked => { root.select-saying(saying.id); }
+                    }
+                    if !saying.heading : Text { x: 12px; y: 9px; width: parent.width - 24px; height: 18px;
+                        text: saying.state; overflow: elide;
+                        color: saying.id == root.selected-id ? #07140e : #a9c3b2;
+                        accessible-role: none;
+                    }
+                    if !saying.heading : Text { x: 12px; y: 30px; width: parent.width - 24px; height: 18px;
+                        text: saying.text; overflow: elide;
+                        color: saying.id == root.selected-id ? #07140e : #e6fff0;
+                        accessible-role: none;
+                    }
+                } }
+            }
+            VerticalBox { padding: 0px; spacing: 12px; horizontal-stretch: 1;
+              ScrollView { vertical-stretch: 1;
+                VerticalBox { padding: 0px; spacing: 12px; alignment: start;
+                    Text { text: root.category; font-size: 18px; color: #e6fff0; wrap: word-wrap; }
+                    Text { text: "Saying"; color: #a9c3b2; }
+                    TextEdit { height: 100px; text <=> root.wording; accessible-label: "Saying wording"; wrap: word-wrap; enabled: !root.busy && !root.confirm-changes && root.selected-id != "";
+                        edited => { root.wording-changed(); }
+                    }
+                    Button { text: "Restore default"; enabled: !root.busy && !root.confirm-changes && root.selected-id != ""; clicked => { root.restore-words(); } }
+                    Text { text: root.audio-state; color: #a9c3b2; wrap: word-wrap; }
+                    Button { text: root.playing ? "Playing…" : "Play saying"; enabled: !root.busy && !root.dirty && !root.confirm-changes && root.audio-state != "Not recorded"; clicked => { root.play(); } }
+                    Text { text: "Generate with this voice"; color: #e6fff0; font-size: 15px; }
+                    HorizontalBox { padding: 0px; spacing: 8px;
+                        Button { text: "Regenerate saying"; enabled: !root.busy && !root.dirty && !root.confirm-changes && root.selected-id != ""; clicked => { root.generate(false); } }
+                        Button { text: "Regenerate all (\{root.total})"; enabled: !root.busy && !root.dirty && !root.confirm-changes; clicked => { root.generate(true); } }
+                    }
+                    Text { text: "Regenerate all replaces the audio for every saying using this voice. You can stop partway through and keep completed sayings."; color: #a9c3b2; wrap: word-wrap; font-size: 12px; }
+                }
+              }
+              Button { text: "Save"; primary: true; enabled: !root.busy && root.dirty && !root.confirm-changes; clicked => { root.save-words(); } }
+            }
+        }
+        if root.generation-total > 0 : VerticalBox { padding: 0px; spacing: 6px;
+            Text { text: "Generated \{root.generated-count} of \{root.generation-total} sayings"; color: #e6fff0; }
+            ProgressIndicator { height: 8px; progress: root.generated-count * 1.0 / max(1, root.generation-total); accessible-label: "Sayings generation progress"; }
+            if root.current-saying != "" : Text { text: root.current-saying; color: #a9c3b2; overflow: elide; }
+        }
+        Text { text: root.status; color: #a7f3d0; wrap: word-wrap; }
+        HorizontalBox { padding: 0px; spacing: 8px;
+            if root.busy : Button { text: "Stop"; enabled: !root.confirm-changes; clicked => { root.stop(); } }
+            Button { text: "Close"; enabled: !root.confirm-changes; clicked => { root.dismiss(); } }
+        }
+    }
+    if root.confirm-changes : FocusScope {
+        width: root.width; height: root.height;
+        init => { self.focus(); }
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape { root.resolve-changes(2); return accept; }
+            return reject;
+        }
+        key-pressed(event) => {
+            if event.text == Key.Return { root.resolve-changes(0); return accept; }
+            return reject;
+        }
+        Rectangle { width: parent.width; height: parent.height; background: #000000b0; TouchArea {} }
+        Rectangle {
+            width: min(460px, root.width - 40px); height: confirm-layout.preferred-height;
+            x: (root.width - self.width) / 2; y: (root.height - self.height) / 2;
+            background: #10291d; border-radius: 8px; border-width: 1px; border-color: #466b55;
+            confirm-layout := VerticalBox { padding: 20px; spacing: 12px;
+                Text { text: "Save changes?"; color: #e6fff0; font-size: 20px; }
+                Text { text: "This option has unsaved changes. Save or discard them before leaving this option."; color: #a9c3b2; wrap: word-wrap; height: 42px; }
+                if root.confirm-error != "" : Text { text: root.confirm-error; color: #ffb4a9; wrap: word-wrap; height: 40px; }
+                HorizontalBox { padding: 0px; spacing: 8px;
+                    Button { text: "Save"; accessible-label: "Save changes"; primary: true; clicked => { root.resolve-changes(0); } }
+                    Button { text: "Discard"; clicked => { root.resolve-changes(1); } }
+                    Button { text: "Cancel"; clicked => { root.resolve-changes(2); } }
+                }
+            }
+        }
+    }
+}

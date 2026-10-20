@@ -6,7 +6,7 @@ use sherpa_onnx::{
     OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig, SileroVadModelConfig,
     VadModelConfig, VoiceActivityDetector,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fs;
 use std::io::Read;
@@ -124,14 +124,14 @@ struct EngineBundle {
 }
 
 enum EngineState {
-    Unloaded,
-    Loading((LocalModel, i32)),
-    Ready((LocalModel, i32), Arc<EngineBundle>),
+    Loading,
+    Ready(Arc<EngineBundle>),
     Failed(String),
 }
+type EngineKey = (LocalModel, i32);
 
 struct EngineManager {
-    state: Mutex<EngineState>,
+    state: Mutex<HashMap<EngineKey, EngineState>>,
     loading: Mutex<()>,
     changed: Condvar,
     generation: std::sync::atomic::AtomicU64,
@@ -141,31 +141,12 @@ fn manager() -> &'static Arc<EngineManager> {
     static MANAGER: OnceLock<Arc<EngineManager>> = OnceLock::new();
     MANAGER.get_or_init(|| {
         Arc::new(EngineManager {
-            state: Mutex::new(EngineState::Unloaded),
+            state: Mutex::new(HashMap::new()),
             loading: Mutex::new(()),
             changed: Condvar::new(),
             generation: std::sync::atomic::AtomicU64::new(0),
         })
     })
-}
-
-pub fn local_engine_status() -> LocalEngineStatus {
-    match &*manager().state.lock().unwrap() {
-        EngineState::Unloaded => LocalEngineStatus::Unloaded,
-        EngineState::Loading(_) => LocalEngineStatus::Loading,
-        EngineState::Ready(_, engine) => {
-            if engine
-                .photon
-                .as_ref()
-                .is_some_and(|photon| !photon.is_healthy())
-            {
-                LocalEngineStatus::Unloaded
-            } else {
-                LocalEngineStatus::Ready
-            }
-        }
-        EngineState::Failed(message) => LocalEngineStatus::Failed(message.clone()),
-    }
 }
 
 pub fn preload_local_engine(config: &LocalSherpaConfig) {
@@ -182,23 +163,21 @@ pub fn preload_local_engine(config: &LocalSherpaConfig) {
     let generation;
     {
         let mut state = manager.state.lock().unwrap();
-        match &*state {
-            EngineState::Loading(loaded) if *loaded == key => return,
-            EngineState::Ready(loaded, engine)
-                if *loaded == key
-                    && engine
-                        .photon
-                        .as_ref()
-                        .is_none_or(|engine| engine.is_healthy()) =>
+        match state.get(&key) {
+            Some(EngineState::Loading) => return,
+            Some(EngineState::Ready(engine))
+                if engine
+                    .photon
+                    .as_ref()
+                    .is_none_or(|engine| engine.is_healthy()) =>
             {
                 return
             }
-            _ => *state = EngineState::Loading(key),
+            _ => {
+                state.insert(key, EngineState::Loading);
+            }
         }
-        generation = manager
-            .generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
+        generation = manager.generation.load(std::sync::atomic::Ordering::SeqCst);
     }
 
     crate::echo_info!(
@@ -230,19 +209,22 @@ pub fn preload_local_engine(config: &LocalSherpaConfig) {
         }
         let mut state = manager.state.lock().unwrap();
         if manager.generation.load(std::sync::atomic::Ordering::SeqCst) == generation
-            && matches!(&*state, EngineState::Loading(loaded) if *loaded == key)
+            && matches!(state.get(&key), Some(EngineState::Loading))
         {
-            *state = match loaded {
-                Ok(engine) => EngineState::Ready(key, Arc::new(engine)),
-                Err(err) => EngineState::Failed(err),
-            };
+            state.insert(
+                key,
+                match loaded {
+                    Ok(engine) => EngineState::Ready(Arc::new(engine)),
+                    Err(err) => EngineState::Failed(err),
+                },
+            );
             manager.changed.notify_all();
         }
     });
 }
 
-pub fn wait_for_local_engine() -> Result<(), String> {
-    engine().map(|_| ())
+pub fn wait_for_local_engine(config: &LocalSherpaConfig) -> Result<(), String> {
+    engine(config).map(|_| ())
 }
 
 pub fn unload_local_engine() {
@@ -250,7 +232,7 @@ pub fn unload_local_engine() {
     manager()
         .generation
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    *state = EngineState::Unloaded;
+    state.clear();
     manager().changed.notify_all();
 }
 
@@ -259,16 +241,19 @@ pub fn shutdown_local_engine() {
     manager()
         .generation
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    if let EngineState::Ready(_, engine) = &*state {
-        if let Some(photon) = &engine.photon {
-            photon.shutdown();
+    for value in state.values() {
+        if let EngineState::Ready(engine) = value {
+            if let Some(photon) = &engine.photon {
+                photon.shutdown();
+            }
         }
     }
-    *state = EngineState::Unloaded;
+    state.clear();
     manager().changed.notify_all();
 }
 
 pub fn local_engine_status_for(config: &LocalSherpaConfig) -> LocalEngineStatus {
+    let config = config.clone().normalized();
     let key = (
         config.model,
         if config.model.uses_gpu() {
@@ -277,9 +262,9 @@ pub fn local_engine_status_for(config: &LocalSherpaConfig) -> LocalEngineStatus 
             config.num_threads
         },
     );
-    match &*manager().state.lock().unwrap() {
-        EngineState::Loading(loaded) if *loaded == key => LocalEngineStatus::Loading,
-        EngineState::Ready(loaded, engine) if *loaded == key => {
+    match manager().state.lock().unwrap().get(&key) {
+        Some(EngineState::Loading) => LocalEngineStatus::Loading,
+        Some(EngineState::Ready(engine)) => {
             if engine
                 .photon
                 .as_ref()
@@ -290,20 +275,29 @@ pub fn local_engine_status_for(config: &LocalSherpaConfig) -> LocalEngineStatus 
                 LocalEngineStatus::Ready
             }
         }
-        EngineState::Failed(message) => LocalEngineStatus::Failed(message.clone()),
+        Some(EngineState::Failed(message)) => LocalEngineStatus::Failed(message.clone()),
         _ => LocalEngineStatus::Unloaded,
     }
 }
 
-fn engine() -> Result<Arc<EngineBundle>, String> {
+fn engine(config: &LocalSherpaConfig) -> Result<Arc<EngineBundle>, String> {
+    let config = config.clone().normalized();
+    let key = (
+        config.model,
+        if config.model.uses_gpu() {
+            0
+        } else {
+            config.num_threads
+        },
+    );
     let manager = manager();
     let mut state = manager.state.lock().unwrap();
     loop {
-        match &*state {
-            EngineState::Ready(_, engine) => return Ok(engine.clone()),
-            EngineState::Failed(message) => return Err(message.clone()),
-            EngineState::Unloaded => return Err("Local speech model has not been loaded".into()),
-            EngineState::Loading(_) => state = manager.changed.wait(state).unwrap(),
+        match state.get(&key) {
+            Some(EngineState::Ready(engine)) => return Ok(engine.clone()),
+            Some(EngineState::Failed(message)) => return Err(message.clone()),
+            None => return Err("Local speech model has not been loaded".into()),
+            Some(EngineState::Loading) => state = manager.changed.wait(state).unwrap(),
         }
     }
 }
@@ -917,7 +911,8 @@ impl LocalSherpaTranscriber {
         event_tx: Sender<TranscriptionEvent>,
         log_tx: UnboundedSender<String>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let engine = tokio::task::spawn_blocking(engine).await??;
+        let config = self.config.clone();
+        let engine = tokio::task::spawn_blocking(move || engine(&config)).await??;
         if let Some(photon) = &engine.photon {
             let result = photon.run(audio_rx, command_rx, event_tx).await;
             if result.is_err() {
@@ -1177,6 +1172,35 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[test]
+    fn engine_status_tracks_each_selected_model() {
+        let first = LocalSherpaConfig {
+            model: LocalModel::ParakeetTdtV2,
+            ..Default::default()
+        };
+        let second = LocalSherpaConfig {
+            model: LocalModel::ParakeetTdtV3,
+            ..Default::default()
+        };
+        {
+            let mut states = manager().state.lock().unwrap();
+            states.insert((first.model, first.num_threads), EngineState::Loading);
+            states.insert(
+                (second.model, second.num_threads),
+                EngineState::Failed("second failed".into()),
+            );
+        }
+        assert!(matches!(
+            super::local_engine_status_for(&first),
+            super::LocalEngineStatus::Loading
+        ));
+        assert!(matches!(
+            super::local_engine_status_for(&second),
+            super::LocalEngineStatus::Failed(_)
+        ));
+        super::unload_local_engine();
+    }
+
+    #[test]
     fn defaults_are_safe() {
         let config = LocalSherpaConfig::default();
         assert_eq!(config.model, LocalModel::ParakeetTdtV2);
@@ -1305,8 +1329,10 @@ mod tests {
         std::env::set_var("ELEVENTH_ECHO_MODEL_DIR", &root);
         let threads = 2;
         let engine = load_engine(LocalModel::ParakeetTdtV2, threads).expect("load local engine");
-        *manager().state.lock().unwrap() =
-            EngineState::Ready((LocalModel::ParakeetTdtV2, threads), Arc::new(engine));
+        manager().state.lock().unwrap().insert(
+            (LocalModel::ParakeetTdtV2, threads),
+            EngineState::Ready(Arc::new(engine)),
+        );
 
         let wave_path = root
             .join("parakeet-tdt-0.6b-v2-int8")

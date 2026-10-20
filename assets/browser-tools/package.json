@@ -1,0 +1,8 @@
+{
+  "name": "echo-browser-tools",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@playwright/mcp": "0.0.83"
+  }
+}

@@ -20,6 +20,26 @@ For dependency maintenance only, review/update `requirements.in`, regenerate `re
 
 Model revision: `73175eb7aeb0d82f1e2a6b53b3aabc10a90bcd0b`. Inference blocks outbound sockets and DNS, including dependency telemetry; internal Windows asyncio wakeup socket pairs remain permitted. Audio travels through bounded private process pipes and is not written to disk.
 
+## Startup performance
+
+Ultra verifies the installed runtime and model before launching its GPU helper.
+The installed runtime contains thousands of small files, so Windows file-cache
+misses, disk contention, and antivirus scanning can affect verification latency.
+Verification now uses up to four workers with one reusable read buffer each;
+all file sizes and SHA-256 checks remain enforced on every load. Diagnostic logs
+report runtime and model verification separately, followed by total time to ready.
+
+On this development machine (2026-10-05), recent slow starts spent 79–92 seconds
+verifying files and about five more seconds loading the GPU model. With cached
+files, the same installed runtime's 16,839 files verified in 4.60 seconds serially
+and 0.81 seconds with bounded workers; model verification took 0.60 seconds.
+These cached-file measurements do not establish cold-start performance.
+The read-only benchmark does not launch another GPU helper:
+
+```powershell
+cargo test installed_ultra_verification_timing -- --ignored --nocapture
+```
+
 ## Verification
 
 ```powershell

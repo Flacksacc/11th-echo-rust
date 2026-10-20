@@ -3,17 +3,48 @@
     windows_subsystem = "windows"
 )]
 
+#[cfg(test)]
+mod agent_tests;
+mod agent_tools;
+mod artifacts;
+mod assistant;
+mod assistant_mcp;
+mod assistant_text;
+mod assistant_voice;
 mod audio;
+mod component_pool;
+mod component_setup;
+mod components;
 mod diagnostics;
 mod gemini;
+mod graph;
+#[cfg(windows)]
+mod graph_hotkeys;
+mod graph_ui;
+mod hermes;
+mod hermes_phrases;
+mod hermes_runtime;
+mod hermes_tabs;
+mod hermes_ui;
 mod hotkey;
 mod icon_animation;
 mod injector;
+mod model_creator;
+mod model_preload;
+mod model_ui;
+mod models;
+mod models_transport;
 mod pipeline;
+mod pipeline_editor;
+mod pipeline_ui;
+mod pipelines;
 mod post_processing;
+mod resources;
+mod response_channels;
 mod settings;
 mod startup;
 mod state;
+mod system_one;
 mod transcription;
 mod updater;
 
@@ -23,7 +54,7 @@ use settings::{
     load_settings, load_transcript_history, save_settings, save_transcript_history, AppSettings,
     TranscriptHistoryEntry, MAX_TRANSCRIPT_HISTORY,
 };
-use slint::{CloseRequestResponse, Color, ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{CloseRequestResponse, Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use state::RecordingState;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -36,6 +67,625 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 const MAX_TRANSCRIPT_DISPLAY_LINES: usize = 100;
+
+pub(crate) fn assistant_choice_label(name: &str, id: &str) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(id.as_bytes());
+    format!(
+        "{name} · {:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3]
+    )
+}
+
+fn populate_mcp_manager(window: &McpManagerWindow, settings: &AppSettings, selected_id: &str) {
+    let choices = settings
+        .assistant_mcp_servers
+        .iter()
+        .map(|server| assistant_choice_label(&server.name, &server.id).into())
+        .collect::<Vec<SharedString>>();
+    window.set_server_options(ModelRc::new(VecModel::from(choices)));
+    if let Some(server) = settings
+        .assistant_mcp_servers
+        .iter()
+        .find(|server| server.id == selected_id)
+    {
+        window.set_selected_server(assistant_choice_label(&server.name, &server.id).into());
+        window.set_server_name(server.name.clone().into());
+        window.set_server_enabled(server.enabled);
+        window.set_environment_text(
+            serde_json::to_string_pretty(&server.environment)
+                .unwrap()
+                .into(),
+        );
+        window.set_headers_text(
+            serde_json::to_string_pretty(&server.headers)
+                .unwrap()
+                .into(),
+        );
+        match &server.transport {
+            assistant_mcp::McpTransport::Stdio { command, args } => {
+                window.set_transport_name("Stdio".into());
+                window.set_command_text(command.clone().into());
+                window.set_args_text(args.join("\n").into());
+                window.set_url_text("".into());
+            }
+            assistant_mcp::McpTransport::Http { url } => {
+                window.set_transport_name("Streamable HTTP".into());
+                window.set_command_text("".into());
+                window.set_args_text("".into());
+                window.set_url_text(url.clone().into());
+            }
+        }
+    } else {
+        window.set_selected_server("".into());
+        window.set_server_name("".into());
+        window.set_transport_name("Stdio".into());
+        window.set_command_text("".into());
+        window.set_args_text("".into());
+        window.set_url_text("".into());
+        window.set_server_enabled(true);
+        window.set_environment_text("{}".into());
+        window.set_headers_text("{}".into());
+    }
+}
+
+fn mcp_server_from_window(
+    window: &McpManagerWindow,
+    settings: &AppSettings,
+) -> assistant_mcp::McpServer {
+    let selected = window.get_selected_server().to_string();
+    let id = settings
+        .assistant_mcp_servers
+        .iter()
+        .find(|server| assistant_choice_label(&server.name, &server.id) == selected)
+        .map(|server| server.id.clone())
+        .unwrap_or_else(pipelines::new_id);
+    let transport = if window.get_transport_name().as_str() == "Stdio" {
+        assistant_mcp::McpTransport::Stdio {
+            command: window.get_command_text().trim().to_string(),
+            args: window
+                .get_args_text()
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect(),
+        }
+    } else {
+        assistant_mcp::McpTransport::Http {
+            url: window.get_url_text().trim().to_string(),
+        }
+    };
+    assistant_mcp::McpServer {
+        id: id.clone(),
+        name: window.get_server_name().trim().to_string(),
+        transport,
+        enabled: window.get_server_enabled(),
+        discovered_tools: settings
+            .assistant_mcp_servers
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.discovered_tools.clone())
+            .unwrap_or_default(),
+        environment: serde_json::from_str(window.get_environment_text().as_str())
+            .unwrap_or_default(),
+        headers: serde_json::from_str(window.get_headers_text().as_str()).unwrap_or_default(),
+    }
+}
+
+struct VoiceRecording {
+    capture: audio::AudioCapture,
+    samples: Arc<Mutex<Vec<i16>>>,
+    collector: thread::JoinHandle<()>,
+}
+
+fn finish_voice_recording(recording: VoiceRecording) -> Result<std::path::PathBuf, String> {
+    recording
+        .capture
+        .begin_shutdown()
+        .join()
+        .map_err(|_| "Microphone capture stopped unexpectedly.".to_string())?;
+    recording
+        .collector
+        .join()
+        .map_err(|_| "Voice recording stopped unexpectedly.".to_string())?;
+    let samples = recording.samples.lock().unwrap();
+    if samples.len() < 16_000 {
+        return Err("Record at least one second of speech.".into());
+    }
+    let dir = settings::settings_path().with_file_name("assistant_voices");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let destination = dir.join(format!("{}.wav", pipelines::new_id()));
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&destination, spec).map_err(|e| e.to_string())?;
+    for &sample in samples.iter() {
+        writer.write_sample(sample).map_err(|e| e.to_string())?;
+    }
+    writer.finalize().map_err(|e| e.to_string())?;
+    Ok(destination)
+}
+
+fn discard_voice_recording(recording: VoiceRecording) {
+    let _ = recording.capture.begin_shutdown().join();
+    let _ = recording.collector.join();
+}
+
+fn refresh_assistant_chat(
+    window: &slint::Weak<AssistantChatWindow>,
+    conversation: &Arc<Mutex<assistant::Conversation>>,
+) {
+    let conversation = conversation.clone();
+    let _ = window.upgrade_in_event_loop(move |chat| {
+        let follow = chat.get_chat_at_bottom();
+        let scroll = chat.get_chat_scroll_position();
+        // Read on the UI thread: an older queued refresh must not restore stale rows.
+        let messages = conversation
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| AssistantMessage {
+                text: m.text.clone().into(),
+                from_user: m.from_user,
+                files: ModelRc::new(VecModel::from(
+                    m.files
+                        .iter()
+                        .map(|f| AssistantFile {
+                            id: f.id.clone().into(),
+                            name: f.name.clone().into(),
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                state: if m.interrupted {
+                    "Interrupted"
+                } else if m.complete {
+                    ""
+                } else {
+                    "Thinking…"
+                }
+                .into(),
+            })
+            .collect::<Vec<_>>();
+        let current = chat.get_messages();
+        if let Some(model) = current
+            .as_any()
+            .downcast_ref::<VecModel<AssistantMessage>>()
+        {
+            while model.row_count() > messages.len() {
+                model.remove(model.row_count() - 1);
+            }
+            for (i, message) in messages.into_iter().enumerate() {
+                if i == model.row_count() {
+                    model.push(message);
+                } else if !model.row_data(i).is_some_and(|old| {
+                    old.text == message.text
+                        && old.state == message.state
+                        && old.from_user == message.from_user
+                        && old.files.row_count() == message.files.row_count()
+                        && old
+                            .files
+                            .iter()
+                            .zip(message.files.iter())
+                            .all(|(a, b)| a.id == b.id && a.name == b.name)
+                }) {
+                    model.set_row_data(i, message);
+                }
+            }
+        } else {
+            chat.set_messages(ModelRc::new(VecModel::from(messages)));
+        }
+        let weak = chat.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_millis(20), move || {
+            if let Some(chat) = weak.upgrade() {
+                if follow && chat.get_chat_scroll_position() == scroll {
+                    chat.invoke_scroll_bottom();
+                }
+            }
+        });
+    });
+}
+
+fn graph_run_rows(graph: &graph::Graph, listening: bool) -> ModelRc<GraphRunRow> {
+    let relevant = graph.relevant();
+    ModelRc::new(VecModel::from(
+        graph
+            .order()
+            .unwrap_or_else(|_| (0..graph.nodes.len()).collect())
+            .into_iter()
+            .map(|i| &graph.nodes[i])
+            .filter(|n| relevant.contains(&n.id))
+            .map(|n| GraphRunRow {
+                id: n.id.clone().into(),
+                title: n.title().into(),
+                state: if listening && n.transcription() {
+                    "Running"
+                } else {
+                    "Waiting"
+                }
+                .into(),
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+fn graph_progress_rows(nodes: &ModelRc<GraphRunRow>, current: i32) -> ModelRc<GraphRunRow> {
+    let rows = nodes.iter().collect::<Vec<_>>();
+    if rows.is_empty() {
+        return ModelRc::default();
+    }
+    let current = (current.max(0) as usize).min(rows.len() - 1);
+    let mut visible = Vec::with_capacity(4);
+    if let Some(previous) = rows[..current]
+        .iter()
+        .rev()
+        .find(|row| row.state == "Complete")
+    {
+        visible.push(previous.clone());
+    }
+    visible.push(rows[current].clone());
+    visible.extend(
+        rows[current + 1..]
+            .iter()
+            .filter(|row| row.state == "Waiting" || row.state == "Running")
+            .take(2)
+            .cloned(),
+    );
+    ModelRc::new(VecModel::from(visible))
+}
+fn update_graph_run_state(model: &ModelRc<GraphRunRow>, id: &str, state: &str) {
+    if let Some(model) = model.as_any().downcast_ref::<VecModel<GraphRunRow>>() {
+        if let Some(i) = model.iter().position(|row| row.id.as_str() == id) {
+            if let Some(mut row) = model.row_data(i) {
+                row.state = state.into();
+                model.set_row_data(i, row);
+            }
+        }
+    }
+}
+fn graph_uses_assistant(graph: &graph::Graph) -> bool {
+    let relevant = graph.relevant();
+    graph
+        .nodes
+        .iter()
+        .any(|n| relevant.contains(&n.id) && matches!(n.kind, graph::Kind::AssistantDisplay))
+}
+fn begin_assistant_graph_listening(
+    chat: &AssistantChatWindow,
+    graph: &graph::Graph,
+    settings: &AppSettings,
+) {
+    let rows = graph_run_rows(graph, true);
+    let current = rows
+        .iter()
+        .position(|row| row.state == "Running")
+        .unwrap_or(0) as i32;
+    chat.set_graph_run_nodes(rows);
+    chat.set_graph_step(current);
+    chat.set_graph_progress_nodes(graph_progress_rows(&chat.get_graph_run_nodes(), current));
+    chat.set_live_transcript("".into());
+    chat.present_listening(true);
+    chat.present_spoken_text("".into());
+    chat.set_tool_activity("".into());
+    chat.present_assistant_state("Listening…".into());
+    chat.set_speech_status(graph_speech_status(graph, settings).into());
+    let _ = chat.show();
+    chat.invoke_scroll_bottom();
+}
+fn prepare_transcription_overlay(
+    overlay: &TranscriptOverlayWindow,
+    pipeline: &pipelines::Pipeline,
+    microphone: &str,
+    assistant: bool,
+) {
+    if assistant {
+        overlay.set_is_visible(false);
+        hide_overlay_window(overlay);
+        return;
+    }
+    overlay.set_graph_run_nodes(
+        pipeline
+            .graph
+            .as_ref()
+            .map(|g| graph_run_rows(g, true))
+            .unwrap_or_default(),
+    );
+    overlay.set_graph_progress_nodes(graph_progress_rows(&overlay.get_graph_run_nodes(), 0));
+    overlay.set_graph_status("".into());
+    overlay.set_pipeline_cards(if pipeline.graph.is_some() {
+        ModelRc::default()
+    } else {
+        pipeline_ui::cards(&pipeline.steps)
+    });
+    overlay.set_pipeline_name(pipeline.name.clone().into());
+    overlay.set_pipeline_step(0);
+    overlay.set_pipeline_failed(false);
+    overlay.set_step_complete(false);
+    reset_overlay_to_listening(overlay, microphone);
+}
+fn graph_speech_status(graph: &graph::Graph, settings: &AppSettings) -> String {
+    let relevant = graph.relevant();
+    let speech: Vec<_> = graph
+        .nodes
+        .iter()
+        .filter(|n| relevant.contains(&n.id))
+        .filter_map(|n| {
+            if let graph::Kind::Speech { voice, .. } = &n.kind {
+                Some(voice)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if speech.is_empty() {
+        return "Speech off: add a Speech node and connect it to the answer in the graph editor."
+            .into();
+    }
+    if !assistant_voice::installed() {
+        return "Speech setup needed: install Pocket TTS from the Speech node's voice settings."
+            .into();
+    }
+    if speech
+        .iter()
+        .any(|voice| !assistant_voice::voice_selection_valid(&voices::resolve(voice, settings)))
+    {
+        return "Speech setup needed: a selected voice is missing. Select another voice or use Alba.".into();
+    }
+    String::new()
+}
+
+// This boundary combines run inputs with the independent UI/conversation handles.
+#[allow(clippy::too_many_arguments)]
+async fn run_graph_chat(
+    graph: &graph::Graph,
+    input: String,
+    settings: &AppSettings,
+    chat: slint::Weak<AssistantChatWindow>,
+    conversation: Arc<Mutex<assistant::Conversation>>,
+    ui: slint::Weak<AppWindow>,
+    cancel: Arc<dyn Fn() -> bool + Send + Sync>,
+    progress: graph::Observer,
+) -> Result<graph::RunResult, String> {
+    let initial_rows = graph_run_rows(graph, false).iter().collect::<Vec<_>>();
+    let speech_status = graph_speech_status(graph, settings);
+    let initial_cancel = cancel.clone();
+    let _ = chat.upgrade_in_event_loop(move |chat| {
+        if initial_cancel() {
+            return;
+        }
+        chat.set_graph_run_nodes(ModelRc::new(VecModel::from(initial_rows)));
+        chat.set_speech_status(speech_status.into());
+        chat.present_listening(false);
+        chat.set_graph_step(0);
+        chat.set_graph_progress_nodes(graph_progress_rows(&chat.get_graph_run_nodes(), 0));
+        chat.present_assistant_state("Processing graph…".into());
+    });
+    let context = conversation
+        .lock()
+        .unwrap()
+        .messages
+        .iter()
+        .filter(|m| m.complete)
+        .rev()
+        .take(16)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|m| {
+            format!(
+                "{}: {}",
+                if m.from_user { "User" } else { "Assistant" },
+                m.text
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let displays = graph
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.kind, graph::Kind::AssistantDisplay))
+        .map(|n| n.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let turn = Arc::new(Mutex::new(None::<(u64, u64)>));
+    let update_turn = turn.clone();
+    let update_conversation = conversation.clone();
+    let update_chat = chat.clone();
+    let user_input = input.clone();
+    let speech_nodes = graph
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.kind, graph::Kind::Speech { .. }))
+        .map(|n| n.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let has_speech = !speech_nodes.is_empty();
+    let node_titles = graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.title()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let display_cancel = cancel.clone();
+    let observer: graph::Observer = Arc::new(move |event| {
+        if display_cancel() {
+            return;
+        }
+        match &event {
+            graph::Event::Text { node, text } if displays.contains(node) => {
+                let mut turn = update_turn.lock().unwrap();
+                let mut conv = update_conversation.lock().unwrap();
+                if display_cancel() {
+                    return;
+                }
+                let (generation, id) = *turn.get_or_insert_with(|| {
+                    let (g, id, _) = conv.start_turn(user_input.clone());
+                    (g, id)
+                });
+                conv.update(generation, id, text.clone(), false);
+                drop(conv);
+                drop(turn);
+                refresh_assistant_chat(&update_chat, &update_conversation);
+                let cancelled = display_cancel.clone();
+                let _ = update_chat.upgrade_in_event_loop(move |chat| {
+                    if cancelled() {
+                        return;
+                    }
+                    chat.present_listening(false);
+                    chat.set_live_transcript("".into());
+                    chat.present_assistant_state("Receiving…".into());
+                    let _ = chat.show();
+                });
+            }
+            graph::Event::Assistant { node, text } if displays.contains(node) => {
+                let spoken = text.clone();
+                let cancelled = display_cancel.clone();
+                let pending_only = !has_speech;
+                let mut turn = update_turn.lock().unwrap();
+                let mut conv = update_conversation.lock().unwrap();
+                let (_, id) = *turn.get_or_insert_with(|| {
+                    let (g, id, _) = conv.start_turn(user_input.clone());
+                    (g, id)
+                });
+                if let Some(message) = conv.messages.iter_mut().find(|m| m.id == id) {
+                    message.assistant_text = spoken.clone();
+                }
+                drop(conv);
+                drop(turn);
+                refresh_assistant_chat(&update_chat, &update_conversation);
+                let _ = update_chat.upgrade_in_event_loop(move |chat| {
+                    if !cancelled() && pending_only {
+                        chat.present_spoken_text(spoken.into());
+                    }
+                });
+            }
+            graph::Event::Files { node, files } if displays.contains(node) => {
+                let mut turn = update_turn.lock().unwrap();
+                let mut conv = update_conversation.lock().unwrap();
+                let (g, id) = *turn.get_or_insert_with(|| {
+                    let (g, id, _) = conv.start_turn(user_input.clone());
+                    (g, id)
+                });
+                let _ = g;
+                if let Some(message) = conv.messages.iter_mut().find(|m| m.id == id) {
+                    message.files = files.clone();
+                }
+                drop(conv);
+                drop(turn);
+                refresh_assistant_chat(&update_chat, &update_conversation);
+            }
+            graph::Event::Speaking { node, text } if speech_nodes.contains(node) => {
+                let text = text.clone();
+                let cancelled = display_cancel.clone();
+                let _ = update_chat.upgrade_in_event_loop(move |chat| {
+                    if !cancelled() {
+                        chat.present_spoken_text(text.into());
+                    }
+                });
+            }
+            graph::Event::Activity { node, text } => {
+                let text = format!(
+                    "{}: {text}",
+                    node_titles.get(node).map(String::as_str).unwrap_or("Agent")
+                );
+                let cancelled = display_cancel.clone();
+                let _ = update_chat.upgrade_in_event_loop(move |chat| {
+                    if !cancelled() {
+                        chat.set_tool_activity(text.into());
+                    }
+                });
+            }
+            graph::Event::Approval { node, request } => {
+                let _ = node;
+                show_agent_approval(request.clone());
+            }
+            graph::Event::Error { node, message } => {
+                let id = node.clone();
+                let speech_error = speech_nodes
+                    .contains(node)
+                    .then(|| format!("Speech failed: {message}"));
+                if let Some(message) = speech_error {
+                    let cancelled = display_cancel.clone();
+                    let _ = update_chat.upgrade_in_event_loop(move |chat| {
+                        if !cancelled() {
+                            chat.set_speech_status(message.into());
+                        }
+                    });
+                }
+                let state = format!("Failed: {message}");
+                let cancelled = display_cancel.clone();
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    if !cancelled() {
+                        ui.invoke_graph_node_state(id.into(), state.into());
+                    }
+                });
+            }
+            graph::Event::State { node, state } => {
+                let id = node.clone();
+                let state = state.to_string();
+                let chat_id = id.clone();
+                let chat_state = state.clone();
+                let cancelled = display_cancel.clone();
+                let _ = update_chat.upgrade_in_event_loop(move |chat| {
+                    if !cancelled() {
+                        update_graph_run_state(&chat.get_graph_run_nodes(), &chat_id, &chat_state);
+                        if chat_state == "Running" {
+                            if let Some(i) = chat
+                                .get_graph_run_nodes()
+                                .iter()
+                                .position(|row| row.id.as_str() == chat_id)
+                            {
+                                chat.set_graph_step(i as i32);
+                            }
+                        }
+                        chat.set_graph_progress_nodes(graph_progress_rows(
+                            &chat.get_graph_run_nodes(),
+                            chat.get_graph_step(),
+                        ));
+                    }
+                });
+                let cancelled = display_cancel.clone();
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    if !cancelled() {
+                        ui.invoke_graph_node_state(id.into(), state.into());
+                    }
+                });
+            }
+            _ => {}
+        }
+        progress(event);
+    });
+    let result = graph::execute(graph, input, settings, context, observer, cancel.clone()).await;
+    if cancel() {
+        return result;
+    }
+    let status = match &result {
+        Ok(result) if result.errors.is_empty() => "Ready".to_string(),
+        Ok(result) => format!("Completed with node errors: {}", result.errors.join("; ")),
+        Err(error) => format!("Graph failed: {error}"),
+    };
+    let final_cancel = cancel.clone();
+    let _ = chat.upgrade_in_event_loop(move |chat| {
+        if !final_cancel() {
+            chat.present_assistant_state(status.into());
+        }
+    });
+    if let Some((generation, id)) = *turn.lock().unwrap() {
+        let mut conv = conversation.lock().unwrap();
+        match &result {
+            Ok(result) => conv.update(generation, id, result.text.clone(), true),
+            Err(_) => {
+                if let Some(message) = conv.messages.iter_mut().find(|m| m.id == id) {
+                    message.interrupted = true;
+                    message.complete = false;
+                }
+            }
+        }
+        drop(conv);
+        refresh_assistant_chat(&chat, &conversation);
+    }
+    result
+}
 
 fn transcript_history_text(history: &[TranscriptHistoryEntry]) -> String {
     // Persisted history is already newest-first. Format once per commit,
@@ -189,7 +839,6 @@ const OVERLAY_WIDTH: i32 = 560;
 const OVERLAY_HEIGHT: i32 = 106;
 const OVERLAY_MAX_LINES: usize = 6;
 const OVERLAY_CHARACTERS_PER_LINE: usize = 62;
-const OVERLAY_CAPTION_CHARACTERS: usize = OVERLAY_MAX_LINES * OVERLAY_CHARACTERS_PER_LINE;
 
 #[cfg(target_os = "windows")]
 use global_hotkey::{
@@ -231,28 +880,42 @@ slint::include_modules!();
 
 #[derive(Debug)]
 enum AppCommand {
+    ToggleGraph(String),
     ToggleRecording,
+    ToggleAssistant,
     StartRecording,
+    StartAssistantRecording,
+    AssistantSubmit(String),
+    AssistantTranscriptSubmit(u64, String),
     StopRecording,
     ReconfigureWarmCapture,
     CapturePostRollElapsed(u64),
     CaptureFlushed(u64, Result<audio::CaptureFlushStats, String>),
     FinalizationTimedOut(u64),
+    ProcessingStarted(u64),
 }
 
 fn app_command_name(command: &AppCommand) -> &'static str {
     match command {
+        AppCommand::ToggleGraph(_) => "toggle_graph",
         AppCommand::ToggleRecording => "toggle_recording",
+        AppCommand::ToggleAssistant => "toggle_assistant",
         AppCommand::StartRecording => "start_recording",
+        AppCommand::StartAssistantRecording => "start_assistant_recording",
+        AppCommand::AssistantSubmit(_) => "assistant_submit",
+        AppCommand::AssistantTranscriptSubmit(_, _) => "assistant_transcript_submit",
         AppCommand::StopRecording => "stop_recording",
         AppCommand::ReconfigureWarmCapture => "reconfigure_warm_capture",
         AppCommand::CapturePostRollElapsed(_) => "capture_post_roll_elapsed",
         AppCommand::CaptureFlushed(_, _) => "capture_flushed",
         AppCommand::FinalizationTimedOut(_) => "finalization_timed_out",
+        AppCommand::ProcessingStarted(_) => "processing_started",
     }
 }
 
 struct Session {
+    assistant: bool,
+    discard_assistant_output: Arc<AtomicBool>,
     epoch: u64,
     state: Arc<Mutex<RecordingState>>,
     audio_capture: Option<audio::AudioCapture>,
@@ -262,6 +925,7 @@ struct Session {
     transcript_pipeline: Arc<Mutex<TranscriptPipeline>>,
     task_abort_handles: Vec<tokio::task::AbortHandle>,
     finalization_watchdog: Option<tokio::task::AbortHandle>,
+    text_processing_started: bool,
     _formatting_activity: post_processing::ActivityGuard,
 }
 
@@ -286,6 +950,57 @@ impl Session {
     fn cancel_finalization_watchdog(&mut self) {
         if let Some(handle) = self.finalization_watchdog.take() {
             handle.abort();
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecordingActivation {
+    Start,
+    Stop,
+    Ignore,
+}
+
+fn recording_activation(active: Option<(bool, bool)>, assistant: bool) -> RecordingActivation {
+    match active {
+        None => RecordingActivation::Start,
+        Some((true, false)) if assistant => RecordingActivation::Start,
+        Some((is_assistant, true)) if !assistant || is_assistant => RecordingActivation::Stop,
+        Some(_) => RecordingActivation::Ignore,
+    }
+}
+
+async fn interrupt_assistant(
+    active_session: &mut Option<Session>,
+    session_epoch: &AtomicU64,
+    warm_capture: Option<&audio::WarmAudioCapture>,
+    tasks: &Mutex<Vec<tokio::task::AbortHandle>>,
+    conversation: &Mutex<assistant::Conversation>,
+) {
+    // Invalidate callbacks before stopping tasks; aborting alone cannot retract
+    // work that has already been queued on the UI thread.
+    session_epoch.fetch_add(1, Ordering::SeqCst);
+    assistant_voice::stop_playback();
+    conversation.lock().unwrap().interrupt();
+    for task in tasks.lock().unwrap().drain(..) {
+        task.abort();
+    }
+    if let Some(mut session) = active_session.take() {
+        session
+            .discard_assistant_output
+            .store(true, Ordering::SeqCst);
+        session.cancel_finalization_watchdog();
+        session.abort_tasks();
+        if session.warm_capture_attached {
+            if let Some(capture) = warm_capture {
+                if let Err(error) = capture.detach(session.epoch).await {
+                    echo_warn!("audio", "Assistant interruption detach failed: {}", error);
+                }
+            }
+        }
+        if let Some(capture) = session.audio_capture.take() {
+            let worker = capture.begin_shutdown();
+            let _ = tokio::task::spawn_blocking(move || worker.join()).await;
         }
     }
 }
@@ -719,20 +1434,7 @@ fn overlay_size_for_text(text: &str) -> (i32, i32) {
 }
 
 fn overlay_caption_text(text: &str) -> String {
-    let trimmed = text.trim();
-    let character_count = trimmed.chars().count();
-    if character_count <= OVERLAY_CAPTION_CHARACTERS {
-        return trimmed.to_string();
-    }
-
-    let mut tail = trimmed
-        .chars()
-        .skip(character_count - OVERLAY_CAPTION_CHARACTERS)
-        .collect::<String>();
-    if let Some(first_space) = tail.find(char::is_whitespace) {
-        tail.drain(..=first_space);
-    }
-    format!("…{}", tail.trim_start())
+    text.trim().to_string()
 }
 
 fn live_transcript_text(committed: &str, partial: &str) -> String {
@@ -751,14 +1453,31 @@ fn live_transcript_text(committed: &str, partial: &str) -> String {
 }
 
 fn set_overlay_height(overlay: &TranscriptOverlayWindow, height: i32) {
-    let next_height = height.clamp(OVERLAY_HEIGHT, 86 + OVERLAY_MAX_LINES as i32 * 20);
+    let next_height = (height
+        + if overlay.get_pipeline_cards().row_count() > 0
+            || overlay.get_graph_run_nodes().row_count() > 0
+        {
+            46
+        } else {
+            0
+        })
+    .max(overlay.get_caption_required_height().ceil() as i32)
+    .clamp(OVERLAY_HEIGHT, 360);
     let previous_height = overlay.get_window_height();
+    #[cfg(target_os = "windows")]
+    let previous_position = overlay.window().position();
+    let scale = overlay.window().scale_factor();
+    let physical = slint::PhysicalSize::new(
+        (OVERLAY_WIDTH as f32 * scale).round() as u32,
+        (next_height as f32 * scale).round() as u32,
+    );
+    if overlay.window().size() != physical {
+        overlay.window().set_size(physical);
+    }
     if previous_height == next_height {
         return;
     }
 
-    #[cfg(target_os = "windows")]
-    let previous_position = overlay.window().position();
     overlay.set_window_height(next_height);
     #[cfg(target_os = "windows")]
     {
@@ -798,6 +1517,8 @@ fn reset_overlay_to_listening(overlay: &TranscriptOverlayWindow, microphone_name
 }
 
 fn show_model_loading_notice(overlay: &TranscriptOverlayWindow) {
+    overlay.set_pipeline_failed(false);
+    overlay.set_step_complete(false);
     overlay.set_sentence_text("Model is loading. No audio is being recorded. Please wait, then press your recording shortcut again.".into());
     overlay.set_microphone_name("Parakeet Ultra · Loading".into());
     overlay.set_is_system_message(true);
@@ -998,10 +1719,9 @@ fn select_ui_backend() -> Result<(), slint::PlatformError> {
     if std::env::var_os("SLINT_BACKEND").is_none() {
         return slint::BackendSelector::new()
             .backend_name("winit".into())
-            // Transparent frameless windows need a complete composited frame.
-            // Slint's winit backend falls back to the compiled software
-            // renderer if FemtoVG cannot initialize on this machine.
-            .renderer_name("femtovg".into())
+            // Skia uses native font rasterization instead of FemtoVG's uneven
+            // glyph atlas. Use it for every window, including the overlay.
+            .renderer_name("skia".into())
             .select();
     }
 
@@ -1056,10 +1776,12 @@ fn synchronize_microphone_editor(
 fn monitor_microphones(
     ui: slint::Weak<AppWindow>,
     initial_snapshot: audio::InputDeviceSnapshot,
+    initial_speakers: assistant_voice::OutputDeviceSnapshot,
     command_tx: mpsc::UnboundedSender<AppCommand>,
 ) {
     thread::spawn(move || {
         let mut previous_snapshot = initial_snapshot;
+        let mut previous_speakers = initial_speakers;
         loop {
             thread::sleep(std::time::Duration::from_millis(500));
             let snapshot = audio::input_device_snapshot();
@@ -1067,10 +1789,14 @@ fn monitor_microphones(
             let devices_changed =
                 replace_options || snapshot.default_device != previous_snapshot.default_device;
             previous_snapshot = snapshot.clone();
+            let speakers = assistant_voice::output_device_snapshot();
+            let replace_speakers = speakers.devices != previous_speakers.devices;
+            previous_speakers = speakers.clone();
 
             if ui
                 .upgrade_in_event_loop(move |ui| {
                     synchronize_microphone_editor(&ui, &snapshot, replace_options);
+                    synchronize_speaker_editor(&ui, &speakers, replace_speakers);
                 })
                 .is_err()
             {
@@ -1081,6 +1807,34 @@ fn monitor_microphones(
             }
         }
     });
+}
+
+fn synchronize_speaker_editor(
+    ui: &AppWindow,
+    snapshot: &assistant_voice::OutputDeviceSnapshot,
+    replace_options: bool,
+) {
+    if replace_options {
+        ui.set_speaker_options(ModelRc::new(VecModel::from(
+            snapshot
+                .devices
+                .iter()
+                .cloned()
+                .map(SharedString::from)
+                .collect::<Vec<_>>(),
+        )));
+    }
+    if ui.get_use_default_speaker() {
+        let selected = snapshot
+            .default_device
+            .as_ref()
+            .or_else(|| snapshot.devices.first())
+            .cloned()
+            .unwrap_or_default();
+        if ui.get_selected_speaker().as_str() != selected {
+            ui.set_selected_speaker(selected.into());
+        }
+    }
 }
 
 fn settings_snapshot_from_ui(ui: &AppWindow, base: &AppSettings) -> AppSettings {
@@ -1144,8 +1898,15 @@ fn settings_snapshot_from_ui(ui: &AppWindow, base: &AppSettings) -> AppSettings 
         post_processing_lines(ui.get_post_custom_replacements_text().as_ref());
     next.selected_microphone = ui.get_selected_microphone().to_string();
     next.use_default_microphone = ui.get_use_default_microphone();
+    next.selected_speaker = ui.get_selected_speaker().to_string();
+    next.use_default_speaker = ui.get_use_default_speaker();
+    next.output_volume = assistant_voice::normalize_output_volume(ui.get_output_volume());
     next.keep_microphone_ready = ui.get_keep_microphone_ready();
     next.hotkey_text = ui.get_hotkey_text().to_string();
+    next.assistant_hotkey_text = ui.get_assistant_hotkey_text().to_string();
+    next.hugging_face_token = ui.get_hugging_face_token_text().to_string();
+    next.tts_voice_path = ui.get_tts_voice_path().to_string();
+    next.tts_preload = ui.get_tts_preload();
     next.start_with_windows = ui.get_start_with_windows();
     next.update_checks_enabled = ui.get_update_checks_enabled();
     next.local_sherpa = transcription::LocalSherpaConfig {
@@ -1237,8 +1998,18 @@ fn populate_settings_editor(ui: &AppWindow, settings: &AppSettings) {
     );
     ui.set_selected_microphone(settings.selected_microphone.clone().into());
     ui.set_use_default_microphone(settings.use_default_microphone);
+    ui.set_selected_speaker(settings.selected_speaker.clone().into());
+    ui.set_use_default_speaker(settings.use_default_speaker);
+    ui.set_output_volume(assistant_voice::normalize_output_volume(
+        settings.output_volume,
+    ));
     ui.set_keep_microphone_ready(settings.keep_microphone_ready);
     ui.set_hotkey_text(settings.hotkey_text.clone().into());
+    ui.set_assistant_hotkey_text(settings.assistant_hotkey_text.clone().into());
+    ui.set_hugging_face_token_text(settings.hugging_face_token.clone().into());
+    ui.set_tts_voice_path(settings.tts_voice_path.clone().into());
+    voice_ui::refresh_main(ui);
+    ui.set_tts_preload(settings.tts_preload);
     ui.set_start_with_windows(settings.start_with_windows);
     ui.set_update_checks_enabled(settings.update_checks_enabled);
     ui.set_overlay_opacity(settings.overlay_opacity);
@@ -1311,6 +2082,9 @@ fn settings_editor_is_dirty(ui: &AppWindow, saved: &AppSettings) -> bool {
     if draft.use_default_microphone && normalized_saved.use_default_microphone {
         normalized_saved.selected_microphone = draft.selected_microphone.clone();
     }
+    if draft.use_default_speaker && normalized_saved.use_default_speaker {
+        normalized_saved.selected_speaker = draft.selected_speaker.clone();
+    }
     draft != normalized_saved
 }
 
@@ -1323,7 +2097,101 @@ fn request_local_model_prompt(ui: &AppWindow) {
     }
 }
 
+fn install_tts_settings_entrypoint(ui: &AppWindow, assistant_editor: &AssistantPipelineWindow) {
+    let ui_for_tts = ui.as_weak();
+    let voice_editor = assistant_editor.as_weak();
+    ui.on_configure_tts(move || {
+        let (Some(ui), Some(editor)) = (ui_for_tts.upgrade(), voice_editor.upgrade()) else {
+            return;
+        };
+        if editor.get_editing_voice()
+            || editor.get_recording_voice()
+            || editor.get_testing_voice()
+            || editor.get_importing_voice()
+        {
+            return;
+        }
+        editor.set_configuration_role(4);
+        editor.set_default_voice_settings(true);
+        editor.set_voice_path(ui.get_tts_voice_path());
+        voice_ui::refresh_editor(&editor);
+        editor.set_preload_voice_on_start(ui.get_tts_preload());
+        editor.set_error("".into());
+        editor.set_voice_status(
+            if assistant_voice::installed() {
+                "Pocket TTS is installed."
+            } else {
+                "Install Pocket TTS to generate speech."
+            }
+            .into(),
+        );
+        let main = ui.as_weak();
+        let weak = editor.as_weak();
+        editor.on_save(move || {
+            let (Some(main), Some(editor)) = (main.upgrade(), weak.upgrade()) else {
+                return;
+            };
+            if editor.get_editing_voice()
+                || editor.get_importing_voice()
+                || editor.get_recording_voice()
+            {
+                return;
+            }
+            main.set_tts_voice_path(editor.get_voice_path());
+            voice_ui::refresh_main(&main);
+            main.set_tts_preload(editor.get_preload_voice_on_start());
+            main.set_tts_model_status(
+                if assistant_voice::installed() {
+                    "Pocket TTS is installed."
+                } else {
+                    "Pocket TTS is not installed."
+                }
+                .into(),
+            );
+            main.set_settings_dirty(true);
+            if editor.get_testing_voice() {
+                assistant_voice::stop_playback();
+                editor.set_testing_voice(false);
+            }
+            let _ = editor.hide();
+        });
+        let _ = editor.show();
+    });
+}
+
+mod assistant_presentation;
+mod avatar_bridge;
+mod avatar_ui;
+mod desktop_avatar;
+mod node_settings;
+mod reminders;
+mod sayings;
+mod sayings_ui;
+mod speech_lane;
+mod voice_ui;
+mod voices;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let worker_args = std::env::args().skip(1).collect::<Vec<_>>();
+    if worker_args
+        .first()
+        .is_some_and(|arg| arg == "--reminder-command")
+    {
+        if let Err(error) = reminders::cli() {
+            println!("{}", serde_json::json!({"error":error}));
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if worker_args.first().is_some_and(|arg| arg == "app-server")
+        || (std::env::var_os("ECHO_CODEX_PROXY").is_some() && worker_args == ["--version"])
+    {
+        let code = hermes_runtime::codex_proxy(&worker_args).unwrap_or_else(|error| {
+            eprintln!("Echo worker launcher failed: {error}");
+            1
+        });
+        std::process::exit(code);
+    }
     env_logger::init();
     match diagnostics::init() {
         Ok(path) => {
@@ -1355,6 +2223,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             guard
         }
         None => {
+            if std::env::args().any(|arg| arg == "--component-setup") {
+                rfd::MessageDialog::new().set_title("Echo components").set_description("Echo is already running. Open Settings → Connections → Manage components in the running application.").show();
+                show_existing_instance(&activation_event);
+                return Ok(());
+            }
+            if std::env::args().any(|arg| arg == "--connect-laya") {
+                return Err("Close Echo before connecting Laya.".into());
+            }
+            if std::env::args().any(|arg| arg == "--configure-hermes") {
+                return Err("Close Echo before configuring its Hermes backend.".into());
+            }
             echo_info!(
                 "instance",
                 "Echo is already running; activating the existing window"
@@ -1363,10 +2242,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     };
+    if std::env::args().any(|arg| arg == "--connect-laya") {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(system_one::connect_local())?;
+        return Ok(());
+    }
+    if std::env::args().any(|arg| arg == "--configure-hermes") {
+        let mut configured = load_settings();
+        hermes::enable_current_assistant(&mut configured)?;
+        if !save_settings(&configured) {
+            return Err("Could not save the Hermes backend configuration.".into());
+        }
+        println!("Hermes is configured with the current assistant model. Start Echo to connect.");
+        return Ok(());
+    }
     select_ui_backend()?;
+    if std::env::args().any(|arg| arg == "--component-setup") {
+        let fresh = !settings::settings_path().exists();
+        let settings = if fresh {
+            components::fresh_settings()
+        } else {
+            load_settings()
+        };
+        let shared = Arc::new(Mutex::new(settings));
+        let window = component_setup::show(shared.clone())?;
+        window.run()?;
+        if fresh && !settings::settings_path().exists() {
+            save_settings(&shared.lock().unwrap());
+        }
+        return Ok(());
+    }
 
     let microphone_snapshot = audio::input_device_snapshot();
+    let speaker_snapshot = assistant_voice::output_device_snapshot();
     let mut initial_settings = load_settings();
+    if !settings::settings_path().exists() {
+        initial_settings = components::fresh_settings();
+    }
+    assistant_voice::set_output_device(
+        &initial_settings.selected_speaker,
+        initial_settings.use_default_speaker,
+    );
     #[cfg(target_os = "windows")]
     match startup::is_enabled() {
         Ok(enabled) => initial_settings.start_with_windows = enabled,
@@ -1396,18 +2314,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         !initial_settings.openai_api_key.trim().is_empty(),
         transcription::local_models_available(&initial_settings.local_sherpa)
     );
+    if let Some(p) = initial_settings
+        .pipelines
+        .as_ref()
+        .and_then(|set| set.active().ok())
+    {
+        if let Ok(c) = p.transcription_config(&initial_settings) {
+            initial_settings.transcription_provider = c.provider.id().into();
+            initial_settings.local_sherpa = c.local;
+        }
+    }
     let selected_microphone = initial_settings.selected_microphone.clone();
     let settings = Arc::new(Mutex::new(initial_settings.clone()));
     let initial_transcript_history = load_transcript_history();
     let transcript_history_store = Arc::new(Mutex::new(initial_transcript_history.clone()));
     let transcript_history_revision = Arc::new(AtomicU64::new(0));
-    if matches!(
-        transcription::TranscriptionProvider::from_id(&initial_settings.transcription_provider),
-        transcription::TranscriptionProvider::LocalSherpaOnnx
-    ) && transcription::local_models_available(&initial_settings.local_sherpa)
-    {
-        transcription::preload_local_engine(&initial_settings.local_sherpa);
-    }
+    model_preload::PreloadPlan::from_settings(&initial_settings).start();
 
     #[cfg(target_os = "windows")]
     let hotkey_text = Arc::new(Mutex::new(initial_settings.hotkey_text.clone()));
@@ -1418,35 +2340,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hotkey_state = Rc::new(RefCell::new(None::<HotKey>));
     #[cfg(target_os = "windows")]
     let hotkey_id_state = Rc::new(RefCell::new(None::<u32>));
+    #[cfg(target_os = "windows")]
+    let assistant_hotkey_state = Rc::new(RefCell::new(None::<HotKey>));
+    #[cfg(target_os = "windows")]
+    let assistant_hotkey_id_state = Rc::new(RefCell::new(None::<u32>));
 
     #[cfg(target_os = "windows")]
     {
-        let startup_hotkey = hotkey_text.lock().unwrap().clone();
-        match apply_hotkey(
-            &hotkey_manager,
-            &mut hotkey_state.borrow_mut(),
-            &startup_hotkey,
-        ) {
-            Ok(id) => {
-                echo_info!(
-                    "hotkey",
-                    "Global hotkey registered specification={} id={}",
-                    startup_hotkey,
-                    id
-                );
-                *hotkey_id_state.borrow_mut() = Some(id);
-            }
-            Err(err) => {
-                echo_error!(
+        if initial_settings
+            .pipelines
+            .as_ref()
+            .is_some_and(|set| set.version != 5)
+        {
+            let startup_hotkey = hotkey_text.lock().unwrap().clone();
+            match apply_hotkey(
+                &hotkey_manager,
+                &mut hotkey_state.borrow_mut(),
+                &startup_hotkey,
+            ) {
+                Ok(id) => {
+                    echo_info!(
+                        "hotkey",
+                        "Global hotkey registered specification={} id={}",
+                        startup_hotkey,
+                        id
+                    );
+                    *hotkey_id_state.borrow_mut() = Some(id);
+                }
+                Err(err) => {
+                    echo_error!(
                     "hotkey",
                     "Failed to register global hotkey {}: {}. Continuing without hotkey support.",
                     startup_hotkey,
                     err
                 );
+                }
             }
         }
     }
+    #[cfg(target_os = "windows")]
+    if initial_settings
+        .pipelines
+        .as_ref()
+        .is_some_and(|set| set.version != 5)
+        && initial_settings.assistant_hotkey_text != initial_settings.hotkey_text
+    {
+        match apply_hotkey(
+            &hotkey_manager,
+            &mut assistant_hotkey_state.borrow_mut(),
+            &initial_settings.assistant_hotkey_text,
+        ) {
+            Ok(id) => *assistant_hotkey_id_state.borrow_mut() = Some(id),
+            Err(err) => echo_error!("hotkey", "Assistant hotkey registration failed: {}", err),
+        }
+    }
 
+    #[cfg(windows)]
+    let graph_hotkeys = Rc::new(RefCell::new(graph_hotkeys::GraphHotkeys::default()));
+    #[cfg(windows)]
+    {
+        let specifications = crate::graph_ui::hotkey_specs(&initial_settings);
+        if let Err(error) = graph_hotkeys
+            .borrow_mut()
+            .sync(&hotkey_manager, &specifications)
+        {
+            echo_warn!("hotkey", "{error}");
+        }
+    }
     let icons = icon_animation::Icons::load()?;
     #[cfg(target_os = "windows")]
     let (quit_item_id, settings_item_id, tray_icon) = {
@@ -1472,11 +2432,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (level_tx, mut level_rx) = mpsc::channel::<f32>(10);
 
     let ui = AppWindow::new()?;
+    #[cfg(windows)]
+    {
+        let registry = graph_hotkeys.clone();
+        let manager = hotkey_manager.clone();
+        ui.on_sync_graph_hotkeys(move |json| {
+            let result = serde_json::from_str::<Vec<(String, String)>>(&json)
+                .map_err(|_| "Invalid graph shortcut configuration.".to_string())
+                .and_then(|specs| registry.borrow_mut().sync(&manager, &specs));
+            result.err().unwrap_or_default().into()
+        });
+    }
+
+    model_ui::install(&ui, settings.clone());
     ui.set_active_tab(0);
-    ui.set_status_text("Idle".into());
+    ui.set_status_text(if initial_settings.pipeline_migration_save_failed {
+        "Your previous setup is active, but its pipeline could not be saved. Check settings folder permissions.".into()
+    } else { "Idle".into() });
     ui.set_is_recording(false);
     #[cfg(target_os = "windows")]
     ui.set_hotkey_text(hotkey_text.lock().unwrap().clone().into());
+    ui.set_assistant_hotkey_text(initial_settings.assistant_hotkey_text.clone().into());
+    ui.set_hugging_face_token_text(initial_settings.hugging_face_token.clone().into());
+    ui.set_tts_voice_path(initial_settings.tts_voice_path.clone().into());
+    ui.set_tts_preload(initial_settings.tts_preload);
+    ui.set_tts_model_status(
+        if assistant_voice::installed() {
+            "Pocket TTS is installed."
+        } else {
+            "Pocket TTS is not installed."
+        }
+        .into(),
+    );
     #[cfg(not(target_os = "windows"))]
     ui.set_hotkey_text("Unavailable".into());
     let initial_provider =
@@ -1528,10 +2515,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         initial_provider,
         transcription::TranscriptionProvider::LocalSherpaOnnx
     ) && transcription::local_models_available(&initial_settings.local_sherpa)
+        && initial_settings
+            .pipelines
+            .as_ref()
+            .and_then(|set| set.active().ok())
+            .and_then(|pipeline| pipeline.steps.first())
+            .is_some_and(pipelines::Step::preload_on_start)
     {
         let preload_ui = ui.as_weak();
+        let preload_config = initial_settings.local_sherpa.clone();
         thread::spawn(move || {
-            if let Err(err) = transcription::wait_for_local_engine() {
+            if let Err(err) = transcription::wait_for_local_engine(&preload_config) {
                 let _ = preload_ui.upgrade_in_event_loop(move |ui| {
                     ui.set_local_download_error(
                         format!("The local model could not load: {err}").into(),
@@ -1555,10 +2549,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )));
     ui.set_selected_microphone(selected_microphone.clone().into());
     ui.set_use_default_microphone(initial_settings.use_default_microphone);
+    ui.set_selected_speaker(initial_settings.selected_speaker.clone().into());
+    ui.set_use_default_speaker(initial_settings.use_default_speaker);
+    ui.set_output_volume(assistant_voice::normalize_output_volume(
+        initial_settings.output_volume,
+    ));
+    assistant_voice::set_output_volume(initial_settings.output_volume);
+    synchronize_speaker_editor(&ui, &speaker_snapshot, true);
+    let speaker_test_ui = ui.as_weak();
+    ui.on_test_speakers(move || {
+        if let Some(ui) = speaker_test_ui.upgrade() {
+            if ui.get_speaker_test_running() { return; }
+            let preferred = (!ui.get_use_default_speaker()).then(|| ui.get_selected_speaker().to_string());
+            let volume = ui.get_output_volume();
+            ui.set_speaker_test_running(true);
+            ui.set_speaker_test_status("Playing a short test tone…".into());
+            let weak = ui.as_weak();
+            thread::spawn(move || {
+                let result = assistant_voice::test_output_device(preferred.as_deref(), volume);
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_speaker_test_running(false);
+                    ui.set_speaker_test_status(match result {
+                        Ok(()) => "Test tone finished. If you did not hear it, check the selected output and Windows volume.".into(),
+                        Err(message) => message.into(),
+                    });
+                });
+            });
+        }
+    });
     ui.set_keep_microphone_ready(initial_settings.keep_microphone_ready);
     ui.set_start_with_windows(initial_settings.start_with_windows);
     ui.set_update_checks_enabled(initial_settings.update_checks_enabled);
     ui.set_app_version(env!("CARGO_PKG_VERSION").into());
+    let _resource_monitor = resources::install(&ui);
     let update_config = match updater::compiled_config() {
         Ok(config) => config,
         Err(err) => {
@@ -1624,7 +2647,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             thread::sleep(std::time::Duration::from_secs(6 * 60 * 60));
         });
     }
-    monitor_microphones(ui.as_weak(), microphone_snapshot, cmd_tx.clone());
+    monitor_microphones(
+        ui.as_weak(),
+        microphone_snapshot,
+        speaker_snapshot,
+        cmd_tx.clone(),
+    );
 
     let gemini_preset_options: Vec<SharedString> = vec![
         "Minimal corrections".into(),
@@ -1740,8 +2768,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hotkey_capture_active = Rc::new(RefCell::new(false));
     #[cfg(target_os = "windows")]
     let hotkey_capture_latched = Rc::new(RefCell::new(false));
+    #[cfg(target_os = "windows")]
+    let hotkey_capture_assistant = Rc::new(Cell::new(false));
 
     let transcript_overlay = TranscriptOverlayWindow::new()?;
+    let caption_overlay = transcript_overlay.as_weak();
+    transcript_overlay.on_caption_layout_changed(move || {
+        if let Some(overlay) = caption_overlay.upgrade() {
+            set_overlay_height(&overlay, OVERLAY_HEIGHT);
+        }
+    });
+    let copy_overlay = transcript_overlay.as_weak();
+    transcript_overlay.on_copy_result(move || {
+        if let Some(w) = copy_overlay.upgrade() {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                match clipboard.set_text(w.get_sentence_text().to_string()) {
+                    Ok(()) => w.set_failure_message("Last successful result copied.".into()),
+                    Err(_) => w.set_failure_message("Could not copy the result. Try again.".into()),
+                }
+            }
+        }
+    });
+    let dismiss_overlay = transcript_overlay.as_weak();
+    transcript_overlay.on_dismiss_result(move || {
+        if let Some(w) = dismiss_overlay.upgrade() {
+            w.set_pipeline_failed(false);
+            w.set_sentence_text("".into());
+            w.set_failure_message("".into());
+            w.set_is_visible(false);
+            hide_overlay_window(&w);
+        }
+    });
     transcript_overlay.set_sentence_text("".into());
     transcript_overlay.set_microphone_name(selected_microphone.clone().into());
     transcript_overlay.set_window_width(OVERLAY_WIDTH);
@@ -1810,6 +2867,650 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let assistant_chat = AssistantChatWindow::new()?;
+    let speech_model_timer = slint::Timer::default();
+    let speech_model_chat = assistant_chat.as_weak();
+    speech_model_timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(100),
+        move || {
+            if let Some(chat) = speech_model_chat.upgrade() {
+                let readiness = assistant_voice::model_readiness();
+                let label = readiness.label();
+                if chat.get_speech_model_status().as_str() != label {
+                    chat.present_speech_model_status(label.into());
+                    chat.present_speech_model_ready(
+                        readiness == assistant_voice::ModelReadiness::Ready,
+                    );
+                }
+            }
+        },
+    );
+    assistant_chat.present_show_spoken_text(initial_settings.assistant_show_spoken_text);
+    let visibility_settings = settings.clone();
+    let visibility_chat = assistant_chat.as_weak();
+    assistant_chat.on_spoken_visibility_changed(move |show| {
+        let mut next = visibility_settings.lock().unwrap().clone();
+        next.assistant_show_spoken_text = show;
+        if save_settings(&next) {
+            *visibility_settings.lock().unwrap() = next;
+        } else if let Some(chat) = visibility_chat.upgrade() {
+            chat.present_assistant_state("Could not save spoken text preference.".into());
+        }
+    });
+    assistant_chat.on_open_file(|id| {
+        if let Err(error) = artifacts::open(&id) {
+            rfd::MessageDialog::new().set_description(error).show();
+        }
+    });
+    assistant_chat.on_save_file(|id| {
+        if let Err(error) = artifacts::save_as(&id) {
+            rfd::MessageDialog::new().set_description(error).show();
+        }
+    });
+    assistant_chat.on_show_file(|id| {
+        if let Err(error) = artifacts::show_in_folder(&id) {
+            rfd::MessageDialog::new().set_description(error).show();
+        }
+    });
+    let assistant_conversation = Arc::new(Mutex::new(assistant::Conversation::default()));
+    let clear_conversation = assistant_conversation.clone();
+    let clear_chat = assistant_chat.as_weak();
+    assistant_chat.on_clear_files(move || {
+        if rfd::MessageDialog::new()
+            .set_title("Clear generated files?")
+            .set_description(
+                "Generated attachments will no longer open. Original files are retained.",
+            )
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show()
+            == rfd::MessageDialogResult::Yes
+        {
+            if let Err(error) = artifacts::clear() {
+                rfd::MessageDialog::new().set_description(error).show();
+            } else {
+                for message in &mut clear_conversation.lock().unwrap().messages {
+                    message.files.retain(|file| !file.generated);
+                }
+                refresh_assistant_chat(&clear_chat, &clear_conversation);
+            }
+        }
+    });
+    if !initial_settings.assistant_avatar_path.is_empty() {
+        if let Ok(avatar) = slint::Image::load_from_path(std::path::Path::new(
+            &initial_settings.assistant_avatar_path,
+        )) {
+            assistant_chat.set_avatar(avatar);
+        }
+    }
+    let assistant_reply_tasks = Arc::new(Mutex::new(Vec::<tokio::task::AbortHandle>::new()));
+    let selection_timer = slint::Timer::default();
+    {
+        let shared = settings.clone();
+        let settings = settings.clone();
+        let chat = assistant_chat.as_weak();
+        assistant_chat.on_graph_selected(move |label| {
+            let mut snapshot = settings.lock().unwrap().clone();
+            if let Some(set) = snapshot.pipelines.as_mut() {
+                if let Some(p) = set
+                    .pipelines
+                    .iter()
+                    .find(|p| assistant_choice_label(&p.name, &p.id) == label.as_str())
+                {
+                    set.active_assistant_id = p.id.clone();
+                    if save_settings(&snapshot) {
+                        *settings.lock().unwrap() = snapshot;
+                    } else if let Some(chat) = chat.upgrade() {
+                        chat.present_assistant_state("Could not save graph selection.".into());
+                    }
+                }
+            }
+        });
+        let chat = assistant_chat.as_weak();
+        selection_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(500),
+            move || {
+                if let Some(chat) = chat.upgrade() {
+                    let snapshot = shared.lock().unwrap();
+                    if let Some(set) = &snapshot.pipelines {
+                        chat.set_graph_options(ModelRc::new(VecModel::from(
+                            set.pipelines
+                                .iter()
+                                .map(|p| assistant_choice_label(&p.name, &p.id).into())
+                                .collect::<Vec<SharedString>>(),
+                        )));
+                        if let Some(p) = set
+                            .pipelines
+                            .iter()
+                            .find(|p| p.id == set.active_assistant_id)
+                            .or_else(|| set.pipelines.iter().find(|p| p.id == set.active_id))
+                        {
+                            chat.set_selected_graph(assistant_choice_label(&p.name, &p.id).into());
+                        }
+                    }
+                }
+            },
+        );
+    }
+    {
+        let main = ui.as_weak();
+        let shared = settings.clone();
+        assistant_chat.on_edit_graph(move || {
+            let index = shared.lock().unwrap().pipelines.as_ref().and_then(|set| {
+                let selected = set.active_assistant().or_else(|_| set.active()).ok()?;
+                set.pipelines.iter().position(|p| p.id == selected.id)
+            });
+            if let (Some(main), Some(index)) = (main.upgrade(), index) {
+                main.invoke_edit_pipeline(index as i32);
+            }
+        });
+    }
+    let assistant_submit_tx = cmd_tx.clone();
+    assistant_chat.on_submit(move |text| {
+        let _ = assistant_submit_tx.send(AppCommand::AssistantSubmit(text.to_string()));
+    });
+    let assistant_listen_tx = cmd_tx.clone();
+    assistant_chat.on_start_listening(move || {
+        assistant_voice::stop_playback();
+        let _ = assistant_listen_tx.send(AppCommand::ToggleAssistant);
+    });
+    let assistant_conversation_for_new = assistant_conversation.clone();
+    let assistant_tasks_for_new = assistant_reply_tasks.clone();
+    let assistant_chat_for_new = assistant_chat.as_weak();
+    assistant_chat.on_new_chat(move || {
+        if let Some(chat) = assistant_chat_for_new.upgrade() {
+            chat.present_listening(false);
+            chat.set_live_transcript("".into());
+            chat.set_graph_run_nodes(ModelRc::default());
+            chat.set_graph_progress_nodes(ModelRc::default());
+            chat.set_speech_status("".into());
+        }
+        assistant_voice::stop_playback();
+        for task in assistant_tasks_for_new.lock().unwrap().drain(..) {
+            task.abort();
+        }
+        assistant_conversation_for_new.lock().unwrap().reset();
+        refresh_assistant_chat(&assistant_chat_for_new, &assistant_conversation_for_new);
+    });
+    assistant_chat.on_speed_changed(assistant_voice::set_playback_speed);
+    assistant_chat.set_output_volume(assistant_voice::normalize_output_volume(
+        initial_settings.output_volume,
+    ));
+    {
+        let chat = assistant_chat.as_weak();
+        ui.on_output_volume_changed(move |volume| {
+            let volume = assistant_voice::normalize_output_volume(volume);
+            assistant_voice::set_output_volume(volume);
+            if let Some(chat) = chat.upgrade() {
+                chat.set_output_volume(volume);
+            }
+        });
+        let main = ui.as_weak();
+        let chat = assistant_chat.as_weak();
+        let shared = settings.clone();
+        let save_timer = slint::Timer::default();
+        assistant_chat.on_volume_changed(move |volume| {
+            let volume = assistant_voice::normalize_output_volume(volume);
+            assistant_voice::set_output_volume(volume);
+            if let Some(main) = main.upgrade() {
+                main.set_output_volume(volume);
+            }
+            let shared = shared.clone();
+            let chat = chat.clone();
+            save_timer.start(
+                slint::TimerMode::SingleShot,
+                std::time::Duration::from_millis(300),
+                move || {
+                    let mut snapshot = shared.lock().unwrap().clone();
+                    snapshot.output_volume = volume;
+                    if save_settings(&snapshot) {
+                        *shared.lock().unwrap() = snapshot;
+                    } else if let Some(chat) = chat.upgrade() {
+                        chat.present_assistant_state("Could not save speech volume.".into());
+                    }
+                },
+            );
+        });
+    }
+
+    let assistant_editor = AssistantPipelineWindow::new()?;
+    let edit_voice = AssistantPipelineWindow::new()?;
+    let mcp_manager = McpManagerWindow::new()?;
+    let components_ui = Rc::new(RefCell::new(None::<ComponentSetupWindow>));
+    let components_settings = settings.clone();
+    ui.on_manage_components(
+        move || match component_setup::show(components_settings.clone()) {
+            Ok(window) => *components_ui.borrow_mut() = Some(window),
+            Err(error) => {
+                rfd::MessageDialog::new()
+                    .set_description(error.to_string())
+                    .show();
+            }
+        },
+    );
+    let tools_ui = mcp_manager.as_weak();
+    let tools_settings = settings.clone();
+    ui.on_manage_agent_tools(move || {
+        if let Some(window) = tools_ui.upgrade() {
+            let current = tools_settings.lock().unwrap().clone();
+            populate_mcp_manager(&window, &current, "");
+            window.set_brave_key(current.brave_api_key.into());
+            let _ = window.show();
+        }
+    });
+    mcp_manager.set_brave_key(settings.lock().unwrap().brave_api_key.clone().into());
+    let component_window = Rc::new(RefCell::new(None::<ComponentSetupWindow>));
+    let component_settings = settings.clone();
+    mcp_manager.on_manage_components(move || {
+        match component_setup::show(component_settings.clone()) {
+            Ok(window) => *component_window.borrow_mut() = Some(window),
+            Err(error) => {
+                rfd::MessageDialog::new()
+                    .set_description(error.to_string())
+                    .show();
+            }
+        }
+    });
+    let search_settings = settings.clone();
+    let weak = mcp_manager.as_weak();
+    mcp_manager.on_save_brave(move || {
+        if let Some(window) = weak.upgrade() {
+            let mut snapshot = search_settings.lock().unwrap().clone();
+            snapshot.brave_api_key = window.get_brave_key().to_string();
+            if save_settings(&snapshot) {
+                *search_settings.lock().unwrap() = snapshot;
+                window.set_status_text("Search key saved.".into());
+            } else {
+                window.set_status_text("Could not save search key.".into());
+            }
+        }
+    });
+    let mcp_manager_for_open = mcp_manager.as_weak();
+    let settings_for_mcp_open = settings.clone();
+    assistant_editor.on_open_mcp_manager(move || {
+        if let Some(window) = mcp_manager_for_open.upgrade() {
+            let current = settings_for_mcp_open.lock().unwrap().clone();
+            let active = window.get_selected_server().to_string();
+            let selected = current
+                .assistant_mcp_servers
+                .iter()
+                .find(|server| assistant_choice_label(&server.name, &server.id) == active)
+                .map(|server| server.id.as_str())
+                .or_else(|| {
+                    current
+                        .assistant_mcp_servers
+                        .first()
+                        .map(|server| server.id.as_str())
+                })
+                .unwrap_or("");
+            populate_mcp_manager(&window, &current, selected);
+            window.set_status_text("".into());
+            let _ = window.show();
+        }
+    });
+    let mcp_manager_for_select = mcp_manager.as_weak();
+    let settings_for_mcp_select = settings.clone();
+    mcp_manager.on_select_server(move |label| {
+        if let Some(window) = mcp_manager_for_select.upgrade() {
+            let current = settings_for_mcp_select.lock().unwrap().clone();
+            let id = current
+                .assistant_mcp_servers
+                .iter()
+                .find(|server| assistant_choice_label(&server.name, &server.id) == label.as_str())
+                .map(|server| server.id.as_str())
+                .unwrap_or("");
+            populate_mcp_manager(&window, &current, id);
+            window.set_status_text("".into());
+        }
+    });
+    let mcp_manager_for_new = mcp_manager.as_weak();
+    let settings_for_mcp_new = settings.clone();
+    mcp_manager.on_new_server(move || {
+        if let Some(window) = mcp_manager_for_new.upgrade() {
+            populate_mcp_manager(&window, &settings_for_mcp_new.lock().unwrap(), "");
+            window.set_status_text("Enter a server, then save it.".into());
+        }
+    });
+    let mcp_manager_for_save = mcp_manager.as_weak();
+    let settings_for_mcp_save = settings.clone();
+    mcp_manager.on_save_server(move || {
+        let Some(window) = mcp_manager_for_save.upgrade() else {
+            return;
+        };
+        let mut snapshot = settings_for_mcp_save.lock().unwrap().clone();
+        for raw in [window.get_environment_text(), window.get_headers_text()] {
+            if serde_json::from_str::<std::collections::BTreeMap<String, String>>(&raw).is_err() {
+                window.set_status_text(
+                    "Environment and headers must be JSON objects with string values.".into(),
+                );
+                return;
+            }
+        }
+        let server = mcp_server_from_window(&window, &snapshot);
+        if let Err(error) = server.validate() {
+            window.set_status_text(error.into());
+            return;
+        }
+        if let Some(existing) = snapshot
+            .assistant_mcp_servers
+            .iter_mut()
+            .find(|existing| existing.id == server.id)
+        {
+            *existing = server.clone();
+        } else {
+            snapshot.assistant_mcp_servers.push(server.clone());
+        }
+        if save_settings(&snapshot) {
+            *settings_for_mcp_save.lock().unwrap() = snapshot.clone();
+            populate_mcp_manager(&window, &snapshot, &server.id);
+            window.set_status_text("MCP server saved.".into());
+        } else {
+            window.set_status_text("Could not save MCP server.".into());
+        }
+    });
+    let mcp_manager_for_remove = mcp_manager.as_weak();
+    let settings_for_mcp_remove = settings.clone();
+    mcp_manager.on_remove_server(move || {
+        let Some(window) = mcp_manager_for_remove.upgrade() else {
+            return;
+        };
+        let mut snapshot = settings_for_mcp_remove.lock().unwrap().clone();
+        let selected = window.get_selected_server().to_string();
+        snapshot
+            .assistant_mcp_servers
+            .retain(|server| assistant_choice_label(&server.name, &server.id) != selected);
+        if save_settings(&snapshot) {
+            *settings_for_mcp_remove.lock().unwrap() = snapshot.clone();
+            populate_mcp_manager(&window, &snapshot, "");
+            window.set_status_text("MCP server removed.".into());
+        } else {
+            window.set_status_text("Could not remove MCP server.".into());
+        }
+    });
+    let mcp_manager_for_test = mcp_manager.as_weak();
+    let settings_for_mcp_test = settings.clone();
+    mcp_manager.on_test_server(move || {
+        let Some(window) = mcp_manager_for_test.upgrade() else {
+            return;
+        };
+        for raw in [window.get_environment_text(), window.get_headers_text()] {
+            if serde_json::from_str::<std::collections::BTreeMap<String, String>>(&raw).is_err() {
+                window.set_status_text(
+                    "Environment and headers must be JSON objects with string values.".into(),
+                );
+                return;
+            }
+        }
+        let server = mcp_server_from_window(&window, &settings_for_mcp_test.lock().unwrap());
+        window.set_status_text("Connecting to MCP server…".into());
+        let weak = mcp_manager_for_test.clone();
+        let shared = settings_for_mcp_test.clone();
+        std::thread::spawn(move || {
+            let result = tokio::runtime::Runtime::new()
+                .map_err(|e| e.to_string())
+                .and_then(|runtime| {
+                    runtime.block_on(async {
+                        let client = assistant_mcp::connect(&server).await?;
+                        let tools = client
+                            .peer()
+                            .list_all_tools()
+                            .await
+                            .map_err(|_| "Could not discover tools.".to_string())?;
+                        let _ = client.cancel().await;
+                        Ok(tools)
+                    })
+                });
+            let status = match result {
+                Ok(tools) => {
+                    let status = if tools.is_empty() {
+                        "Connected. This server has no tools.".to_string()
+                    } else {
+                        format!(
+                            "Connected. Tools:\n{}",
+                            tools
+                                .iter()
+                                .map(|t| format!(
+                                    "{}: {}",
+                                    t.name,
+                                    t.description.as_deref().unwrap_or("")
+                                ))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        )
+                    };
+                    let mut snapshot = shared.lock().unwrap();
+                    if let Some(saved) = snapshot
+                        .assistant_mcp_servers
+                        .iter_mut()
+                        .find(|s| s.id == server.id && s.transport == server.transport)
+                    {
+                        saved.discovered_tools = tools;
+                        if !save_settings(&snapshot) {
+                            let _ = weak.upgrade_in_event_loop(|window| {
+                                window.set_status_text(
+                                    "Connected, but could not save discovered tools.".into(),
+                                )
+                            });
+                            return;
+                        }
+                    }
+                    status
+                }
+                Err(error) => error,
+            };
+            let _ = weak.upgrade_in_event_loop(move |window| window.set_status_text(status.into()));
+        });
+    });
+    voice_ui::install(&ui, &assistant_editor, &edit_voice, settings.clone())?;
+    let voice_recording = Rc::new(RefCell::new(None::<VoiceRecording>));
+    let voice_recording_for_button = voice_recording.clone();
+    let assistant_editor_for_record = edit_voice.as_weak();
+    let main_for_voice_record = ui.as_weak();
+    let settings_for_record = settings.clone();
+    edit_voice.on_record_voice(move || {
+        let Some(editor) = assistant_editor_for_record.upgrade() else {
+            return;
+        };
+        if let Some(recording) = voice_recording_for_button.borrow_mut().take() {
+            editor.set_recording_voice(false);
+            match finish_voice_recording(recording) {
+                Ok(path) => {
+                    voice_ui::start_import(&editor, main_for_voice_record.clone(), path, true);
+                }
+                Err(error) => editor.set_voice_status(error.into()),
+            }
+            return;
+        }
+        let current = settings_for_record.lock().unwrap().clone();
+        let microphone = if current.use_default_microphone {
+            None
+        } else {
+            Some(current.selected_microphone)
+        };
+        let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(128);
+        let (level_tx, _level_rx) = tokio::sync::mpsc::channel(2);
+        match audio::start_audio_capture(audio_tx, level_tx, microphone) {
+            Ok(capture) => {
+                let samples = Arc::new(Mutex::new(Vec::<i16>::new()));
+                let collected = samples.clone();
+                let collector = thread::spawn(move || {
+                    while let Some(chunk) = audio_rx.blocking_recv() {
+                        let mut buffer = collected.lock().unwrap();
+                        let remaining = (16_000usize * 30).saturating_sub(buffer.len());
+                        buffer.extend(chunk.into_iter().take(remaining));
+                    }
+                });
+                *voice_recording_for_button.borrow_mut() = Some(VoiceRecording {
+                    capture,
+                    samples,
+                    collector,
+                });
+                editor.set_recording_voice(true);
+                editor.set_voice_status(
+                    "Recording voice. Speak clearly, then press Stop recording.".into(),
+                );
+            }
+            Err(_) => {
+                editor.set_voice_status("Could not start microphone for voice recording.".into())
+            }
+        }
+    });
+    let assistant_editor_for_install = assistant_editor.as_weak();
+    let main_for_voice_install = ui.as_weak();
+    assistant_editor.on_install_voice_model(move || {
+        let Some(editor) = assistant_editor_for_install.upgrade() else {
+            return;
+        };
+        if editor.get_installing_voice() {
+            return;
+        }
+        editor.set_installing_voice(true);
+        editor.set_voice_status("Downloading and verifying Pocket TTS…".into());
+        let window = assistant_editor_for_install.clone();
+        let main = main_for_voice_install.clone();
+        std::thread::spawn(move || {
+            let result = tokio::runtime::Runtime::new()
+                .map_err(|e| e.to_string())
+                .and_then(|runtime| runtime.block_on(assistant_voice::install_standard()));
+            let message = match result {
+                Ok(()) => "Pocket TTS installed and verified.".to_string(),
+                Err(error) => error,
+            };
+            let _ = window.upgrade_in_event_loop(move |editor| {
+                editor.set_installing_voice(false);
+                editor.set_voice_status(message.into());
+                if let Some(main) = main.upgrade() {
+                    main.set_tts_model_status(
+                        if assistant_voice::installed() {
+                            "Pocket TTS is installed."
+                        } else {
+                            "Pocket TTS is not installed."
+                        }
+                        .into(),
+                    );
+                }
+            });
+        });
+    });
+    let assistant_editor_for_test_voice = assistant_editor.as_weak();
+    assistant_editor.on_test_voice(move || {
+        let Some(editor) = assistant_editor_for_test_voice.upgrade() else {
+            return;
+        };
+        if editor.get_testing_voice() || editor.get_editing_voice() {
+            return;
+        }
+        let phrase = editor.get_voice_test_text().trim().to_string();
+        if phrase.is_empty() {
+            editor.set_voice_status("Enter a test phrase first.".into());
+            return;
+        }
+        if !assistant_voice::installed() {
+            editor.set_voice_status("Install Pocket TTS before testing the voice.".into());
+            return;
+        }
+        let path = std::path::PathBuf::from(editor.get_voice_path().to_string());
+        if !assistant_voice::voice_selection_valid(&path) {
+            editor.set_voice_status(
+                "The selected voice is missing. Import another voice or use Alba.".into(),
+            );
+            return;
+        }
+        assistant_voice::stop_playback();
+        let preview_generation = assistant_voice::playback_generation();
+        editor.set_testing_voice(true);
+        editor.set_voice_status("Generating voice preview…".into());
+        let window = assistant_editor_for_test_voice.clone();
+        std::thread::spawn(move || {
+            let result = assistant_voice::speak_if_current(&phrase, &path, preview_generation);
+            let message = match result {
+                Ok(()) => "Voice preview finished.".to_string(),
+                Err(error) => error,
+            };
+            if assistant_voice::playback_generation() == preview_generation {
+                let _ = window.upgrade_in_event_loop(move |editor| {
+                    editor.set_testing_voice(false);
+                    editor.set_voice_status(message.into());
+                });
+            }
+        });
+    });
+    let edit_weak = edit_voice.as_weak();
+    let library_weak = assistant_editor.as_weak();
+    let recording_for_done = voice_recording.clone();
+    edit_voice.on_cancel(move || {
+        let (Some(editor), Some(library)) = (edit_weak.upgrade(), library_weak.upgrade()) else {
+            return;
+        };
+        if editor.get_importing_voice() {
+            return;
+        }
+        if let Some(recording) = recording_for_done.borrow_mut().take() {
+            discard_voice_recording(recording);
+        }
+        editor.set_recording_voice(false);
+        voice_ui::close_editor(&library, &editor);
+    });
+    let edit_weak = edit_voice.as_weak();
+    edit_voice.window().on_close_requested(move || {
+        if let Some(editor) = edit_weak.upgrade() {
+            editor.invoke_cancel();
+        }
+        CloseRequestResponse::KeepWindowShown
+    });
+    let weak = assistant_editor.as_weak();
+    assistant_editor.on_cancel(move || {
+        if let Some(editor) = weak.upgrade() {
+            if editor.get_editing_voice() {
+                return;
+            }
+            if editor.get_testing_voice() {
+                assistant_voice::stop_playback();
+            }
+            editor.set_testing_voice(false);
+            let _ = editor.hide();
+        }
+    });
+    let weak = assistant_editor.as_weak();
+    assistant_editor.window().on_close_requested(move || {
+        if let Some(editor) = weak.upgrade() {
+            editor.invoke_cancel();
+        }
+        CloseRequestResponse::KeepWindowShown
+    });
+    install_tts_settings_entrypoint(&ui, &assistant_editor);
+    let _avatar_playground =
+        avatar_ui::install(&ui, &assistant_chat, &assistant_editor, settings.clone())?;
+    pipeline_ui::install(&ui, settings.clone(), assistant_editor.as_weak());
+    let _desktop_avatar = desktop_avatar::install(&assistant_chat, settings.clone())?;
+    let hermes_integration = hermes_ui::install(&assistant_chat, settings.clone())?;
+    let _reminders = match reminders::ui::install(&ui, &assistant_chat, settings.clone()) {
+        Ok(integration) => Some(integration),
+        Err(error) => {
+            log::warn!("Calendar reminders could not start: {error}");
+            None
+        }
+    };
+    {
+        let chat = assistant_chat.as_weak();
+        ui.on_hermes_settings(move || {
+            if let Some(chat) = chat.upgrade() {
+                chat.invoke_hermes_settings();
+            }
+        });
+        let chat = assistant_chat.as_weak();
+        ui.on_open_assistant(move || {
+            if let Some(chat) = chat.upgrade() {
+                let _ = chat.show();
+            }
+        });
+    }
+    let hermes_for_runtime = hermes_integration.controller.clone();
+    let assistant_chat_for_tokio = assistant_chat.as_weak();
+    let assistant_conversation_for_runtime = assistant_conversation.clone();
+    let assistant_tasks_for_runtime = assistant_reply_tasks.clone();
+
     let ui_handle_for_tokio = ui.as_weak();
     let overlay_handle_for_tokio = transcript_overlay.as_weak();
     let settings_for_runtime = settings.clone();
@@ -1823,6 +3524,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             echo_info!("runtime", "Tokio runtime active");
 
             let mut active_session: Option<Session> = None;
+            let mut requested_graph: Option<String> = None;
             let mut warm_capture: Option<audio::WarmAudioCapture> = None;
             let mut warm_reconfigure_pending = false;
             let (finalize_tx, mut finalize_rx) = mpsc::unbounded_channel::<(u64, bool)>();
@@ -1856,6 +3558,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
                     Some((finalized_epoch, preserve_status)) = finalize_rx.recv() => {
+                        hermes_for_runtime.finish_capture(finalized_epoch);
                         echo_info!(
                             "session",
                             "Finalization received epoch={} current_epoch={} preserve_status={}",
@@ -1906,7 +3609,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         overlay_visible.store(false, Ordering::SeqCst);
+                        let final_ui_epoch = session_epoch.clone();
                         let _ = ui_handle_for_tokio.upgrade_in_event_loop(move |ui| {
+                            if final_ui_epoch.load(Ordering::SeqCst) != finalized_epoch { return; }
                             ui.set_audio_level(0.0);
                             ui.set_is_recording(false);
                             ui.set_is_finalizing(false);
@@ -1915,7 +3620,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_status_text("Idle".into());
                             }
                         });
-                        let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
+                        let final_overlay_epoch = session_epoch.clone();
+                        let _ = overlay_handle_for_tokio.upgrade_in_event_loop(move |overlay| {
+                            if final_overlay_epoch.load(Ordering::SeqCst) != finalized_epoch { return; }
+                            if overlay.get_pipeline_failed() { overlay.set_audio_level(0.0); return; }
                             overlay.set_sentence_text("".into());
                             overlay.set_audio_level(0.0);
                             overlay.set_window_width(OVERLAY_WIDTH);
@@ -1934,12 +3642,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         active_session.as_ref().map_or(0, |session| session.epoch)
                     );
                     let cmd = match cmd {
+                        AppCommand::ToggleGraph(id) => {
+                            let assistant = settings_for_runtime.lock().unwrap().pipelines.as_ref()
+                                .and_then(|set| set.pipelines.iter().find(|p| p.id == id))
+                                .and_then(|p| p.graph.as_ref()).is_some_and(graph_uses_assistant);
+                            match recording_activation(active_session.as_ref().map(|s| (s.assistant, s.state.lock().unwrap().can_stop())), assistant) {
+                                RecordingActivation::Start => { requested_graph=Some(id); AppCommand::StartRecording }
+                                RecordingActivation::Stop => AppCommand::StopRecording,
+                                RecordingActivation::Ignore => continue,
+                            }
+                        }
                         AppCommand::ToggleRecording => {
                             match active_session.as_ref() {
                                 Some(session) => {
                                     let state = session.state.lock().unwrap();
                                     if state.can_stop() {
                                         AppCommand::StopRecording
+                                    } else if session.assistant && settings_for_runtime.lock().unwrap().pipelines.as_ref()
+                                        .and_then(|set| set.active().ok()).and_then(|p| p.graph.as_ref()).is_some_and(graph_uses_assistant) {
+                                        AppCommand::StartRecording
                                     } else {
                                         echo_info!(
                                             "session",
@@ -1951,11 +3672,166 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 None => AppCommand::StartRecording,
                             }
                         }
+                        AppCommand::ToggleAssistant => {
+                            match recording_activation(active_session.as_ref().map(|s| (s.assistant, s.state.lock().unwrap().can_stop())), true) {
+                                RecordingActivation::Start => AppCommand::StartAssistantRecording,
+                                RecordingActivation::Stop => AppCommand::StopRecording,
+                                RecordingActivation::Ignore => continue,
+                            }
+                        }
+                        AppCommand::AssistantTranscriptSubmit(epoch, input) => {
+                            if epoch != session_epoch.load(Ordering::SeqCst) { continue; }
+                            if settings_for_runtime.lock().unwrap().hermes.enabled {
+                                assistant_voice::stop_playback();
+                                hermes_for_runtime.submit_recording(epoch, input);
+                                continue;
+                            }
+                            AppCommand::AssistantSubmit(input)
+                        }
                         cmd => cmd,
                     };
 
                     match cmd {
-                        AppCommand::StartRecording => {
+                        AppCommand::AssistantSubmit(input) => {
+                            let input = input.trim().to_string();
+                            if input.is_empty() { continue; }
+                            assistant_voice::stop_playback();
+                            let playback_generation = assistant_voice::playback_generation();
+                            let current_settings = settings_for_runtime.lock().unwrap().clone();
+                            if current_settings.hermes.enabled {
+                                hermes_for_runtime.submit(input);
+                                continue;
+                            }
+                            if let Some(p)=current_settings.pipelines.as_ref().and_then(|set|set.active_assistant().or_else(|_|set.active()).ok()).filter(|p|p.graph.is_some()).cloned() {
+                                let graph=p.graph.unwrap();
+                                if let Err(error)=graph.preflight(&current_settings) { let _=assistant_chat_for_tokio.upgrade_in_event_loop(move|chat|chat.present_assistant_state(error.into())); continue; }
+                                let chat=assistant_chat_for_tokio.clone(); let conversation=assistant_conversation_for_runtime.clone();let ui=ui_handle_for_tokio.clone();
+                                let target=injector::capture_injection_target();
+                                let task=tokio::spawn(async move {
+                                    let generation=playback_generation;
+                                    let cancel=Arc::new(move||assistant_voice::playback_generation()!=generation);
+                                    let result=run_graph_chat(&graph,input,&current_settings,chat.clone(),conversation,ui,cancel,Arc::new(|_|{})).await;
+                                    if assistant_voice::playback_generation() != generation { return; }
+                                    let status = match result {
+                                        Ok(result) => {
+                                            let delivered = if result.destination == graph::Destination::Text {
+                                                injector::inject_text(&result.text, target).map(|_| ()).map_err(|e| e.to_string())
+                                            } else { Ok(()) };
+                                            delivered.map(|()| if result.errors.is_empty() { "Ready".into() } else { format!("Completed with node errors: {}", result.errors.join("; ")) })
+                                        },
+                                        Err(error) => Err(error),
+                                    };
+                                    let _=chat.upgrade_in_event_loop(move|chat|{if assistant_voice::playback_generation()==generation {chat.present_assistant_state(status.unwrap_or_else(|error| error).into());}});
+                                });
+                                let mut tasks=assistant_tasks_for_runtime.lock().unwrap();tasks.retain(|task|!task.is_finished());tasks.push(task.abort_handle());continue;
+                            }
+                            let pipeline = match current_settings.pipelines.as_ref()
+                                .ok_or_else(|| "Pipeline configuration is missing.".to_string())
+                                .and_then(|set| set.active_assistant())
+                                .and_then(|p| { p.preflight(&current_settings)?; assistant::AssistantPipeline::from_pipeline(p) }) {
+                                Ok(pipeline) => pipeline,
+                                Err(error) => {
+                                    let _ = assistant_chat_for_tokio.upgrade_in_event_loop(move |chat| {
+                                        chat.present_assistant_state(error.into()); let _ = chat.show();
+                                    });
+                                    continue;
+                                }
+                            };
+                            let (generation, reply_id, context) = assistant_conversation_for_runtime.lock().unwrap().start_turn(input.clone());
+                            refresh_assistant_chat(&assistant_chat_for_tokio, &assistant_conversation_for_runtime);
+                            let chat = assistant_chat_for_tokio.clone();
+                            let conversation = assistant_conversation_for_runtime.clone();
+                            let task = tokio::spawn(async move {
+                                let (speech_tx, speech_rx) = std::sync::mpsc::channel::<String>();
+                                let spoken_offset = Arc::new(Mutex::new(0usize));
+                                let speech_task = if pipeline.output_steps.iter().any(|s| matches!(s, pipelines::OutputStep::Speech)) {
+                                    let voice = std::path::PathBuf::from(&pipeline.voice_id);
+                                    Some(tokio::task::spawn_blocking(move || assistant_voice::play_segments(speech_rx, &voice, playback_generation)))
+                                } else { None };
+                                let update_chat = chat.clone();
+                                let update_conversation = conversation.clone();
+                                let update_speech_tx = speech_tx.clone();
+                                let update_spoken_offset = spoken_offset.clone();
+                                let spoken_text = Arc::new(Mutex::new(String::new()));
+                                let update_spoken_text = spoken_text.clone();
+                                let result = assistant::answer_with_outputs(&current_settings, &pipeline, &context, &input,
+                                    move |text| {
+                                        if assistant_voice::playback_generation() != playback_generation { return; }
+                                        update_conversation.lock().unwrap().update(generation, reply_id, text.to_string(), false);
+                                        refresh_assistant_chat(&update_chat, &update_conversation);
+                                    }, move |text| {
+                                        if assistant_voice::playback_generation() != playback_generation { return; }
+                                        *update_spoken_text.lock().unwrap() = text.to_string();
+                                        let mut offset = update_spoken_offset.lock().unwrap();
+                                        for sentence in assistant::ready_spoken_sentences(text, &mut offset) {
+                                            let _ = update_speech_tx.send(sentence);
+                                        }
+                                    }, {
+                                        let voice=pipeline.voice_id.clone();
+                                        move |text| { let voice=voice.clone(); async move {
+                                            tokio::task::spawn_blocking(move || assistant_voice::speak_if_current(&text,std::path::Path::new(&voice),playback_generation))
+                                                .await.map_err(|_| "Speech generation task failed.".to_string())?
+                                        }}
+                                    }).await;
+                                if assistant_voice::playback_generation() != playback_generation { return; }
+                                match result {
+                                    Ok(text) => {
+                                        conversation.lock().unwrap().update(generation, reply_id, text.clone(), true);
+                                        let offset = *spoken_offset.lock().unwrap();
+                                        if let Some(tail) = spoken_text.lock().unwrap().get(offset..) {
+                                            if !tail.trim().is_empty() { let _ = speech_tx.send(tail.trim().to_string()); }
+                                        }
+                                    },
+                                    Err(error) => conversation.lock().unwrap().update(generation, reply_id, format!("Assistant error: {error}"), true),
+                                }
+                                drop(speech_tx);
+                                refresh_assistant_chat(&chat, &conversation);
+                                let _ = chat.upgrade_in_event_loop(move |chat| { if assistant_voice::playback_generation() == playback_generation { chat.present_assistant_state("Ready".into()); } });
+                                if let Some(task) = speech_task {
+                                    if let Ok(Err(error)) = task.await {
+                                        if assistant_voice::playback_generation() == playback_generation {
+                                            let _ = chat.upgrade_in_event_loop(move |chat| { if assistant_voice::playback_generation() == playback_generation { chat.present_assistant_state(error.into()); } });
+                                        }
+                                    }
+                                }
+                            });
+                            let mut tasks = assistant_tasks_for_runtime.lock().unwrap();
+                            tasks.retain(|task| !task.is_finished());
+                            tasks.push(task.abort_handle());
+                        }
+                        command @ (AppCommand::StartRecording | AppCommand::StartAssistantRecording) => {
+                            let requested_assistant = matches!(command, AppCommand::StartAssistantRecording);
+                            let graph_mode = settings_for_runtime.lock().unwrap().pipelines.as_ref().is_some_and(|s|s.version==5);
+                            let mut current_settings = settings_for_runtime.lock().unwrap().clone();
+                            if graph_mode { if let Some(set)=current_settings.pipelines.as_mut() {
+                                if let Some(id)=requested_graph.take() { set.active_id=id; }
+                                else if requested_assistant {
+                                    match set.assistant_for_runtime() {
+                                        Ok(pipeline) => set.active_id=pipeline.id.clone(),
+                                        Err(error) => {
+                                            let _ = ui_handle_for_tokio.upgrade_in_event_loop(move |ui| {
+                                                ui.set_status_text(error.into());
+                                                ui.set_is_recording(false);
+                                            });
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }}
+                            let starts_assistant = requested_assistant || current_settings.pipelines.as_ref()
+                                .and_then(|set| set.active().ok()).and_then(|p| p.graph.as_ref()).is_some_and(graph_uses_assistant);
+                            let native_assistant = starts_assistant && current_settings.hermes.enabled;
+                            let assistant_mode = (requested_assistant && !graph_mode) || native_assistant;
+                            if starts_assistant && active_session.as_ref().is_none_or(|s| s.assistant) {
+                                interrupt_assistant(&mut active_session, &session_epoch, warm_capture.as_ref(),
+                                    &assistant_tasks_for_runtime, &assistant_conversation_for_runtime).await;
+                                refresh_assistant_chat(&assistant_chat_for_tokio, &assistant_conversation_for_runtime);
+                                let _ = assistant_chat_for_tokio.upgrade_in_event_loop(|chat| {
+                                    chat.present_listening(true);
+                                    chat.set_live_transcript("".into());
+                                    chat.present_assistant_state("Listening…".into()); let _ = chat.show();
+                                });
+                            }
                             if active_session.is_some() {
                                 echo_warn!(
                                     "session",
@@ -1974,12 +3850,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 });
                                 continue;
                             };
-                            let current_settings = settings_for_runtime.lock().unwrap().clone();
+                            let assistant_config = if assistant_mode && !native_assistant {
+                                Some(current_settings.pipelines.as_ref()
+                                    .ok_or_else(|| "Pipeline configuration is missing.".to_string())
+                                    .and_then(|set| set.active_assistant())
+                                    .and_then(|p| { p.preflight(&current_settings)?; assistant::AssistantPipeline::from_pipeline(p) }))
+                            } else { None };
+                            let assistant_config = match assistant_config.transpose() {
+                                Ok(config) => config,
+                                Err(message) => {
+                                    let chat_message = message.clone();
+                                    let _ = assistant_chat_for_tokio.upgrade_in_event_loop(move |chat| { chat.present_assistant_state(chat_message.into()); });
+                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(move |ui| {
+                                        ui.set_status_text(message.into()); ui.set_has_error(true);
+                                    });
+                                    continue;
+                                }
+                            };
+                            let session_pipeline = if let Some(config) = &assistant_config {
+                                config.speech_input(&current_settings)
+                            } else if native_assistant {
+                                current_settings.pipelines.as_ref().ok_or_else(|| "Pipeline configuration is missing.".to_string())
+                                    .and_then(|set| set.active().cloned())
+                            } else {
+                                current_settings.pipelines.as_ref().ok_or_else(|| "Pipeline configuration is missing.".to_string())
+                                    .and_then(|set| set.active().cloned())
+                                    .and_then(|p| { p.preflight(&current_settings)?; Ok(p) })
+                            };
+                            let session_pipeline = match session_pipeline {
+                                Ok(p) => p,
+                                Err(message) => {
+                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(move |ui| {
+                                        ui.set_status_text(message.into()); ui.set_has_error(true); ui.set_is_recording(false);
+                                    });
+                                    continue;
+                                }
+                            };
+                            let assistant_graph=assistant_mode || session_pipeline.graph.as_ref().is_some_and(graph_uses_assistant);
+                            if assistant_graph {
+                                overlay_visible.store(false, Ordering::SeqCst);
+                                let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
+                                    overlay.set_is_visible(false);
+                                    hide_overlay_window(&overlay);
+                                });
+                            }
+                            if assistant_graph && !assistant_mode {
+                                assistant_voice::stop_playback();
+                                if let Some(graph) = session_pipeline.graph.clone() {
+                                    let selected = assistant_choice_label(&session_pipeline.name, &session_pipeline.id);
+                                    let speech_settings = current_settings.clone();
+                                    let _ = assistant_chat_for_tokio.upgrade_in_event_loop(move |chat| {
+                                        chat.set_selected_graph(selected.into());
+                                        begin_assistant_graph_listening(&chat, &graph, &speech_settings);
+                                    });
+                                }
+                            }
+                            let speech_config = match session_pipeline.transcription_config(&current_settings) {
+                                Ok(config) => config,
+                                Err(error) => {
+                                    let _ = assistant_chat_for_tokio.upgrade_in_event_loop(move |chat| chat.present_assistant_state(error.into()));
+                                    continue;
+                                }
+                            };
+                            current_settings.transcription_provider = speech_config.provider.id().into();
+                            current_settings.local_sherpa = speech_config.local.clone();
                             let provider = transcription::TranscriptionProvider::from_id(
                                 &current_settings.transcription_provider,
                             );
                             if !matches!(provider, transcription::TranscriptionProvider::LocalSherpaOnnx)
-                                && current_settings.transcription_config().api_key.trim().is_empty() {
+                                && speech_config.api_key.trim().is_empty() {
                                 echo_error!(
                                     "session",
                                     "Start rejected provider={} reason=missing_api_key",
@@ -1989,6 +3928,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     ui.set_status_text("Missing API key".into());
                                     ui.set_is_recording(false);
                                 });
+                                if assistant_graph {
+                                    let _ = assistant_chat_for_tokio.upgrade_in_event_loop(|chat| {
+                                        chat.present_listening(false);
+                                        chat.present_assistant_state("Missing API key".into());
+                                    });
+                                }
                                 continue;
                             }
 
@@ -2001,7 +3946,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         "local_model",
                                         "Start rejected because required local model files are unavailable"
                                     );
-                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(|ui| {
+                                    let required_model = current_settings.local_sherpa.model;
+                                    let _ = ui_handle_for_tokio.upgrade_in_event_loop(move |ui| {
+                                        ui.set_local_model_text(required_model.label().into());
                                         ui.set_local_download_error("".into());
                                         request_local_model_prompt(&ui);
                                         ui.set_status_text("Local speech files are required".into());
@@ -2009,6 +3956,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         ui.set_active_tab(3);
                                         let _ = ui.show();
                                     });
+                                    if assistant_graph {
+                                        let _ = assistant_chat_for_tokio.upgrade_in_event_loop(|chat| {
+                                            chat.present_listening(false);
+                                            chat.present_assistant_state("Local speech files are required".into());
+                                        });
+                                    }
                                     continue;
                             }
 
@@ -2025,9 +3978,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     ui.set_is_finalizing(false);
                                     ui.set_has_error(false);
                                 });
-                                let _ = overlay_handle_for_tokio.upgrade_in_event_loop(|overlay| {
-                                    show_model_loading_notice(&overlay);
-                                });
+                                if assistant_graph {
+                                    let _ = assistant_chat_for_tokio.upgrade_in_event_loop(|chat| {
+                                        chat.present_listening(false);
+                                        chat.present_assistant_state("Loading local speech model…".into());
+                                    });
+                                } else {
+                                    let loading_pipeline = session_pipeline.clone();
+                                    let _ = overlay_handle_for_tokio.upgrade_in_event_loop(move |overlay| {
+                                        overlay.set_graph_run_nodes(loading_pipeline.graph.as_ref().map(|g| graph_run_rows(g, true)).unwrap_or_default());
+                                        overlay.set_graph_progress_nodes(graph_progress_rows(&overlay.get_graph_run_nodes(), 0));
+                                        overlay.set_graph_status("".into());overlay.set_pipeline_cards(if loading_pipeline.graph.is_some(){ModelRc::default()}else{pipeline_ui::cards(&loading_pipeline.steps)}); overlay.set_pipeline_name(loading_pipeline.name.into()); overlay.set_pipeline_step(0);
+                                        show_model_loading_notice(&overlay);
+                                    });
+                                }
                                 continue;
                             }
 
@@ -2036,6 +4000,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             });
                             let current_session_epoch =
                                 session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                            if native_assistant { hermes_for_runtime.bind_recording(current_session_epoch, session_pipeline.graph.clone()); }
+                            let discard_assistant_output = Arc::new(AtomicBool::new(false));
 
                             let preferred_device = preferred_microphone(&current_settings);
 
@@ -2148,7 +4114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         provider,
                                         transcription::TranscriptionProvider::LocalSherpaOnnx
                                     ) && !matches!(
-                                        transcription::local_engine_status(),
+                                        transcription::local_engine_status_for(&current_settings.local_sherpa),
                                         transcription::LocalEngineStatus::Ready
                                     );
                                     if loading_local_model {
@@ -2171,18 +4137,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         ui.set_is_finalizing(false);
                                         ui.set_transcript("".into());
                                     });
-                                    overlay_visible.store(true, Ordering::SeqCst);
-                                    let _ = overlay_handle_for_tokio.upgrade_in_event_loop(
-                                        move |overlay| {
-                                            reset_overlay_to_listening(
-                                                &overlay,
-                                                &microphone_name,
-                                            );
-                                        },
-                                    );
+                                    overlay_visible.store(!assistant_graph, Ordering::SeqCst);
+                                    let overlay_pipeline = session_pipeline.clone();
+                                    let _ = overlay_handle_for_tokio.upgrade_in_event_loop(move |overlay| {
+                                        prepare_transcription_overlay(&overlay, &overlay_pipeline, &microphone_name, assistant_graph);
+                                    });
 
                                     let client = transcription::TranscriberClient::from_config(
-                                        current_settings.transcription_config(),
+                                        speech_config,
                                     );
                                     let requires_committed_final = matches!(provider, transcription::TranscriptionProvider::LocalSherpaOnnx) && current_settings.local_sherpa.model.uses_gpu();
                                     let client_state = state.clone();
@@ -2192,11 +4154,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let transcript_history_revision_for_text =
                                         transcript_history_revision_for_runtime.clone();
                                     let log_line_tx_for_text = log_line_tx.clone();
-                                    let settings_for_text = settings_for_runtime.clone();
+                                    let session_settings_for_text = current_settings.clone();
+                                    let processing_command_tx = cmd_tx_for_runtime.clone();
                                     let finalize_tx_for_transcript = finalize_tx.clone();
                                     let ui_handle_for_network = ui_handle_for_tokio.clone();
                                     let ui_handle_for_transcript = ui_handle_for_tokio.clone();
                                     let overlay_handle_for_transcript = overlay_handle_for_tokio.clone();
+                                    let assistant_chat_for_transcript = assistant_chat_for_tokio.clone();
+                                    let graph_conversation = assistant_conversation_for_runtime.clone();
+                                    let discard_for_transcript = discard_assistant_output.clone();
                                     let overlay_visible_for_transcript = overlay_visible.clone();
                                     let session_epoch_for_transcript = session_epoch.clone();
                                     let preserve_session_status = Arc::new(AtomicBool::new(false));
@@ -2328,7 +4294,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                             let mut was_committed = false;
                                             let mut is_error = false;
-                                            let mut stop_requested_for_msg = false;
                                             let display_text = match msg {
                                                 transcription::TranscriptionEvent::Partial(text) => {
                                                     latest_partial = text;
@@ -2358,7 +4323,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                                     let aggregated = {
                                                         let mut pipeline = transcript_pipeline_for_text.lock().unwrap();
-                                                        stop_requested_for_msg = pipeline.stop_requested();
                                                         pipeline.push_fragment(&base_text)
                                                     };
                                                     was_committed = true;
@@ -2387,7 +4351,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                             let aggregated_for_overlay =
                                                 overlay_caption_text(&display_text);
-                                            let hide_overlay = (was_committed && stop_requested_for_msg) || is_error;
                                             let text_for_ui = if was_committed || is_error {
                                                 display_text.clone()
                                             } else {
@@ -2412,6 +4375,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     ui.set_transcript(text_for_ui.into());
                                                 }
                                             });
+                                            if assistant_graph {
+                                                let live = display_text.clone();
+                                                let epoch = session_epoch_for_transcript.clone();
+                                                let _ = assistant_chat_for_transcript.upgrade_in_event_loop(move |chat| {
+                                                    if epoch.load(Ordering::SeqCst) != current_session_epoch { return; }
+                                                    if is_error {
+                                                        chat.present_assistant_state(live.into());
+                                                        chat.set_live_transcript("".into());
+                                                        chat.present_listening(false);
+                                                    } else {
+                                                        chat.set_live_transcript(live.into());
+                                                    }
+                                                });
+                                                continue;
+                                            }
                                             let overlay_visible_setter = overlay_visible_for_transcript.clone();
                                             let session_epoch_for_overlay = session_epoch_for_transcript.clone();
                                             let _ = overlay_handle_for_transcript
@@ -2422,15 +4400,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                         return;
                                                     }
                                                     overlay.set_is_error(is_error);
-                                                    if hide_overlay {
+                                                    if is_error {
+                                                        overlay.set_pipeline_failed(true); overlay.set_pipeline_step(0);
+                                                        overlay.set_failure_message(aggregated_for_overlay.into());
                                                         overlay.set_sentence_text("".into());
-                                                        overlay.set_window_width(OVERLAY_WIDTH);
-                                                        set_overlay_height(&overlay, OVERLAY_HEIGHT);
-                                                        overlay.set_is_error(false);
-                                                        overlay.set_is_system_message(false);
-                                                        overlay.set_is_visible(false);
-                                                        overlay_visible_setter.store(false, Ordering::SeqCst);
-                                                        hide_overlay_window(&overlay);
+                                                        set_overlay_height(&overlay, 220); overlay.set_is_visible(true);
+                                                        overlay_visible_setter.store(true, Ordering::SeqCst);
+                                                        show_overlay_without_activation(&overlay);
                                                     } else {
                                                         let (w, h) =
                                                             overlay_size_for_text(
@@ -2457,23 +4433,96 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         if stopped && !had_error && !base_text.trim().is_empty()
                                             && session_epoch_for_transcript.load(Ordering::SeqCst) == current_session_epoch
                                         {
-                                            let snapshot = settings_for_text.lock().unwrap().clone();
-                                            let rewritten = if snapshot.gemini_enabled {
-                                                gemini::rewrite_text(&snapshot.gemini_api_key, &snapshot.gemini_model,
-                                                    &snapshot.gemini_prompt_preset, &snapshot.gemini_custom_prompt, &base_text).await
-                                            } else { base_text };
-                                            let raw_fallback = rewritten.clone();
-                                            let pp = settings_for_text.lock().unwrap().post_processing.clone();
-                                            let worker_settings = pp.clone();
-                                            let result = tokio::task::spawn_blocking(move || post_processing::process(&rewritten, &worker_settings)).await;
-                                            let mut processed = result.unwrap_or_else(|_| post_processing::ProcessedText {
-                                                text: raw_fallback.clone(), warning: Some("Formatting worker failed; original text retained.".into())
-                                            });
-                                            if session_epoch_for_transcript.load(Ordering::SeqCst) != current_session_epoch { return; }
-                                            if settings_for_text.lock().unwrap().post_processing != pp {
-                                                processed = post_processing::ProcessedText { text: raw_fallback,
-                                                    warning: Some("Settings changed while formatting; original text retained.".into()) };
+                                            if assistant_mode {
+                                                if discard_for_transcript.load(Ordering::SeqCst) {
+                                                    let _ = finalize_tx_for_transcript.send((current_session_epoch, true));
+                                                    return;
+                                                }
+                                                let final_text = base_text.trim().to_string();
+                                                let thinking_epoch = session_epoch_for_transcript.clone();
+                                                let _ = assistant_chat_for_transcript.upgrade_in_event_loop(move |chat| {
+                                                    if thinking_epoch.load(Ordering::SeqCst) != current_session_epoch { return; }
+                                                    chat.set_live_transcript("".into());
+                                                    chat.present_assistant_state("Thinking…".into());
+                                                });
+                                                let _ = processing_command_tx.send(AppCommand::AssistantTranscriptSubmit(current_session_epoch, final_text));
+                                                let _ = finalize_tx_for_transcript.send((current_session_epoch, true));
+                                                return;
                                             }
+                                            let _ = processing_command_tx.send(AppCommand::ProcessingStarted(current_session_epoch));
+                                            let progress_overlay = overlay_handle_for_transcript.clone();
+                                            let progress_epoch = session_epoch_for_transcript.clone();
+                                            let result = if let Some(graph)=&session_pipeline.graph {
+                                                assistant_voice::stop_playback();
+                                                let cancelled_epoch=session_epoch_for_transcript.clone();
+                                                let discarded=discard_for_transcript.clone();let cancel=Arc::new(move||cancelled_epoch.load(Ordering::SeqCst)!=current_session_epoch || discarded.load(Ordering::SeqCst));
+                                                let overlay=progress_overlay.clone();let epoch=progress_epoch.clone();
+                                                let progress_titles = graph.nodes.iter().map(|n| (n.id.clone(), n.title())).collect::<std::collections::HashMap<_, _>>();
+                                                let progress:graph::Observer=Arc::new(move|event|{
+                                                    if assistant_graph { return; }
+                                                    let epoch=epoch.clone();
+                                                    let title = if let graph::Event::State { node, .. } = &event { progress_titles.get(node).cloned() } else { None };
+                                                    let _=overlay.upgrade_in_event_loop(move|overlay|{
+                                                        if epoch.load(Ordering::SeqCst)!=current_session_epoch{return;}
+                                                        match event {
+                                                            graph::Event::State{node,state}=>{ update_graph_run_state(&overlay.get_graph_run_nodes(), &node, state); if state == "Running" { if let Some(i) = overlay.get_graph_run_nodes().iter().position(|row| row.id.as_str() == node) { overlay.set_pipeline_step(i as i32); } } overlay.set_graph_progress_nodes(graph_progress_rows(&overlay.get_graph_run_nodes(), overlay.get_pipeline_step())); overlay.set_graph_status(format!("{} · {state}",title.unwrap_or(node)).into()); },
+                                                            graph::Event::Text{text,..}=>{ let caption = overlay_caption_text(&text); set_overlay_height(&overlay, overlay_size_for_text(&caption).1); overlay.set_sentence_text(caption.into()); },
+                                                            graph::Event::Error{message,..}=>overlay.set_failure_message(message.into()),
+                                                            _=>{},
+                                                        }
+                                                    });
+                                                });
+                                                let outcome=run_graph_chat(graph,base_text,&session_settings_for_text,assistant_chat_for_transcript.clone(),graph_conversation.clone(),ui_handle_for_transcript.clone(),cancel,progress).await;
+                                                match outcome {
+                                                    Ok(outcome)=>{if !outcome.errors.is_empty(){let message=outcome.errors.join("; ");let _=ui_handle_for_transcript.upgrade_in_event_loop(move|ui|{ui.set_status_text(message.into());ui.set_has_error(true);});}
+                                                        if outcome.destination==graph::Destination::Assistant { let _=overlay_handle_for_transcript.upgrade_in_event_loop(|overlay|{overlay.set_is_visible(false);let _=overlay.hide();});let _=finalize_tx_for_transcript.send((current_session_epoch,true));return; }
+                                                        Ok(outcome.text)
+                                                    },
+                                                    Err(message)=>Err(pipelines::RunFailure{step:0,message,text:String::new()})
+                                                }
+                                            }else{pipelines::execute(&session_pipeline, base_text, &session_settings_for_text,
+                                                move |index, text, complete| {
+                                                    let text = overlay_caption_text(text);
+                                                    let epoch = progress_epoch.clone();
+                                                    let _ = progress_overlay.upgrade_in_event_loop(move |overlay| {
+                                                        if epoch.load(Ordering::SeqCst) != current_session_epoch { return; }
+                                                        overlay.set_pipeline_step(index as i32); overlay.set_step_complete(complete);
+                                                        overlay.set_sentence_text(text.clone().into());
+                                                        set_overlay_height(&overlay, overlay_size_for_text(&text).1);
+                                                        overlay.set_is_visible(true); show_overlay_without_activation(&overlay);
+                                                    });
+                                                }, || session_epoch_for_transcript.load(Ordering::SeqCst) != current_session_epoch).await};
+                                            if session_epoch_for_transcript.load(Ordering::SeqCst) != current_session_epoch { return; }
+                                            let processed = match result {
+                                                Ok(text) => post_processing::ProcessedText { text, warning: None },
+                                                Err(failure) => {
+                                                    preserve_status_for_transcript.store(true, Ordering::SeqCst);
+                                                    let message = failure.message.clone();
+                                                    let _ = ui_handle_for_transcript.upgrade_in_event_loop(move |ui| { ui.set_status_text(format!("Pipeline stopped: {message}").into()); ui.set_has_error(true); });
+                                                    if assistant_graph {
+                                                        let message = format!("Pipeline stopped: {}", failure.message);
+                                                        let _ = assistant_chat_for_transcript.upgrade_in_event_loop(move |chat| {
+                                                            chat.present_assistant_state(message.into());
+                                                            chat.present_listening(false);
+                                                        });
+                                                    } else {
+                                                    let _ = overlay_handle_for_transcript.upgrade_in_event_loop(move |overlay| {
+                                                        overlay.set_pipeline_step(failure.step as i32); overlay.set_pipeline_failed(true); overlay.set_is_error(true);
+                                                        overlay.set_sentence_text(failure.text.into());
+                                                        overlay.set_failure_message(failure.message.into());
+                                                        set_overlay_height(&overlay, 250); show_overlay_without_activation(&overlay);
+                                                    });
+                                                    }
+                                                    let _ = finalize_tx_for_transcript.send((current_session_epoch, true));
+                                                    return;
+                                                }
+                                            };
+                                            // Close before injection; retain the original foreground target.
+                                            let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+                                            let _ = overlay_handle_for_transcript.upgrade_in_event_loop(move |overlay| {
+                                                overlay.set_is_visible(false); hide_overlay_window(&overlay); let _ = closed_tx.send(());
+                                            });
+                                            if closed_rx.await.is_err() || session_epoch_for_transcript.load(Ordering::SeqCst) != current_session_epoch { return; }
                                             let final_text = processed.text.trim().to_string();
                                                     if !final_text.is_empty() {
                                                         let entry = TranscriptHistoryEntry {
@@ -2582,6 +4631,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 });
                                             }
                                         }
+                                        if assistant_graph {
+                                            let state = if had_error {
+                                                "Transcription failed. Press Listen to try again."
+                                            } else {
+                                                "No speech detected. Press Listen to try again."
+                                            };
+                                            let _ = assistant_chat_for_transcript.upgrade_in_event_loop(move |chat| {
+                                                chat.present_assistant_state(state.into());
+                                                chat.set_live_transcript("".into());
+                                                chat.present_listening(false);
+                                            });
+                                        }
                                         echo_info!(
                                             "transcript",
                                             "Event channel closed epoch={} preserve_status={}",
@@ -2595,6 +4656,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     });
 
                                     active_session = Some(Session {
+                                        assistant: assistant_graph,
+                                        discard_assistant_output,
                                         epoch: current_session_epoch,
                                         state,
                                         audio_capture: capture,
@@ -2609,6 +4672,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             transcript_task.abort_handle(),
                                         ],
                                         finalization_watchdog: None,
+                                        text_processing_started: false,
                                         _formatting_activity: formatting_activity,
                                     });
                                     if let Some(session) = active_session.as_ref() {
@@ -2619,6 +4683,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     }
                                     Err(e) => {
+                                    if assistant_graph {
+                                        let state = format!("Microphone error: {e}");
+                                        let _ = assistant_chat_for_tokio.upgrade_in_event_loop(move |chat| { chat.present_assistant_state(state.into()); chat.present_listening(false); });
+                                    }
                                     echo_error!(
                                         "audio",
                                         "Failed to start capture epoch={}: {}",
@@ -2722,7 +4790,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         );
                                     }
                                     }
-                                    AppCommand::ToggleRecording => unreachable!(),
+                                    AppCommand::ToggleGraph(_) | AppCommand::ToggleRecording | AppCommand::ToggleAssistant | AppCommand::AssistantTranscriptSubmit(_, _) => unreachable!(),
                                     AppCommand::CapturePostRollElapsed(capture_epoch) => {
                                     let Some(session) = active_session.as_mut() else {
                                         continue;
@@ -2810,10 +4878,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     session.request_stop();
                                     }
+                                    AppCommand::ProcessingStarted(epoch) => {
+                                        if let Some(session) = active_session.as_mut().filter(|s| s.epoch == epoch) { session.text_processing_started = true; session.cancel_finalization_watchdog(); }
+                                    }
                                     AppCommand::FinalizationTimedOut(timed_out_epoch) => {
                                     let timed_out = active_session
                                         .as_ref()
-                                        .is_some_and(|session| session.epoch == timed_out_epoch);
+                                        .is_some_and(|session| session.epoch == timed_out_epoch && !session.text_processing_started);
                                     if !timed_out {
                                         continue;
                                     }
@@ -2898,6 +4969,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hotkey_id_for_apply = hotkey_id_state.clone();
     #[cfg(target_os = "windows")]
     let hotkey_text_for_apply = hotkey_text.clone();
+    #[cfg(target_os = "windows")]
+    let assistant_hotkey_state_for_apply = assistant_hotkey_state.clone();
+    #[cfg(target_os = "windows")]
+    let assistant_hotkey_id_for_apply = assistant_hotkey_id_state.clone();
     let warm_capture_reconfigure_tx = cmd_tx.clone();
     ui.on_apply_settings(move || {
         let Some(editor) = ui_weak_for_apply.upgrade() else { return; };
@@ -3071,7 +5146,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         if let Some(ui) = ui_weak_for_apply.upgrade() {
             snapshot.post_processing = draft.post_processing;
+            snapshot.hugging_face_token = draft.hugging_face_token;
+            snapshot.tts_voice_path = draft.tts_voice_path;
+            snapshot.tts_preload = draft.tts_preload;
+            snapshot.selected_speaker = ui.get_selected_speaker().to_string();
+            snapshot.use_default_speaker = ui.get_use_default_speaker();
+            snapshot.output_volume = draft.output_volume;
             snapshot.hotkey_text = ui.get_hotkey_text().to_string();
+            snapshot.assistant_hotkey_text = ui.get_assistant_hotkey_text().to_string();
             snapshot.update_checks_enabled = ui.get_update_checks_enabled();
             snapshot.overlay_opacity = ui.get_overlay_opacity();
             snapshot.theme_background_top_color = ui.get_theme_background_top_color().to_string();
@@ -3090,6 +5172,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(target_os = "windows")]
         let hotkey_changed = previous_hotkey != snapshot.hotkey_text;
         #[cfg(target_os = "windows")]
+        let previous_assistant_hotkey = settings_for_ui.lock().unwrap().assistant_hotkey_text.clone();
+        #[cfg(target_os = "windows")]
+        let assistant_hotkey_changed = previous_assistant_hotkey != snapshot.assistant_hotkey_text;
+        #[cfg(target_os = "windows")]
         let hotkey_result = if hotkey_changed {
             apply_hotkey(
                 &hotkey_manager_for_apply,
@@ -3106,7 +5192,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(target_os = "windows"))]
         let hotkey_result: Result<(), String> = Ok(());
 
-        let saved = startup_result.is_ok() && hotkey_result.is_ok() && save_settings(&snapshot);
+        #[cfg(target_os = "windows")]
+        let assistant_hotkey_result = if snapshot.assistant_hotkey_text == snapshot.hotkey_text {
+            Err("Assistant and dictation hotkeys must be different.".to_string())
+        } else if assistant_hotkey_changed {
+            apply_hotkey(&hotkey_manager_for_apply, &mut assistant_hotkey_state_for_apply.borrow_mut(), &snapshot.assistant_hotkey_text)
+                .map(|id| { *assistant_hotkey_id_for_apply.borrow_mut() = Some(id); })
+        } else { Ok(()) };
+        #[cfg(not(target_os = "windows"))]
+        let assistant_hotkey_result: Result<(), String> = Ok(());
+
+        let saved = startup_result.is_ok() && hotkey_result.is_ok() && assistant_hotkey_result.is_ok() && save_settings(&snapshot);
         if saved {
             echo_info!(
                 "settings",
@@ -3137,6 +5233,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         #[cfg(target_os = "windows")]
+        if !saved && assistant_hotkey_changed && assistant_hotkey_result.is_ok() {
+            if let Ok(id) = apply_hotkey(&hotkey_manager_for_apply, &mut assistant_hotkey_state_for_apply.borrow_mut(), &previous_assistant_hotkey) {
+                *assistant_hotkey_id_for_apply.borrow_mut() = Some(id);
+            }
+        }
+        #[cfg(target_os = "windows")]
         if !saved && startup_result.is_ok() {
             let previous_startup = settings_for_ui.lock().unwrap().start_with_windows;
             if previous_startup != start_with_windows {
@@ -3147,16 +5249,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(mut current) = settings_for_ui.lock() {
                 *current = snapshot.clone();
             }
+            assistant_voice::set_output_device(&snapshot.selected_speaker, snapshot.use_default_speaker);
+            assistant_voice::set_output_volume(snapshot.output_volume);
             let _ = warm_capture_reconfigure_tx.send(AppCommand::ReconfigureWarmCapture);
+            model_preload::PreloadPlan::from_settings(&snapshot).start();
             let local_selected = matches!(
                 transcription::TranscriptionProvider::from_id(&snapshot.transcription_provider),
                 transcription::TranscriptionProvider::LocalSherpaOnnx
-            );
+            ) && snapshot.pipelines.as_ref().and_then(|set| set.active().ok())
+                .and_then(|pipeline| pipeline.steps.first()).is_some_and(pipelines::Step::preload_on_start);
             if local_selected && transcription::local_models_available(&snapshot.local_sherpa) {
-                transcription::preload_local_engine(&snapshot.local_sherpa);
                 let repair_ui = ui_weak_for_settings.clone();
+                let preload_config = snapshot.local_sherpa.clone();
                 thread::spawn(move || {
-                    if let Err(err) = transcription::wait_for_local_engine() {
+                    if let Err(err) = transcription::wait_for_local_engine(&preload_config) {
                         let _ = repair_ui.upgrade_in_event_loop(move |ui| {
                             ui.set_local_download_error(
                                 format!("The local model could not load: {err}").into(),
@@ -3168,8 +5274,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
                 });
-            } else {
-                transcription::unload_local_engine();
             }
         }
 
@@ -3203,6 +5307,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .err()
                     .map(|err| format!("Could not update Windows startup: {err}"))
                     .or_else(|| hotkey_result.as_ref().err().cloned())
+                    .or_else(|| assistant_hotkey_result.as_ref().err().cloned())
                     .unwrap_or_else(|| "Settings save failed".to_string());
                 ui.set_status_text(message.into());
                 ui.set_has_error(true);
@@ -3298,19 +5403,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let result = result.and_then(|_| {
                 let saved = settings_after_download.lock().unwrap().clone();
-                if saved.local_sherpa.model == local_config.model
-                    && matches!(
-                        transcription::TranscriptionProvider::from_id(
-                            &saved.transcription_provider
-                        ),
-                        transcription::TranscriptionProvider::LocalSherpaOnnx
-                    )
-                {
-                    transcription::preload_local_engine(&saved.local_sherpa);
-                    transcription::wait_for_local_engine()
-                } else {
-                    Ok(())
-                }
+                let speech = saved.pipelines.as_ref().and_then(|set| set.active().ok()).and_then(|p| p.transcription_config(&saved).ok());
+                if let Some(config) = speech.filter(|c| c.provider == transcription::TranscriptionProvider::LocalSherpaOnnx && c.local.model == local_config.model) {
+                    transcription::preload_local_engine(&config.local);
+                    transcription::wait_for_local_engine(&config.local)
+                } else { Ok(()) }
             });
             match &result {
                 Ok(()) => echo_info!(
@@ -3330,7 +5427,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.set_status_text("Local speech model ready".into());
                     ui.set_has_error(false);
                     ui.set_active_tab(3);
-                    ui.set_settings_tab(1);
+                    ui.set_settings_tab(5);
                 }
                 Err(err) => {
                     ui.set_local_download_progress_visible(false);
@@ -3366,10 +5463,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         .into(),
     );
-    if initial_settings.post_processing.enabled
-        && initial_settings.post_processing.punctuation
-        && !has_punctuation_model
-    {
+    let pipeline_needs_punctuation = initial_settings
+        .pipelines
+        .as_ref()
+        .and_then(|s| s.active().ok())
+        .is_some_and(|p| {
+            p.steps
+                .iter()
+                .any(|s| matches!(&s.kind, pipelines::StepKind::Punctuation(pp) if pp.punctuation))
+        });
+    if pipeline_needs_punctuation && !has_punctuation_model {
         ui.set_post_model_download_prompt_visible(true);
     }
     if has_punctuation_model {
@@ -3384,7 +5487,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                     Err(error) => {
                         ui.set_post_model_status(error.into());
-                        if ui.get_post_processing_enabled() && ui.get_post_punctuation() {
+                        if pipeline_needs_punctuation {
                             ui.set_post_model_download_prompt_visible(true);
                             let _ = ui.show();
                         }
@@ -3470,12 +5573,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hotkey_capture_active_for_start = hotkey_capture_active.clone();
     #[cfg(target_os = "windows")]
     let hotkey_capture_latched_for_start = hotkey_capture_latched.clone();
+    #[cfg(target_os = "windows")]
+    let hotkey_capture_assistant_for_start = hotkey_capture_assistant.clone();
 
     ui.on_start_hotkey_capture(move || {
         #[cfg(target_os = "windows")]
         {
             *hotkey_capture_active_for_start.borrow_mut() = true;
             *hotkey_capture_latched_for_start.borrow_mut() = false;
+            hotkey_capture_assistant_for_start.set(false);
             if let Some(capture) = hotkey_capture_window_for_start.upgrade() {
                 capture.set_state_text("Waiting for key combo...".into());
                 capture.set_combo_text("".into());
@@ -3491,6 +5597,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ui) = ui_weak_for_hotkey.upgrade() {
                 ui.set_status_text("Hotkeys are not supported on this platform".into());
                 ui.invoke_request_navigation(2);
+            }
+        }
+    });
+
+    #[cfg(target_os = "windows")]
+    let assistant_capture_active = hotkey_capture_active.clone();
+    #[cfg(target_os = "windows")]
+    let assistant_capture_latched = hotkey_capture_latched.clone();
+    #[cfg(target_os = "windows")]
+    let assistant_capture_target = hotkey_capture_assistant.clone();
+    #[cfg(target_os = "windows")]
+    let assistant_capture_window = hotkey_capture_window.as_weak();
+    ui.on_start_assistant_hotkey_capture(move || {
+        #[cfg(target_os = "windows")]
+        {
+            *assistant_capture_active.borrow_mut() = true;
+            *assistant_capture_latched.borrow_mut() = false;
+            assistant_capture_target.set(true);
+            if let Some(capture) = assistant_capture_window.upgrade() {
+                capture.set_state_text("Waiting for assistant key combo...".into());
+                capture.set_combo_text("".into());
+                let _ = capture.show();
             }
         }
     });
@@ -3511,6 +5639,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hotkey_capture_active_for_timer = hotkey_capture_active.clone();
     #[cfg(target_os = "windows")]
     let hotkey_capture_latched_for_timer = hotkey_capture_latched.clone();
+    #[cfg(target_os = "windows")]
+    let hotkey_capture_assistant_for_timer = hotkey_capture_assistant.clone();
+    #[cfg(target_os = "windows")]
+    let assistant_hotkey_id_for_timer = assistant_hotkey_id_state.clone();
 
     let activity_revision_seen = Rc::new(Cell::new(initial_activity_revision));
 
@@ -3653,11 +5785,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.set_local_repair_pending(false);
                     ui.set_local_download_prompt_visible(true);
                     ui.set_active_tab(3);
-                    ui.set_settings_tab(1);
+                    ui.set_settings_tab(5);
                     let _ = ui.show();
                 }
                 if ui.get_active_tab() == 3
-                    && ui.get_settings_tab() == 1
+                    && ui.get_settings_tab() == 5
                     && matches!(
                         transcription::TranscriptionProvider::from_id(&selected_provider),
                         transcription::TranscriptionProvider::LocalSherpaOnnx
@@ -3729,7 +5861,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(combo) = detect_hotkey_combo() {
                             if !*hotkey_capture_latched_for_timer.borrow() {
                                 *hotkey_capture_latched_for_timer.borrow_mut() = true;
-                                ui.set_hotkey_text(combo.clone().into());
+                                if hotkey_capture_assistant_for_timer.get() {
+                                    ui.set_assistant_hotkey_text(combo.clone().into());
+                                } else {
+                                    ui.set_hotkey_text(combo.clone().into());
+                                }
                                 ui.set_status_text("Hotkey change pending Save settings".into());
                                 if let Some(capture) = hotkey_capture_window_for_timer.upgrade() {
                                     capture.set_state_text("Ready to save".into());
@@ -3744,12 +5880,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+                        if let Some(editor)=graph_ui::hotkey_capture_editor(){
+                            if event.state==HotKeyState::Pressed {
+                                let saved=settings_for_timer.lock().unwrap();
+                                let combo=graph_hotkeys::capture_registered_combo(event.id,*hotkey_id_state.borrow(),*assistant_hotkey_id_for_timer.borrow(),&saved);
+                                if let Some(combo)=combo{editor.set_graph_hotkey(combo.into());editor.set_dirty(true);}
+                            }
+                            continue;
+                        }
+                        if event.state==HotKeyState::Pressed {
+                            if let Some(id)=graph_hotkeys.borrow().registered.iter().find(|(_,key)|key.id()==event.id).map(|(id,_)|id.clone()) {let _=cmd_tx_for_timer.send(AppCommand::ToggleGraph(id));continue;}
+                        }
                         let current_hotkey_id = *hotkey_id_state.borrow();
+                        let assistant_hotkey_id = *assistant_hotkey_id_for_timer.borrow();
                         if current_hotkey_id.is_some_and(|id| event.id == id)
                             && event.state == HotKeyState::Pressed
                         {
                             echo_info!("hotkey", "Global recording hotkey pressed id={}", event.id);
                             let _ = cmd_tx_for_timer.send(AppCommand::ToggleRecording);
+                        } else if assistant_hotkey_id.is_some_and(|id| event.id == id)
+                            && event.state == HotKeyState::Pressed
+                        {
+                            let _ = cmd_tx_for_timer.send(AppCommand::ToggleAssistant);
                         }
                     }
 
@@ -3845,6 +5997,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     echo_info!("app", "Slint event loop starting");
     let event_loop_result = slint::run_event_loop_until_quit();
+    hermes_integration.controller.shutdown();
     transcription::shutdown_local_engine();
     event_loop_result?;
     echo_info!("app", "Slint event loop stopped; Echo exiting cleanly");
@@ -3855,12 +6008,695 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         forward_audio_until_stopped, overlay_caption_text, overlay_size_for_text, parse_hotkey,
-        selected_microphone_for_snapshot, OVERLAY_CAPTION_CHARACTERS, OVERLAY_HEIGHT,
-        OVERLAY_MAX_LINES,
+        selected_microphone_for_snapshot, OVERLAY_HEIGHT, OVERLAY_MAX_LINES,
     };
     use crate::audio::InputDeviceSnapshot;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn assistant_activation_stops_listening_and_restarts_processing() {
+        use super::{recording_activation, RecordingActivation as Action};
+        assert_eq!(recording_activation(None, true), Action::Start);
+        assert_eq!(recording_activation(Some((true, true)), true), Action::Stop);
+        assert_eq!(
+            recording_activation(Some((true, false)), true),
+            Action::Start
+        );
+        assert_eq!(
+            recording_activation(Some((false, false)), true),
+            Action::Ignore
+        );
+        assert_eq!(
+            recording_activation(Some((false, true)), true),
+            Action::Ignore
+        );
+        assert_eq!(
+            recording_activation(Some((false, true)), false),
+            Action::Stop
+        );
+        assert_eq!(
+            recording_activation(Some((false, false)), false),
+            Action::Ignore
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_interrupt_drops_model_request_and_invalidates_queued_speech() {
+        use std::sync::{atomic::AtomicU64, Mutex};
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut settings = super::AppSettings::default();
+        settings
+            .model_registry
+            .connections
+            .push(crate::models::ModelConnection {
+                id: "interruption-test".into(),
+                provider: "openai_compatible".into(),
+                endpoint: format!("http://{address}/v1"),
+                api_key: String::new(),
+                api_version: String::new(),
+                custom_header_name: String::new(),
+                custom_header_value: String::new(),
+                allow_lan_http: false,
+            });
+        let mut model = crate::models::ConfiguredModel::new(
+            "interruption-test".into(),
+            "Test".into(),
+            "test".into(),
+        );
+        model.verified = true;
+        let model_id = model.id.clone();
+        settings.model_registry.models.push(model);
+        let task = tokio::spawn(async move {
+            crate::models::stream(
+                &settings,
+                &model_id,
+                "Answer the request",
+                "request",
+                |_| {},
+            )
+            .await
+        });
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut request = vec![0; 16384];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        let tasks = Mutex::new(vec![task.abort_handle()]);
+        let epoch = AtomicU64::new(1);
+        let conversation = Mutex::new(crate::assistant::Conversation::default());
+        let generation = crate::assistant_voice::playback_generation();
+        super::interrupt_assistant(&mut None, &epoch, None, &tasks, &conversation).await;
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(tasks.lock().unwrap().is_empty());
+        assert_ne!(crate::assistant_voice::playback_generation(), generation);
+        // An old queued sentence must return before loading a voice or audio device.
+        crate::assistant_voice::speak_if_current(
+            "stale sentence",
+            std::path::Path::new("missing-voice"),
+            generation,
+        )
+        .unwrap();
+        // Dropping the model future closes its outstanding HTTP request.
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if socket.read(&mut request).await.unwrap() == 0 {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok());
+    }
+
+    #[test]
+    #[ignore = "native assistant interruption fixture; synthetic microphone, no user settings"]
+    #[allow(clippy::arc_with_non_send_sync)] // Matches the UI-thread session API; this fixture never sends Session across threads.
+    fn assistant_interruption_interactive_fixture() {
+        use slint::{ComponentHandle, Model};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc, Mutex,
+        };
+        let settings = super::AppSettings::default();
+        let p = crate::pipelines::migrate(&settings)
+            .active()
+            .unwrap()
+            .clone();
+        let mut graph = crate::graph::migrate(&p, &settings);
+        for node in &mut graph.nodes {
+            if matches!(node.kind, crate::graph::Kind::TextOutput) {
+                node.kind = crate::graph::Kind::AssistantDisplay;
+            }
+        }
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let task = runtime.spawn(std::future::pending::<()>());
+        let watchdog = runtime.spawn(std::future::pending::<()>());
+        let watchdog_handle = watchdog.abort_handle();
+        let tasks = Arc::new(Mutex::new(vec![task.abort_handle()]));
+        let conversation = Arc::new(Mutex::new(crate::assistant::Conversation::default()));
+        let (generation, reply, _) = conversation
+            .lock()
+            .unwrap()
+            .start_turn("Old request".into());
+        conversation.lock().unwrap().update(
+            generation,
+            reply,
+            "This unfinished response stays visible.".into(),
+            false,
+        );
+        let epoch = Arc::new(AtomicU64::new(7));
+        let discarded = Arc::new(AtomicBool::new(false));
+        let session = Arc::new(Mutex::new(Some(super::Session {
+            assistant: true,
+            discard_assistant_output: discarded.clone(),
+            epoch: 7,
+            state: Arc::new(Mutex::new(crate::state::RecordingState::Finalizing)),
+            audio_capture: None,
+            warm_capture_attached: false,
+            audio_forward_stop_tx: None,
+            network_stop_tx: None,
+            transcript_pipeline: Arc::new(Mutex::new(crate::pipeline::TranscriptPipeline::new())),
+            task_abort_handles: vec![watchdog_handle],
+            finalization_watchdog: Some(watchdog.abort_handle()),
+            text_processing_started: true,
+            _formatting_activity: crate::post_processing::ActivityGuard::acquire().unwrap(),
+        })));
+        let chat = super::AssistantChatWindow::new().unwrap();
+        if let Ok(width) = std::env::var("ECHO_GUI_WIDTH") {
+            chat.set_window_width(width.parse().unwrap());
+        }
+        if let Ok(height) = std::env::var("ECHO_GUI_HEIGHT") {
+            chat.set_window_height(height.parse().unwrap());
+        }
+        if let Ok(scale) = std::env::var("SLINT_SCALE_FACTOR") {
+            let scale: f32 = scale.parse().unwrap();
+            let weak = chat.as_weak();
+            slint::Timer::single_shot(Duration::from_millis(30), move || {
+                let chat = weak.upgrade().unwrap();
+                chat.window()
+                    .dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
+                        scale_factor: scale,
+                    });
+                chat.window().set_size(slint::PhysicalSize::new(
+                    (chat.get_window_width() as f32 * scale).round() as u32,
+                    (chat.get_window_height() as f32 * scale).round() as u32,
+                ));
+            });
+        }
+        chat.present_assistant_state("Receiving…".into());
+        super::refresh_assistant_chat(&chat.as_weak(), &conversation);
+        let weak = chat.as_weak();
+        let callback_conversation = conversation.clone();
+        let callback_runtime = runtime.clone();
+        let callback_session = session.clone();
+        let callback_discarded = discarded.clone();
+        chat.on_start_listening(move || {
+            callback_runtime.block_on(super::interrupt_assistant(
+                &mut callback_session.lock().unwrap(),
+                &epoch,
+                None,
+                &tasks,
+                &callback_conversation,
+            ));
+            assert!(callback_session.lock().unwrap().is_none());
+            assert!(callback_discarded.load(Ordering::SeqCst));
+            callback_conversation.lock().unwrap().update(
+                generation,
+                reply,
+                "STALE RESULT".into(),
+                true,
+            );
+            if let Some(chat) = weak.upgrade() {
+                super::begin_assistant_graph_listening(&chat, &graph, &settings);
+                super::refresh_assistant_chat(&weak, &callback_conversation);
+                chat.set_live_transcript("This is my new spoken request.".into());
+            }
+        });
+        let weak = chat.as_weak();
+        let submit_conversation = conversation.clone();
+        chat.on_submit(move |text| {
+            let mut conv = submit_conversation.lock().unwrap();
+            let (generation, reply, context) = conv.start_turn(text.to_string());
+            assert!(!context.contains("unfinished response"));
+            conv.update(
+                generation,
+                reply,
+                "The new request completed successfully.".into(),
+                true,
+            );
+            drop(conv);
+            super::refresh_assistant_chat(&weak, &submit_conversation);
+            if let Some(chat) = weak.upgrade() {
+                chat.present_listening(false);
+                chat.set_live_transcript("".into());
+                chat.present_assistant_state("Ready".into());
+            }
+        });
+        if std::env::var_os("ECHO_ASSISTANT_INTERRUPT_INSPECT").is_none() {
+            let weak = chat.as_weak();
+            slint::Timer::single_shot(Duration::from_millis(100), move || {
+                let chat = weak.upgrade().unwrap();
+                chat.invoke_start_listening();
+                let weak = chat.as_weak();
+                slint::Timer::single_shot(Duration::from_millis(100), move || {
+                    let chat = weak.upgrade().unwrap();
+                    assert!(chat.get_listening());
+                    assert_eq!(chat.get_assistant_state(), "Listening…");
+                    assert!(chat.get_messages().iter().any(|m| m.state == "Interrupted"));
+                    assert!(!chat.get_messages().iter().any(|m| m.text == "STALE RESULT"));
+                    if let Some(path) = std::env::var_os("ECHO_GUI_SNAPSHOT_PATH") {
+                        let pixels = chat.window().take_snapshot().unwrap();
+                        image::save_buffer(
+                            path,
+                            pixels.as_bytes(),
+                            pixels.width(),
+                            pixels.height(),
+                            image::ColorType::Rgba8,
+                        )
+                        .unwrap();
+                    }
+                    chat.invoke_submit("New request".into());
+                    slint::Timer::single_shot(Duration::from_millis(100), || {
+                        let _ = slint::quit_event_loop();
+                    });
+                });
+            });
+        }
+        chat.run().unwrap();
+        assert!(runtime.block_on(task).unwrap_err().is_cancelled());
+        assert!(runtime.block_on(watchdog).unwrap_err().is_cancelled());
+        assert!(conversation
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.interrupted));
+        assert!(chat
+            .get_messages()
+            .iter()
+            .any(|m| m.text == "The new request completed successfully."));
+        chat.hide().unwrap();
+    }
+
+    #[test]
+    #[ignore = "isolated Slint graph run; verifies speech failure remains visible beside delivered text"]
+    fn graph_chat_reports_speech_failure() {
+        use slint::{ComponentHandle, Model};
+        use std::sync::{Arc, Mutex};
+        let settings = super::AppSettings::default();
+        let p = crate::pipelines::migrate(&settings)
+            .active()
+            .unwrap()
+            .clone();
+        let mut graph = crate::graph::migrate(&p, &settings);
+        graph.nodes.retain(|n| n.transcription());
+        graph.edges.clear();
+        let source = graph.nodes[0].id.clone();
+        let display = crate::graph::Node::new(crate::graph::Kind::AssistantDisplay, 0., 0.);
+        let display_id = display.id.clone();
+        graph.nodes.push(display);
+        graph.connect(&source, "text", &display_id, "text").unwrap();
+        let speech = crate::graph::Node::new(
+            crate::graph::Kind::Speech {
+                voice: "missing-test-voice.wav".into(),
+                preload: false,
+            },
+            0.,
+            0.,
+        );
+        let speech_id = speech.id.clone();
+        graph.nodes.push(speech);
+        graph.connect(&source, "text", &speech_id, "text").unwrap();
+        let main = super::AppWindow::new().unwrap();
+        let chat = super::AssistantChatWindow::new().unwrap();
+        let conversation = Arc::new(Mutex::new(crate::assistant::Conversation::default()));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let outcome = runtime
+            .block_on(super::run_graph_chat(
+                &graph,
+                "Hi".into(),
+                &settings,
+                chat.as_weak(),
+                conversation,
+                main.as_weak(),
+                Arc::new(|| false),
+                Arc::new(|_| {}),
+            ))
+            .unwrap();
+        assert_eq!(outcome.text, "Hi");
+        assert_eq!(outcome.errors.len(), 1);
+        slint::Timer::single_shot(std::time::Duration::from_millis(100), || {
+            let _ = slint::quit_event_loop();
+        });
+        slint::run_event_loop().unwrap();
+        assert!(chat.get_speech_status().starts_with("Speech failed:"));
+        assert!(chat
+            .get_assistant_state()
+            .starts_with("Completed with node errors:"));
+        assert!(chat
+            .get_graph_run_nodes()
+            .iter()
+            .any(|row| row.id.as_str() == speech_id && row.state == "Failed"));
+        assert!(chat
+            .get_messages()
+            .iter()
+            .any(|message| !message.from_user && message.text == "Hi"));
+        chat.hide().unwrap();
+    }
+    #[test]
+    fn assistant_output_detection_ignores_disconnected_nodes() {
+        let settings = super::AppSettings::default();
+        let p = crate::pipelines::migrate(&settings)
+            .active()
+            .unwrap()
+            .clone();
+        let mut graph = crate::graph::migrate(&p, &settings);
+        let display = crate::graph::Node::new(crate::graph::Kind::AssistantDisplay, 0., 0.);
+        let id = display.id.clone();
+        graph.nodes.push(display);
+        assert!(!super::graph_uses_assistant(&graph));
+        let source = graph
+            .nodes
+            .iter()
+            .find(|n| n.transcription())
+            .unwrap()
+            .id
+            .clone();
+        graph.connect(&source, "text", &id, "text").unwrap();
+        assert!(super::graph_uses_assistant(&graph));
+    }
+    #[test]
+    #[ignore = "isolated destination window routing; synthetic transcription, no microphone"]
+    fn pipeline_destination_selects_transcription_window_smoke() {
+        use slint::ComponentHandle;
+        let settings = super::AppSettings::default();
+        let mut pipeline = crate::pipelines::migrate(&settings)
+            .active()
+            .unwrap()
+            .clone();
+        pipeline.graph = Some(crate::graph::migrate(&pipeline, &settings));
+        let overlay = super::TranscriptOverlayWindow::new().unwrap();
+        let chat = super::AssistantChatWindow::new().unwrap();
+        assert!(!super::graph_uses_assistant(
+            pipeline.graph.as_ref().unwrap()
+        ));
+        super::prepare_transcription_overlay(&overlay, &pipeline, "Synthetic microphone", false);
+        assert!(overlay.window().is_visible());
+        assert!(overlay.get_is_visible());
+        assert!(!chat.window().is_visible());
+
+        let graph = pipeline.graph.as_mut().unwrap();
+        let ending = graph
+            .nodes
+            .iter_mut()
+            .find(|n| matches!(n.kind, crate::graph::Kind::TextOutput))
+            .unwrap();
+        ending.kind = crate::graph::Kind::AssistantDisplay;
+        let assistant = super::graph_uses_assistant(graph);
+        assert!(assistant);
+        super::begin_assistant_graph_listening(&chat, graph, &settings);
+        super::prepare_transcription_overlay(
+            &overlay,
+            &pipeline,
+            "Synthetic microphone",
+            assistant,
+        );
+        assert!(chat.window().is_visible());
+        assert!(chat.get_listening());
+        assert!(!overlay.window().is_visible());
+        assert!(!overlay.get_is_visible());
+        chat.set_live_transcript("The first sentence appears in the assistant board.".into());
+
+        // Optional MCP inspection exercises the same startup policy as recording.
+        if let Ok(destination) = std::env::var("ECHO_TRANSCRIPTION_UI_INSPECT") {
+            if destination == "text" {
+                for node in &mut pipeline.graph.as_mut().unwrap().nodes {
+                    if matches!(node.kind, crate::graph::Kind::AssistantDisplay) {
+                        node.kind = crate::graph::Kind::TextOutput;
+                    }
+                }
+                super::prepare_transcription_overlay(
+                    &overlay,
+                    &pipeline,
+                    "Synthetic microphone",
+                    false,
+                );
+                chat.hide().unwrap();
+                overlay.set_sentence_text(
+                    "The first sentence appears in the transcription overlay.".into(),
+                );
+            }
+            slint::run_event_loop().unwrap();
+        }
+        overlay.hide().unwrap();
+        chat.hide().unwrap();
+    }
+    #[test]
+    #[ignore = "isolated first-sentence geometry and assistant recording startup; no microphone"]
+    fn first_sentence_and_assistant_start_smoke() {
+        use slint::{ComponentHandle, Model};
+        let settings = super::AppSettings::default();
+        let p = crate::pipelines::migrate(&settings)
+            .active()
+            .unwrap()
+            .clone();
+        let graph = crate::graph::migrate(&p, &settings);
+        let chat = super::AssistantChatWindow::new().unwrap();
+        super::begin_assistant_graph_listening(&chat, &graph, &settings);
+        assert!(chat.get_listening());
+        assert!(chat.window().is_visible());
+        assert_eq!(chat.get_assistant_state(), "Listening…");
+        assert!(chat
+            .get_graph_progress_nodes()
+            .iter()
+            .any(|n| n.state == "Running"));
+        let first =
+            "This is the first sentence, with several wide words WWWWWW WWWWWW WWWWWW WWWWWW.";
+        chat.set_live_transcript(first.into());
+        chat.invoke_scroll_bottom();
+        assert_eq!(chat.get_live_transcript(), first);
+        let overlay = super::TranscriptOverlayWindow::new().unwrap();
+        overlay.set_graph_run_nodes(super::graph_run_rows(&graph, true));
+        overlay.set_graph_progress_nodes(super::graph_progress_rows(
+            &overlay.get_graph_run_nodes(),
+            0,
+        ));
+        overlay.set_sentence_text(first.into());
+        super::set_overlay_height(&overlay, super::OVERLAY_HEIGHT);
+        assert!(overlay.get_window_height() >= overlay.get_caption_required_height().ceil() as i32);
+        assert!(overlay.window().size().height >= overlay.get_window_height() as u32);
+        overlay.show().unwrap();
+        let image = overlay.window().take_snapshot().unwrap();
+        assert!(image.height() >= overlay.get_caption_required_height().ceil() as u32);
+        overlay.hide().unwrap();
+        chat.hide().unwrap();
+    }
+    #[test]
+    fn progress_window_advances_through_fifteen_nodes() {
+        use slint::{Model, ModelRc, VecModel};
+        for current in 0..15 {
+            let rows = ModelRc::new(VecModel::from(
+                (0..15)
+                    .map(|i| super::GraphRunRow {
+                        id: i.to_string().into(),
+                        title: format!("Node {}", i + 1).into(),
+                        state: if i < current {
+                            "Complete"
+                        } else if i == current {
+                            "Running"
+                        } else {
+                            "Waiting"
+                        }
+                        .into(),
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+            let visible = super::graph_progress_rows(&rows, current);
+            let expected: Vec<_> = ((current - 1).max(0)..=(current + 2).min(14))
+                .map(|i| i.to_string())
+                .collect();
+            assert_eq!(
+                visible
+                    .iter()
+                    .map(|row| row.id.to_string())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(visible.row_count() <= 4);
+            assert_eq!(
+                visible.iter().filter(|row| row.state == "Running").count(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn progress_window_omits_skipped_branches_and_duplicate_current() {
+        use slint::{Model, ModelRc, VecModel};
+        let rows = ModelRc::new(VecModel::from(
+            [
+                "Complete", "Skipped", "Running", "Skipped", "Waiting", "Blocked", "Waiting",
+            ]
+            .iter()
+            .enumerate()
+            .map(|(i, state)| super::GraphRunRow {
+                id: i.to_string().into(),
+                title: "Node".into(),
+                state: (*state).into(),
+            })
+            .collect::<Vec<_>>(),
+        ));
+        assert_eq!(
+            super::graph_progress_rows(&rows, 2)
+                .iter()
+                .map(|row| row.id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["0", "2", "4", "6"]
+        );
+        assert_eq!(
+            super::graph_progress_rows(&ModelRc::default(), 99).row_count(),
+            0
+        );
+        let last = super::graph_progress_rows(&rows, 99);
+        assert_eq!(
+            last.iter()
+                .map(|row| row.id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["0", "6"]
+        );
+    }
+    #[test]
+    fn speech_notice_requires_connected_output() {
+        let mut settings = super::AppSettings::default();
+        let p = crate::pipelines::migrate(&settings)
+            .active()
+            .unwrap()
+            .clone();
+        let mut graph = crate::graph::migrate(&p, &settings);
+        assert!(super::graph_speech_status(&graph, &settings).starts_with("Speech off:"));
+        let speech = crate::graph::Node::new(
+            crate::graph::Kind::Speech {
+                voice: crate::voices::FOLLOW_DEFAULT.into(),
+                preload: false,
+            },
+            0.,
+            0.,
+        );
+        let id = speech.id.clone();
+        graph.nodes.push(speech);
+        assert!(super::graph_speech_status(&graph, &settings).starts_with("Speech off:"));
+        let source = graph
+            .nodes
+            .iter()
+            .find(|n| n.transcription())
+            .unwrap()
+            .id
+            .clone();
+        graph.connect(&source, "text", &id, "text").unwrap();
+        if crate::assistant_voice::installed() {
+            assert!(super::graph_speech_status(&graph, &settings).is_empty());
+            settings.tts_voice_path = "missing-settings-default-voice.safetensors".into();
+            assert!(
+                super::graph_speech_status(&graph, &settings).starts_with("Speech setup needed:")
+            );
+            settings.tts_voice_path.clear();
+        } else {
+            assert!(
+                super::graph_speech_status(&graph, &settings).starts_with("Speech setup needed:")
+            );
+        }
+        if let crate::graph::Kind::Speech { voice, .. } = &mut graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == id)
+            .unwrap()
+            .kind
+        {
+            *voice = "missing-custom-voice.wav".into();
+        }
+        assert!(super::graph_speech_status(&graph, &settings).starts_with("Speech setup needed:"));
+    }
+    #[test]
+    #[ignore = "isolated Slint graph progress models and adaptive overlay geometry"]
+    fn graph_feedback_smoke() {
+        use slint::{ComponentHandle, Model, ModelRc, VecModel};
+        let overlay = super::TranscriptOverlayWindow::new().unwrap();
+        overlay.set_sentence_text("Hi".into());
+        super::set_overlay_height(&overlay, super::overlay_size_for_text("Hi").1);
+        assert!(overlay.get_window_height() >= overlay.get_caption_required_height().ceil() as i32);
+        let rows = ModelRc::new(VecModel::from(vec![
+            super::GraphRunRow {
+                id: "first".into(),
+                title: "Text".into(),
+                state: "Waiting".into(),
+            },
+            super::GraphRunRow {
+                id: "second".into(),
+                title: "Text".into(),
+                state: "Waiting".into(),
+            },
+        ]));
+        overlay.set_graph_run_nodes(rows.clone());
+        overlay.set_graph_progress_nodes(super::graph_progress_rows(&rows, 0));
+        super::set_overlay_height(&overlay, super::overlay_size_for_text("Hi").1);
+        assert!(overlay.get_window_height() >= overlay.get_caption_required_height().ceil() as i32);
+        super::update_graph_run_state(&rows, "second", "Running");
+        assert_eq!(rows.row_data(0).unwrap().state, "Waiting");
+        assert_eq!(rows.row_data(1).unwrap().state, "Running");
+        overlay.show().unwrap();
+        let snapshot = overlay.window().take_snapshot().unwrap();
+        assert!(snapshot.height() >= 152);
+        overlay.hide().unwrap();
+    }
+    #[test]
+    #[ignore = "isolated speaker settings persistence and device refresh; no audio"]
+    fn speaker_settings_ui_smoke() {
+        use slint::ComponentHandle;
+        let ui = super::AppWindow::new().unwrap();
+        let mut saved = super::AppSettings::default();
+        saved.normalize_transcription_settings();
+        super::populate_settings_editor(&ui, &saved);
+        let snapshot = super::assistant_voice::OutputDeviceSnapshot {
+            devices: vec!["Speakers A".into(), "Headphones B".into()],
+            default_device: Some("Speakers A".into()),
+        };
+        super::synchronize_speaker_editor(&ui, &snapshot, true);
+        assert_eq!(ui.get_selected_speaker(), "Speakers A");
+        assert!(!super::settings_editor_is_dirty(&ui, &saved));
+        ui.set_use_default_speaker(false);
+        ui.set_selected_speaker("Headphones B".into());
+        ui.set_output_volume(0.35);
+        super::synchronize_speaker_editor(&ui, &snapshot, false);
+        assert_eq!(ui.get_selected_speaker(), "Headphones B");
+        assert!(super::settings_editor_is_dirty(&ui, &saved));
+        let draft = super::settings_snapshot_from_ui(&ui, &saved);
+        assert_eq!(draft.selected_speaker, "Headphones B");
+        assert!(!draft.use_default_speaker);
+        assert_eq!(draft.output_volume, 0.35);
+        let restored: super::AppSettings =
+            serde_json::from_str(&serde_json::to_string(&draft).unwrap()).unwrap();
+        super::populate_settings_editor(&ui, &restored);
+        assert_eq!(ui.get_selected_speaker(), "Headphones B");
+        assert!(!ui.get_use_default_speaker());
+        assert_eq!(ui.get_output_volume(), 0.35);
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    #[ignore = "isolated TTS defaults persistence; no audio or network"]
+    fn tts_settings_ui_smoke() {
+        use slint::ComponentHandle;
+        let ui = super::AppWindow::new().unwrap();
+        let mut saved = super::AppSettings::default();
+        saved.normalize_transcription_settings();
+        super::populate_settings_editor(&ui, &saved);
+        assert!(!super::settings_editor_is_dirty(&ui, &saved));
+        let voice = super::AssistantPipelineWindow::new().unwrap();
+        super::install_tts_settings_entrypoint(&ui, &voice);
+        ui.invoke_configure_tts();
+        assert_eq!(voice.get_configuration_role(), 4);
+        assert!(voice.get_default_voice_settings());
+        voice.set_voice_path("C:/Echo/default-voice.wav".into());
+        voice.set_preload_voice_on_start(true);
+        voice.invoke_save();
+        assert_eq!(ui.get_tts_voice_path(), "C:/Echo/default-voice.wav");
+        assert!(ui.get_tts_preload());
+        ui.set_tts_preload(true);
+        ui.set_hugging_face_token_text("test-token".into());
+        assert!(super::settings_editor_is_dirty(&ui, &saved));
+        let draft = super::settings_snapshot_from_ui(&ui, &saved);
+        assert_eq!(draft.tts_voice_path, "C:/Echo/default-voice.wav");
+        assert!(draft.tts_preload);
+        assert_eq!(draft.hugging_face_token, "test-token");
+        super::populate_settings_editor(&ui, &saved);
+        assert_eq!(ui.get_tts_voice_path(), "");
+        assert!(!ui.get_tts_preload());
+        assert!(!super::settings_editor_is_dirty(&ui, &saved));
+        ui.hide().unwrap();
+    }
 
     #[test]
     #[ignore = "opens an isolated settings window; no recording, network, or user settings writes"]
@@ -3898,7 +6734,7 @@ mod tests {
         let weak = ui.as_weak();
         slint::Timer::single_shot(Duration::from_millis(500), move || {
             let ui = weak.upgrade().unwrap();
-            for tab in 0..=4 {
+            for tab in 0..=6 {
                 ui.set_settings_tab(tab);
                 let pixels = ui.window().take_snapshot().unwrap();
                 assert!(pixels.width() >= 760 && pixels.height() >= 600);
@@ -3980,7 +6816,7 @@ mod tests {
         );
         ui.set_local_engine_status_text("Ready".into());
         ui.set_active_tab(3);
-        ui.set_settings_tab(1);
+        ui.set_settings_tab(5);
         ui.window().set_size(slint::PhysicalSize::new(1000, 1050));
         ui.show().unwrap();
         let weak = ui.as_weak();
@@ -4002,7 +6838,7 @@ mod tests {
                 "echo-ultra-install.bmp",
             );
             ui.set_local_download_prompt_visible(false);
-            for tab in 0..=4 {
+            for tab in 0..=6 {
                 ui.set_settings_tab(tab);
                 let pixels = ui.window().take_snapshot().unwrap();
                 assert!(pixels.width() >= 760 && pixels.height() >= 600);
@@ -4116,6 +6952,150 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "native Skia assistant scrolling with synthetic streaming history; no services"]
+    fn assistant_history_scroll_survives_stream_updates_ui_smoke() {
+        use slint::ComponentHandle;
+        super::select_ui_backend().unwrap();
+        let chat = super::AssistantChatWindow::new().unwrap();
+        let conversation = std::sync::Arc::new(std::sync::Mutex::new(
+            super::assistant::Conversation::default(),
+        ));
+        let mut latest = (0, 0);
+        for i in 0..100 {
+            let mut conversation = conversation.lock().unwrap();
+            let (generation, reply, _) = conversation.start_turn(format!("Synthetic question {i}"));
+            conversation.update(
+                generation,
+                reply,
+                "A bounded synthetic answer for the scrolling test. ".repeat(12),
+                true,
+            );
+            latest = (generation, reply);
+        }
+        chat.show().unwrap();
+        super::refresh_assistant_chat(&chat.as_weak(), &conversation);
+        let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let output = result.clone();
+        let weak = chat.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_millis(500), move || {
+            let chat = weak.upgrade().unwrap();
+            let phase = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                chat.invoke_scroll_bottom();
+                let _ = chat.window().take_snapshot().unwrap();
+                chat.invoke_scroll_bottom();
+                let start = std::time::Instant::now();
+                for _ in 0..30 {
+                    chat.window()
+                        .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                            position: slint::LogicalPosition::new(150.0, 350.0),
+                            delta_x: 0.0,
+                            delta_y: 120.0,
+                        });
+                    let _ = chat.window().take_snapshot().unwrap();
+                }
+                println!(
+                    "Assistant history wheel-to-snapshot mean: {:.2} ms",
+                    start.elapsed().as_secs_f64() * 1000.0 / 30.0
+                );
+                assert!(
+                    !chat.get_chat_at_bottom(),
+                    "The user must be able to scroll away from the streaming tail"
+                );
+                chat.get_chat_scroll_position()
+            }));
+            let scroll = match phase {
+                Ok(scroll) => scroll,
+                Err(error) => {
+                    *output.borrow_mut() = Some(Err(error));
+                    let _ = chat.hide();
+                    let _ = slint::quit_event_loop();
+                    return;
+                }
+            };
+            conversation.lock().unwrap().update(
+                latest.0,
+                latest.1,
+                "More streamed text. ".repeat(60),
+                true,
+            );
+            super::refresh_assistant_chat(&chat.as_weak(), &conversation);
+            let weak = chat.as_weak();
+            slint::Timer::single_shot(std::time::Duration::from_millis(150), move || {
+                let chat = weak.upgrade().unwrap();
+                *output.borrow_mut() = Some(std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| {
+                        assert!(
+                            (chat.get_chat_scroll_position() - scroll).abs() < 2.0,
+                            "A streamed update must not move the user's reading position"
+                        );
+                        assert!(!chat.get_chat_at_bottom());
+                    }),
+                ));
+                let _ = chat.hide();
+                let _ = slint::quit_event_loop();
+            });
+        });
+        slint::run_event_loop_until_quit().unwrap();
+        if let Some(Err(error)) = result.borrow_mut().take() {
+            std::panic::resume_unwind(error);
+        };
+    }
+
+    #[test]
+    #[ignore = "isolated live-message layout and automatic following; no microphone or services"]
+    fn assistant_live_message_follows_recording_in_history() {
+        use slint::ComponentHandle;
+        let chat = super::AssistantChatWindow::new().unwrap();
+        let hermes = std::env::var_os("ECHO_GUI_HERMES").is_some();
+        chat.set_hermes_mode(hermes);
+        chat.set_rich_blocks(slint::ModelRc::new(slint::VecModel::from(
+            (0..100)
+                .map(|i| crate::RichMessageBlock {
+                    id: i.to_string().into(),
+                    text: slint::StyledText::from_plain_text(
+                        format!("Earlier message {i}. ").repeat(20).as_str(),
+                    ),
+                    first: true,
+                    last: true,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )));
+        chat.set_messages(slint::ModelRc::new(slint::VecModel::from(
+            (0..100)
+                .map(|i| crate::AssistantMessage {
+                    text: format!("Earlier message {i}. ").repeat(20).into(),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )));
+        chat.show().unwrap();
+        let _ = chat.window().take_snapshot().unwrap();
+        chat.set_hermes_scroll_position(0.0);
+        chat.set_listening(true);
+        chat.set_live_transcript("This is the first sentence of my new message.".into());
+        let _ = chat.window().take_snapshot().unwrap();
+        let _ = chat.window().take_snapshot().unwrap();
+        assert!(if hermes {
+            chat.get_hermes_at_bottom()
+        } else {
+            chat.get_chat_at_bottom()
+        });
+        chat.set_live_transcript("A longer live message with Unicode 🐈. ".repeat(150).into());
+        let _ = chat.window().take_snapshot().unwrap();
+        let _ = chat.window().take_snapshot().unwrap();
+        assert!(if hermes {
+            chat.get_hermes_at_bottom()
+        } else {
+            chat.get_chat_at_bottom()
+        });
+        chat.set_listening(false);
+        chat.set_live_transcript("".into());
+        let _ = chat.window().take_snapshot().unwrap();
+        chat.hide().unwrap();
+    }
+
+    #[test]
     #[ignore = "isolated 1000-line Activity selection/scroll performance check"]
     fn activity_console_performance_smoke() {
         use slint::ComponentHandle;
@@ -4221,6 +7201,13 @@ mod tests {
     fn redesigned_ui_smoke() {
         use slint::ComponentHandle;
         let ui = super::AppWindow::new().unwrap();
+        ui.set_local_model_options(slint::ModelRc::new(slint::VecModel::from(
+            super::transcription::LocalModel::ALL
+                .into_iter()
+                .map(|model| slint::SharedString::from(model.label()))
+                .collect::<Vec<_>>(),
+        )));
+
         let navigated = std::rc::Rc::new(std::cell::Cell::new(-1));
         let outcome = std::rc::Rc::new(std::cell::RefCell::new(None));
         let timer_outcome = outcome.clone();
@@ -4255,7 +7242,7 @@ mod tests {
                 {
                     for tab in [0, 2, 3] {
                         ui.set_active_tab(tab);
-                        let pages = if tab == 3 { 5 } else { 1 };
+                        let pages = if tab == 3 { 7 } else { 1 };
                         for page in 0..pages {
                             ui.set_settings_tab(page);
                             let pixels = ui.window().take_snapshot().unwrap();
@@ -4275,15 +7262,12 @@ mod tests {
                 ui.set_unsaved_settings_prompt_visible(true);
                 #[cfg(windows)]
                 {
-                    use windows::{
-                        core::w,
-                        Win32::{
-                            Foundation::{LPARAM, WPARAM},
-                            UI::WindowsAndMessaging::*,
-                        },
+                    use windows::Win32::{
+                        Foundation::{LPARAM, WPARAM},
+                        UI::WindowsAndMessaging::*,
                     };
                     let icons = super::icon_animation::Icons::load().unwrap();
-                    let hwnd = unsafe { FindWindowW(None, w!("Echo")) };
+                    let hwnd = super::icon_animation::main_window();
                     assert_ne!(hwnd.0, 0);
                     let mut previous = 0;
                     for frame in icons.frames.iter().chain(std::iter::once(&icons.idle)) {
@@ -4395,10 +7379,10 @@ mod tests {
                 );
                 ui.window()
                     .dispatch_event(slint::platform::WindowEvent::PointerMoved {
-                        position: slint::LogicalPosition::new(width as f32 - 20.0, 16.0),
+                        position: slint::LogicalPosition::new(25.0, height as f32 - 13.0),
                     });
                 for pressed in [true, false] {
-                    let position = slint::LogicalPosition::new(width as f32 - 20.0, 16.0);
+                    let position = slint::LogicalPosition::new(25.0, height as f32 - 13.0);
                     let button = slint::platform::PointerEventButton::Left;
                     ui.window().dispatch_event(if pressed {
                         slint::platform::WindowEvent::PointerPressed { position, button }
@@ -4637,23 +7621,23 @@ mod tests {
     }
 
     #[test]
-    fn overlay_shows_the_latest_words_within_the_six_line_limit() {
+    fn overlay_retains_the_first_sentence_and_full_transcript() {
         let transcript = (0..80)
             .map(|index| format!("word{index}"))
             .collect::<Vec<_>>()
             .join(" ");
         let caption = overlay_caption_text(&transcript);
 
-        assert!(caption.starts_with('…'));
+        assert_eq!(caption, transcript);
+        assert!(caption.starts_with("word0"));
         assert!(caption.ends_with("word79"));
-        assert!(caption.chars().count() <= OVERLAY_CAPTION_CHARACTERS + 1);
     }
 
     #[test]
     fn overlay_height_grows_to_six_lines_and_stops() {
         assert_eq!(overlay_size_for_text("short").1, OVERLAY_HEIGHT);
 
-        let long_caption = "x".repeat(OVERLAY_CAPTION_CHARACTERS * 2);
+        let long_caption = "x".repeat(OVERLAY_MAX_LINES * 62 * 2);
         assert_eq!(
             overlay_size_for_text(&long_caption).1,
             86 + OVERLAY_MAX_LINES as i32 * 20
@@ -4681,3 +7665,60 @@ mod tests {
         assert!(capture_tx.send(vec![4]).await.is_err());
     }
 }
+
+thread_local! {static AGENT_APPROVAL_WINDOWS:RefCell<Vec<AgentApprovalWindow>>=const{RefCell::new(Vec::new())};}
+fn show_agent_approval(request: Arc<agent_tools::Approval>) {
+    let _ = slint::invoke_from_event_loop(move || {
+        if (request.cancelled)() {
+            return;
+        }
+        let Ok(window) = AgentApprovalWindow::new() else {
+            return;
+        };
+        window.set_action_text(request.description.clone().into());
+        window.set_scope_label(request.scope_label.clone().into());
+        let weak = window.as_weak();
+        let approval = request.clone();
+        window.on_decide(move |accepted, scope| {
+            if !(approval.cancelled)() {
+                if let Some(tx) = approval.reply.lock().unwrap().take() {
+                    let _ = tx.send(agent_tools::Decision {
+                        allow: accepted,
+                        scope,
+                    });
+                }
+            }
+            if let Some(window) = weak.upgrade() {
+                let _ = window.hide();
+            }
+        });
+        let approval = request.clone();
+        window.window().on_close_requested(move || {
+            if let Some(tx) = approval.reply.lock().unwrap().take() {
+                let _ = tx.send(agent_tools::Decision::default());
+            }
+            CloseRequestResponse::HideWindow
+        });
+        let _ = window.show();
+        AGENT_APPROVAL_WINDOWS.with(|windows| {
+            windows
+                .borrow_mut()
+                .retain(|window| window.window().is_visible());
+            windows.borrow_mut().push(window.clone_strong());
+        });
+        fn poll(window: slint::Weak<AgentApprovalWindow>, request: Arc<agent_tools::Approval>) {
+            slint::Timer::single_shot(std::time::Duration::from_millis(30), move || {
+                if (request.cancelled)() {
+                    request.reply.lock().unwrap().take();
+                    if let Some(window) = window.upgrade() {
+                        let _ = window.hide();
+                    }
+                } else if request.reply.lock().unwrap().is_some() {
+                    poll(window, request);
+                }
+            });
+        }
+        poll(window.as_weak(), request);
+    });
+}
+mod codex_import;

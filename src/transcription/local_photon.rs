@@ -274,6 +274,16 @@ fn safe_relative(name: &str) -> Result<PathBuf, String> {
 }
 
 fn verify_file(path: &Path, size: u64, hash: &str) -> Result<(), String> {
+    let mut buffer = vec![0; 1024 * 1024];
+    verify_file_with_buffer(path, size, hash, &mut buffer)
+}
+
+fn verify_file_with_buffer(
+    path: &Path,
+    size: u64,
+    hash: &str,
+    buffer: &mut [u8],
+) -> Result<(), String> {
     let mut file = std::fs::File::open(path)
         .map_err(|_| "GPU speech files are missing. Download and install to repair.".to_string())?;
     if file.metadata().map_err(|err| err.to_string())?.len() != size {
@@ -282,9 +292,8 @@ fn verify_file(path: &Path, size: u64, hash: &str) -> Result<(), String> {
         );
     }
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0; 1024 * 1024];
     loop {
-        let count = file.read(&mut buffer).map_err(|err| err.to_string())?;
+        let count = file.read(buffer).map_err(|err| err.to_string())?;
         if count == 0 {
             break;
         }
@@ -299,14 +308,41 @@ fn verify_file(path: &Path, size: u64, hash: &str) -> Result<(), String> {
 }
 
 fn verify_runtime(path: &Path, runtime: &RuntimeManifest) -> Result<(), String> {
-    for file in &runtime.files {
-        verify_file(
-            &path.join(safe_relative(&file.path)?),
-            file.size,
-            &file.sha256,
-        )?;
-    }
-    Ok(())
+    // Thousands of small Python files make serial opens expensive on a cold
+    // Windows file cache. Bound I/O concurrency and reuse one buffer per worker;
+    // every byte still passes the same size and SHA-256 checks on every load.
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(4)
+        .min(runtime.files.len());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut buffer = vec![0; 1024 * 1024];
+                    while let Some(file) = runtime
+                        .files
+                        .get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                    {
+                        verify_file_with_buffer(
+                            &path.join(safe_relative(&file.path)?),
+                            file.size,
+                            &file.sha256,
+                            &mut buffer,
+                        )?;
+                    }
+                    Ok::<(), String>(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| "GPU runtime verification worker failed".to_string())??;
+        }
+        Ok(())
+    })
 }
 
 fn activate(staged: &Path, target: &Path) -> Result<(), String> {
@@ -793,12 +829,24 @@ impl PhotonEngine {
         let model = model_root();
         if std::env::var_os("ECHO_ULTRA_RUNTIME_DIR").is_none() {
             crate::echo_info!("local_model", "Ultra verifying GPU runtime files");
+            let verification_started = Instant::now();
             verify_runtime(&runtime, &installed_manifest()?)?;
+            crate::echo_info!(
+                "local_model",
+                "Ultra runtime verification completed in {:.1}s",
+                verification_started.elapsed().as_secs_f32()
+            );
         }
         crate::echo_info!("local_model", "Ultra verifying model files");
+        let verification_started = Instant::now();
         for (name, size, hash) in MODEL_FILES {
             verify_file(&model.join(name), size, hash)?;
         }
+        crate::echo_info!(
+            "local_model",
+            "Ultra model verification completed in {:.1}s",
+            verification_started.elapsed().as_secs_f32()
+        );
         crate::echo_info!(
             "local_model",
             "Ultra file verification completed in {:.1}s; loading GPU model",
@@ -1183,6 +1231,40 @@ mod tests {
         assert!(!engine.is_healthy());
     }
     #[test]
+    #[ignore = "requires installed Ultra files; reads all checksummed runtime and model bytes"]
+    fn installed_ultra_verification_timing() {
+        let runtime = installed_manifest().unwrap();
+        let started = Instant::now();
+        for file in &runtime.files {
+            verify_file(
+                &runtime_root().join(safe_relative(&file.path).unwrap()),
+                file.size,
+                &file.sha256,
+            )
+            .unwrap();
+        }
+        eprintln!(
+            "Ultra serial runtime verification: {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+        let started = Instant::now();
+        verify_runtime(&runtime_root(), &runtime).unwrap();
+        eprintln!(
+            "Ultra runtime verification: {:.3}s ({} files)",
+            started.elapsed().as_secs_f64(),
+            runtime.files.len()
+        );
+        let started = Instant::now();
+        for (name, size, hash) in MODEL_FILES {
+            verify_file(&model_root().join(name), size, hash).unwrap();
+        }
+        eprintln!(
+            "Ultra model verification: {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    #[test]
     fn protocol_round_trip_and_rejects_oversized_frames() {
         let mut bytes = Vec::new();
         let mut frame = Frame::new(42, "audio");
@@ -1237,6 +1319,56 @@ mod tests {
         runtime.files[0].sha256 = "a".repeat(64);
         runtime.sha256 = "x".repeat(64);
         assert!(parse_manifest(&serde_json::to_string(&runtime).unwrap()).is_err());
+    }
+
+    #[test]
+    fn parallel_runtime_verification_checks_every_file_and_reused_buffer() {
+        let work = std::env::temp_dir().join(format!(
+            "echo-ultra-verification-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&work).unwrap();
+        let files = (0..16)
+            .map(|index| {
+                // Alternate empty, small, and larger-than-buffer files so stale
+                // buffer contents and partial final reads cannot hide corruption.
+                let bytes = vec![index as u8; [0, 71, 1024 * 1024 + 13][index % 3]];
+                let path = format!("file-{index}");
+                std::fs::write(work.join(&path), &bytes).unwrap();
+                RuntimeFile {
+                    path,
+                    size: bytes.len() as u64,
+                    sha256: format!("{:x}", Sha256::digest(&bytes)),
+                }
+            })
+            .collect();
+        let mut runtime = RuntimeManifest {
+            dependency_fingerprint: None,
+            protocol: 1,
+            url: "https://example.invalid/runtime.zip".into(),
+            size: 1,
+            sha256: "0".repeat(64),
+            files,
+        };
+        verify_runtime(&work, &runtime).unwrap();
+        let changed = &runtime.files[14];
+        std::fs::write(work.join(&changed.path), vec![99; changed.size as usize]).unwrap();
+        assert!(verify_runtime(&work, &runtime)
+            .unwrap_err()
+            .contains("checksum"));
+        std::fs::remove_file(work.join(&changed.path)).unwrap();
+        assert!(verify_runtime(&work, &runtime)
+            .unwrap_err()
+            .contains("missing"));
+        runtime.files[14].path = "../escape".into();
+        assert!(verify_runtime(&work, &runtime)
+            .unwrap_err()
+            .contains("Unsafe"));
+        std::fs::remove_dir_all(work).unwrap();
     }
 
     #[test]

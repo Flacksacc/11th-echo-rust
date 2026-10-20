@@ -28,10 +28,10 @@ impl Frame {
 
     #[cfg(windows)]
     pub fn update_taskbar(&self) {
-        use windows::{core::w, Win32::UI::WindowsAndMessaging::*};
+        use windows::Win32::UI::WindowsAndMessaging::*;
         // Only touch this process's main window, never another Echo instance.
         unsafe {
-            let hwnd = FindWindowW(None, w!("Echo"));
+            let hwnd = main_window();
             let mut pid = 0;
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
             if hwnd.0 != 0 && pid == std::process::id() {
@@ -44,6 +44,47 @@ impl Frame {
             }
         }
     }
+}
+
+// Other Echo windows (including isolated inspection processes) can share the
+// title. FindWindow returns only the first one and can suppress our animation.
+#[cfg(windows)]
+pub fn main_window() -> windows::Win32::Foundation::HWND {
+    use windows::Win32::{
+        Foundation::{BOOL, HWND, LPARAM},
+        UI::WindowsAndMessaging::*,
+    };
+    unsafe extern "system" fn visit(hwnd: HWND, result: LPARAM) -> BOOL {
+        let mut pid = 0;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        }
+        if pid == std::process::id() {
+            let mut title = [0u16; 16];
+            let count = unsafe { GetWindowTextW(hwnd, &mut title) };
+            // A window procedure can return the full title length even when
+            // WM_GETTEXT truncated it to our buffer (including Slint windows).
+            // Never use that untrusted count as a slice boundary in this FFI
+            // callback: a panic here cannot unwind and aborts the application.
+            if is_main_window_title(&title, count) {
+                unsafe {
+                    *(result.0 as *mut HWND) = hwnd;
+                }
+                return BOOL(0);
+            }
+        }
+        BOOL(1)
+    }
+    let mut result = HWND::default();
+    unsafe {
+        let _ = EnumWindows(Some(visit), LPARAM((&mut result as *mut HWND) as isize));
+    }
+    result
+}
+
+#[cfg(windows)]
+fn is_main_window_title(title: &[u16], count: i32) -> bool {
+    count == 4 && title.get(..4) == Some(&[69, 99, 104, 111])
 }
 
 pub struct Icons {
@@ -130,6 +171,17 @@ impl Drop for NativeIcon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn window_title_accepts_only_echo_and_rejects_invalid_reported_lengths() {
+        let title = [69, 99, 104, 111, 0];
+        assert!(is_main_window_title(&title, 4));
+        for count in [-1, 0, 3, 5, 22, i32::MAX] {
+            assert!(!is_main_window_title(&title, count));
+        }
+        assert!(!is_main_window_title(&title[..3], 4));
+        assert!(!is_main_window_title(&[69, 67, 72, 79], 4));
+    }
     #[test]
     fn supplied_animation_has_three_fixed_canvas_frames_and_loops() {
         let icons = Icons::load().unwrap();

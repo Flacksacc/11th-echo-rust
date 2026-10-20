@@ -1,0 +1,206 @@
+import { VerticalBox, HorizontalBox, LineEdit, TextEdit, ComboBox, ScrollView, Button, CheckBox, Palette } from "std-widgets.slint";
+
+export struct ModelRow { name: string, detail: string }
+export component ModelManagerWindow inherits Window {
+    default-font-family: "Arial";
+    icon: @image-url("../eleventhecho.png");
+    init => { Palette.color-scheme = ColorScheme.dark; }
+    title: "Models & connections";
+    preferred-width: 840px; preferred-height: 670px; min-width: 600px; min-height: 490px;
+    background: #07140e;
+    in property <[ModelRow]> rows;
+    in property <[string]> providers: ["gemini"];
+    in property <[string]> discovered-models;
+    in-out property <int> selected-index: -1;
+    in-out property <string> name;
+    in-out property <string> provider: "gemini";
+    in-out property <string> endpoint;
+    in-out property <string> api-version: "2024-10-21";
+    in-out property <string> api-key;
+    in-out property <string> custom-header-name;
+    in-out property <string> custom-header-value;
+    in-out property <bool> allow-lan-http;
+    in-out property <bool> update-shared-connection: true;
+    in-out property <string> model-id;
+    in-out property <string> instructions;
+    in-out property <string> max-tokens: "2048";
+    in-out property <string> temperature;
+    in-out property <string> additional-params;
+    in-out property <string> timeout-seconds: "60";
+    in-out property <string> status;
+    in-out property <bool> busy;
+    callback select-model(int);
+    callback new-model();
+    callback test-and-save();
+    callback refresh-models();
+    callback delete-model();
+    callback close-window();
+    VerticalBox { padding: 16px; spacing: 10px;
+        Text { text: "Configured models"; color: #edfff2; font-size: 19px; }
+        ScrollView { height: 105px;
+            VerticalBox { padding: 0px; spacing: 5px;
+                for row[index] in root.rows : Button {
+                    text: row.name + "   ·   " + row.detail;
+                    clicked => { root.select-model(index); }
+                }
+            }
+        }
+        Button { text: "+ Add model"; enabled: !root.busy; clicked => { root.new-model(); } }
+        ScrollView {
+            VerticalBox { padding: 0px; spacing: 7px; alignment: start;
+                Text { text: "Friendly name"; color: #a9c3b2; }
+                LineEdit { text <=> root.name; }
+                Text { text: "Provider"; color: #a9c3b2; }
+                ComboBox { model: root.providers; current-value <=> root.provider; }
+                Text { text: "Model ID (enter the exact ID from your provider)"; color: #a9c3b2; }
+                LineEdit { text <=> root.model-id; }
+                HorizontalBox { spacing: 8px;
+                    Button { text: "Refresh model IDs"; enabled: !root.busy; clicked => { root.refresh-models(); } }
+                    if root.discovered-models.length > 0 : ComboBox { model: root.discovered-models; current-value <=> root.model-id; }
+                }
+                Text { text: "Endpoint override (optional for named cloud providers)"; color: #a9c3b2; }
+                LineEdit { text <=> root.endpoint; }
+                if root.provider == "azure" : VerticalBox {
+                    Text { text: "Azure API version"; color: #a9c3b2; }
+                    LineEdit { text <=> root.api-version; }
+                }
+                CheckBox { text: "Allow unencrypted LAN HTTP"; checked <=> root.allow-lan-http; }
+                Text { text: "API key (leave empty only for unauthenticated local servers)"; color: #a9c3b2; }
+                LineEdit { text <=> root.api-key; input-type: password; }
+                Text { text: "Custom authentication header name (optional)"; color: #a9c3b2; }
+                LineEdit { text <=> root.custom-header-name; }
+                Text { text: "Custom header secret (optional)"; color: #a9c3b2; }
+                LineEdit { text <=> root.custom-header-value; input-type: password; }
+                if root.selected-index >= 0 : CheckBox {
+                    text: "Update shared connection for all models using it";
+                    checked <=> root.update-shared-connection;
+                }
+                if root.provider != "ollaya" : VerticalBox { padding: 0px; spacing: 7px;
+                    Text { text: "Additional request parameters (JSON)"; color: #a9c3b2; }
+                    TextEdit { height: 110px; text <=> root.additional-params; enabled: !root.busy; accessible-label: "Additional request parameters (JSON)"; }
+                    Text { text: "Optional JSON object passed to the provider through Rig. Leave blank to use provider defaults."; color: #a9c3b2; font-size: 12px; wrap: word-wrap; }
+                }
+                Text { text: root.provider == "ollaya" ? "Routing instructions" : "Default instructions"; color: #a9c3b2; }
+                TextEdit { height: 95px; text <=> root.instructions; }
+                HorizontalBox { spacing: 10px;
+                    VerticalBox { visible: root.provider != "ollaya"; Text { text: "Output tokens"; color: #a9c3b2; } LineEdit { text <=> root.max-tokens; } }
+                    VerticalBox { visible: root.provider != "ollaya"; Text { text: "Temperature (optional)"; color: #a9c3b2; } LineEdit { text <=> root.temperature; } }
+                    VerticalBox { Text { text: "Timeout seconds"; color: #a9c3b2; } LineEdit { text <=> root.timeout-seconds; } }
+                }
+            }
+        }
+        if root.status != "" : Text { text: root.status; color: #e6c583; wrap: word-wrap; }
+        HorizontalBox { spacing: 8px;
+            Button { text: root.busy ? "Testing…" : "Test & save (may use provider quota)"; enabled: !root.busy; clicked => { root.test-and-save(); } }
+            Button { text: "Delete model"; enabled: !root.busy && root.selected-index >= 0; clicked => { root.delete-model(); } }
+            Button { text: "Close"; enabled: !root.busy; clicked => { root.close-window(); } }
+        }
+    }
+}
+
+export component ModelCreatorWindow inherits Window {
+    default-font-family: "Arial";
+    icon: @image-url("../eleventhecho.png");
+    init => { Palette.color-scheme = ColorScheme.dark; }
+    title: "Create model component";
+    preferred-width: 760px; preferred-height: 820px;
+    min-width: 600px; min-height: 560px;
+    background: #07140e;
+    in property <[string]> providers: ["gemini"];
+    in property <[string]> discovered-models;
+    in-out property <string> name;
+    in-out property <string> provider: "gemini";
+    in-out property <string> endpoint;
+    in-out property <string> api-version: "2024-10-21";
+    in-out property <string> api-key;
+    in-out property <string> custom-header-name;
+    in-out property <string> custom-header-value;
+    in-out property <bool> allow-lan-http;
+    in-out property <string> model-id;
+    in-out property <string> instructions;
+    in-out property <string> max-tokens: "2048";
+    in-out property <string> temperature;
+    in-out property <string> additional-params;
+    in-out property <string> timeout-seconds: "60";
+    in-out property <string> status;
+    in-out property <bool> busy;
+    in-out property <string> sample-input: "this is a sample sentence with a spelling eror";
+    in-out property <string> response;
+    in-out property <bool> tested;
+    in-out property <bool> advanced;
+    callback configuration-changed();
+    callback connection-changed();
+    callback test-model();
+    callback test-completed(string, bool);
+    callback create-model();
+    callback refresh-models();
+    callback close-window();
+    changed provider => { root.configuration-changed(); root.connection-changed(); }
+    changed endpoint => { root.configuration-changed(); root.connection-changed(); }
+    changed api-version => { root.configuration-changed(); root.connection-changed(); }
+    changed api-key => { root.configuration-changed(); root.connection-changed(); }
+    changed custom-header-name => { root.configuration-changed(); root.connection-changed(); }
+    changed custom-header-value => { root.configuration-changed(); root.connection-changed(); }
+    changed allow-lan-http => { root.configuration-changed(); root.connection-changed(); }
+    changed model-id => { root.configuration-changed(); }
+    changed instructions => { root.configuration-changed(); }
+    changed max-tokens => { root.configuration-changed(); }
+    changed temperature => { root.configuration-changed(); }
+    changed additional-params => { root.configuration-changed(); }
+    changed timeout-seconds => { root.configuration-changed(); }
+    VerticalBox { padding: 16px; spacing: 10px;
+        Text { text: "Create model component"; color: #edfff2; font-size: 20px; }
+        ScrollView { vertical-stretch: 1;
+            VerticalBox { padding: 0px; spacing: 7px; alignment: start;
+                Text { text: "Component name"; color: #a9c3b2; }
+                LineEdit { text <=> root.name; enabled: !root.busy; }
+                Text { text: "Provider"; color: #a9c3b2; }
+                ComboBox { model: root.providers; current-value <=> root.provider; enabled: !root.busy; }
+                Text { text: "Model ID"; color: #a9c3b2; }
+                LineEdit { text <=> root.model-id; enabled: !root.busy; }
+                HorizontalBox { padding: 0px; spacing: 8px;
+                    Button { text: "Discover models"; enabled: !root.busy; clicked => { root.refresh-models(); } }
+                    if root.discovered-models.length > 0 : ComboBox { model: root.discovered-models; current-value <=> root.model-id; enabled: !root.busy; }
+                }
+                Text { text: "Endpoint (optional for cloud providers)"; color: #a9c3b2; }
+                LineEdit { text <=> root.endpoint; enabled: !root.busy; }
+                if root.provider == "azure" : VerticalBox { padding: 0px;
+                    Text { text: "Azure API version"; color: #a9c3b2; }
+                    LineEdit { text <=> root.api-version; enabled: !root.busy; }
+                }
+                Text { text: "API key"; color: #a9c3b2; }
+                LineEdit { text <=> root.api-key; input-type: password; enabled: !root.busy; }
+                Text { text: root.provider == "ollaya" ? "Routing instructions" : "Default prompt"; color: #a9c3b2; }
+                TextEdit { height: 95px; text <=> root.instructions; enabled: !root.busy; }
+                if root.provider != "ollaya" : VerticalBox { padding: 0px; spacing: 7px;
+                    Text { text: "Additional request parameters (JSON)"; color: #a9c3b2; }
+                    TextEdit { height: 110px; text <=> root.additional-params; enabled: !root.busy; accessible-label: "Additional request parameters (JSON)"; }
+                    Text { text: "Optional JSON object passed to the provider through Rig. Leave blank to use provider defaults."; color: #a9c3b2; font-size: 12px; wrap: word-wrap; }
+                }
+                CheckBox { text: "Advanced"; checked <=> root.advanced; }
+                if root.advanced : VerticalBox { padding: 0px; spacing: 7px;
+                    CheckBox { text: "Allow unencrypted LAN HTTP"; checked <=> root.allow-lan-http; enabled: !root.busy; }
+                    Text { text: "Custom authentication header"; color: #a9c3b2; }
+                    LineEdit { text <=> root.custom-header-name; enabled: !root.busy; }
+                    Text { text: "Header secret"; color: #a9c3b2; }
+                    LineEdit { text <=> root.custom-header-value; input-type: password; enabled: !root.busy; }
+                    HorizontalBox { padding: 0px; spacing: 10px;
+                        VerticalBox { visible: root.provider != "ollaya"; padding: 0px; Text { text: "Output tokens"; color: #a9c3b2; } LineEdit { text <=> root.max-tokens; enabled: !root.busy; } }
+                        VerticalBox { visible: root.provider != "ollaya"; padding: 0px; Text { text: "Temperature"; color: #a9c3b2; } LineEdit { text <=> root.temperature; enabled: !root.busy; } }
+                        VerticalBox { padding: 0px; Text { text: "Timeout (s)"; color: #a9c3b2; } LineEdit { text <=> root.timeout-seconds; enabled: !root.busy; } }
+                    }
+                }
+                Text { text: "Test input"; color: #a9c3b2; }
+                TextEdit { height: 85px; text <=> root.sample-input; enabled: !root.busy; }
+                Button { text: root.busy ? "Working…" : "Test (may use provider quota)"; enabled: !root.busy; clicked => { root.test-model(); } }
+                Text { text: root.provider == "ollaya" ? "Decision result" : "Model response"; color: #a9c3b2; }
+                TextEdit { height: 120px; text: root.response; read-only: true; }
+            }
+        }
+        Text { text: root.status; color: #e6c583; wrap: word-wrap; max-height: 60px; overflow: elide; }
+        HorizontalBox { padding: 0px; spacing: 8px;
+            Button { text: "Create model component"; enabled: root.tested && !root.busy && root.name != ""; clicked => { root.create-model(); } }
+            Button { text: "Cancel"; clicked => { root.close-window(); } }
+        }
+    }
+}
